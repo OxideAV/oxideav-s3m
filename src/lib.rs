@@ -11,9 +11,10 @@
 //!   single packet (the same approach as `oxideav-mod`).
 //! - A **codec** (`s3m`) whose decoder parses header + instruments +
 //!   patterns + sample bodies and drives a 44.1 kHz stereo-S16 mixer.
-//!
-//! See `MEMORY.md → MOD multichannel` for the architectural sketch that
-//! applies here too (per-channel streams as a future mode).
+//! - A **per-channel codec** (`s3m_multichannel`) that emits one stereo
+//!   pair per S3M channel instead of a single summed stereo stream —
+//!   useful for DAWs, visualizers, and per-instrument remastering. See
+//!   [`decoder::CODEC_ID_MULTICHANNEL`] and [`player::PlayerState::render_per_channel`].
 
 pub mod container;
 pub mod decoder;
@@ -26,6 +27,7 @@ use oxideav_codec::CodecRegistry;
 use oxideav_container::ContainerRegistry;
 
 pub const CODEC_ID_STR: &str = "s3m";
+pub use decoder::CODEC_ID_MULTICHANNEL;
 
 pub fn register_codecs(reg: &mut CodecRegistry) {
     decoder::register(reg);

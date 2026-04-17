@@ -760,6 +760,29 @@ impl PlayerState {
         out[1] = (r * 32767.0) as i16;
     }
 
+    /// Per-channel mixdown: writes one stereo frame per S3M channel into
+    /// `out`, which must be exactly `2 * self.channels.len()` i16 wide.
+    /// Layout: `[ch0_L, ch0_R, ch1_L, ch1_R, … chN_L, chN_R]`.
+    ///
+    /// Pan, volume, global-volume and master-volume are applied per
+    /// channel identically to the mixed path, but the sqrt(active) mixing
+    /// compensation is omitted — each output stream carries exactly one
+    /// channel's signal, so there's nothing to compensate for.
+    fn render_one_per_channel(&mut self, out: &mut [i16]) {
+        let out_rate = self.sample_rate as f32;
+        let mv = (self.master_volume.max(1) as f32) / 48.0;
+        let gv = (self.global_volume as f32) / 64.0;
+        let scale = mv * gv;
+        for (i, ch) in self.channels.iter_mut().enumerate() {
+            let (cl, cr) = Self::mix_channel(ch, &self.samples, out_rate);
+            let l = (cl * scale).clamp(-1.0, 1.0);
+            let r = (cr * scale).clamp(-1.0, 1.0);
+            let off = i * 2;
+            out[off] = (l * 32767.0) as i16;
+            out[off + 1] = (r * 32767.0) as i16;
+        }
+    }
+
     /// Render up to `dst.len()/2` stereo frames.
     pub fn render(&mut self, dst: &mut [i16]) -> usize {
         assert!(dst.len() % 2 == 0);
@@ -781,6 +804,62 @@ impl PlayerState {
             for _ in 0..want {
                 let off = produced * 2;
                 self.render_one(&mut dst[off..off + 2]);
+                produced += 1;
+            }
+            self.tick_sample_cursor += want as u32;
+            if self.tick_sample_cursor >= spt {
+                self.tick_sample_cursor = 0;
+                self.tick += 1;
+                if self.tick >= self.speed {
+                    self.tick = 0;
+                    self.next_row();
+                }
+            }
+        }
+        produced
+    }
+
+    /// Number of channels emitted by `render_per_channel`.
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Render up to `dst.len() / (2 * self.channel_count())` frames in
+    /// per-channel mode. Each frame is `2 * channel_count()` i16 wide:
+    /// `[ch0_L, ch0_R, ch1_L, ch1_R, … chN_L, chN_R]`, repeated for each
+    /// frame.
+    ///
+    /// Unlike `render`, the output is *not* mixed down: every S3M channel
+    /// gets its own stereo pair (panned per the channel's pan, scaled by
+    /// volume/global/master). Consumers that want individual streams
+    /// (DAWs, visualizers, per-instrument remastering) deinterleave the
+    /// result into `channel_count()` stereo buffers.
+    ///
+    /// Returns the number of frames produced.
+    pub fn render_per_channel(&mut self, dst: &mut [i16]) -> usize {
+        let stride = self.channels.len() * 2;
+        assert!(
+            stride > 0 && dst.len() % stride == 0,
+            "per-channel destination must be a multiple of 2 * channel_count"
+        );
+        let total_frames = dst.len() / stride;
+        let mut produced = 0usize;
+        while produced < total_frames {
+            if self.ended {
+                break;
+            }
+            if self.tick_sample_cursor == 0 {
+                self.advance_tick();
+                if self.ended {
+                    break;
+                }
+            }
+            let spt = self.samples_per_tick().max(1);
+            let remaining_in_tick = spt.saturating_sub(self.tick_sample_cursor);
+            let want = (total_frames - produced).min(remaining_in_tick as usize);
+            for _ in 0..want {
+                let off = produced * stride;
+                self.render_one_per_channel(&mut dst[off..off + stride]);
                 produced += 1;
             }
             self.tick_sample_cursor += want as u32;

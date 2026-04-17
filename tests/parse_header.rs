@@ -768,3 +768,169 @@ fn build_stereo_pan_module() -> Vec<u8> {
     out[pat_pp_off..pat_pp_off + 2].copy_from_slice(&pat_parapointer.to_le_bytes());
     out
 }
+
+/// Per-channel rendering API: `render_per_channel` emits one stereo pair
+/// per S3M channel slot (32 total), so with 4 enabled channels the
+/// output stride is 2 * 32 = 64 i16 per frame. Verifies:
+///   - stride is a multiple of 2 * channel_count;
+///   - the triggered channel (0, panned by channel-settings to the left
+///     bank) produces non-silent L output;
+///   - unused but enabled channels (1..=3) stay silent;
+///   - disabled slots (4..=31) stay silent on both L and R.
+#[test]
+fn player_render_per_channel_isolates_streams() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Default synth: note triggers are on channel 0; channels 1..=3 are
+    // enabled but unused by the pattern; channels 4..=31 are 0xFF
+    // (disabled).
+    let (bytes, _) = build_synth_s3m();
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    let n_ch = player.channel_count();
+    assert_eq!(n_ch, 32, "S3M always has 32 channel slots");
+    let stride = n_ch * 2;
+    let frames = 8192usize;
+    let mut dst = vec![0i16; frames * stride];
+    let produced = player.render_per_channel(&mut dst);
+    assert!(
+        produced > 0,
+        "per-channel render produced no frames (ended early?)"
+    );
+    dst.truncate(produced * stride);
+
+    // Channel 0 (the one triggered by the pattern) sits in the left bank
+    // — channel_setting == 0, pan == 0x03 — so L must be audible.
+    let ch0_l_nz = dst.chunks_exact(stride).filter(|f| f[0] != 0).count();
+    assert!(
+        ch0_l_nz > produced / 8,
+        "ch0 L expected audible, got {ch0_l_nz}/{produced} non-zero"
+    );
+
+    // Channels 1..=3 have no pattern events, so they must be silent on
+    // both sides for the entire render.
+    for ch in 1..4 {
+        let l_off = ch * 2;
+        let r_off = ch * 2 + 1;
+        let l_nz = dst.chunks_exact(stride).filter(|f| f[l_off] != 0).count();
+        let r_nz = dst.chunks_exact(stride).filter(|f| f[r_off] != 0).count();
+        assert_eq!(
+            l_nz, 0,
+            "ch{ch} L should be silent (no trigger), got {l_nz} non-zero"
+        );
+        assert_eq!(
+            r_nz, 0,
+            "ch{ch} R should be silent (no trigger), got {r_nz} non-zero"
+        );
+    }
+
+    // Channels 4..=31 are disabled slots — guaranteed silent.
+    for ch in 4..32 {
+        let l_off = ch * 2;
+        let r_off = ch * 2 + 1;
+        for f in dst.chunks_exact(stride) {
+            assert_eq!(
+                f[l_off], 0,
+                "disabled ch{ch} L leaked non-zero audio: {}",
+                f[l_off]
+            );
+            assert_eq!(
+                f[r_off], 0,
+                "disabled ch{ch} R leaked non-zero audio: {}",
+                f[r_off]
+            );
+        }
+    }
+}
+
+/// Sanity cross-check that the two render paths produce frames at the
+/// same rate and both remain audible over an identical window.
+#[test]
+fn per_channel_matches_mixed_frame_rate() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    let (bytes, _) = build_synth_s3m();
+
+    // Render mixed.
+    let h1 = parse_header(&bytes).unwrap();
+    let s1 = extract_samples(&h1, &bytes);
+    let p1 = unpack_all(&h1, &bytes);
+    let mut mixed_player = PlayerState::new(&h1, s1, p1, OUTPUT_SAMPLE_RATE);
+    let frames = 8192usize;
+    let mut mixed = vec![0i16; frames * 2];
+    let mixed_n = mixed_player.render(&mut mixed);
+
+    // Render per-channel from a fresh player on the same song.
+    let h2 = parse_header(&bytes).unwrap();
+    let s2 = extract_samples(&h2, &bytes);
+    let p2 = unpack_all(&h2, &bytes);
+    let mut pc_player = PlayerState::new(&h2, s2, p2, OUTPUT_SAMPLE_RATE);
+    let n_ch = pc_player.channel_count();
+    let stride = n_ch * 2;
+    let mut pc = vec![0i16; frames * stride];
+    let pc_n = pc_player.render_per_channel(&mut pc);
+
+    assert_eq!(
+        mixed_n, pc_n,
+        "mixed and per-channel should emit same frame count"
+    );
+
+    // Both should have some audible output over the window.
+    let mixed_nz = mixed[..mixed_n * 2].iter().filter(|&&s| s != 0).count();
+    let pc_any_nz = pc[..pc_n * stride].iter().filter(|&&s| s != 0).count();
+    assert!(mixed_nz > 100, "mixed path silent: {mixed_nz} non-zero");
+    assert!(
+        pc_any_nz > 100,
+        "per-channel path silent: {pc_any_nz} non-zero"
+    );
+}
+
+/// Register the `s3m_multichannel` codec id and make sure a decoder
+/// created through the registry emits frames whose channel count is
+/// 2 * 32 (full stride per S3M channel slot).
+#[test]
+fn decoder_multichannel_emits_32_stereo_streams() {
+    let (bytes, _) = build_synth_s3m();
+
+    let mut codec_reg = CodecRegistry::new();
+    decoder::register(&mut codec_reg);
+
+    let params = CodecParameters::audio(CodecId::new(oxideav_s3m::CODEC_ID_MULTICHANNEL));
+    let mut dec = codec_reg
+        .make_decoder(&params)
+        .expect("build s3m_multichannel decoder");
+
+    let tb = TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64);
+    let pkt = Packet::new(0, tb, bytes);
+    dec.send_packet(&pkt).unwrap();
+
+    let frame = dec.receive_frame().expect("first frame");
+    match frame {
+        Frame::Audio(a) => {
+            assert_eq!(a.channels, 64, "expected 2*32 interleaved channels");
+            assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
+            assert_eq!(a.format, SampleFormat::S16);
+            // Bytes = samples * channels * 2 (i16).
+            assert_eq!(a.data[0].len(), a.samples as usize * 64 * 2);
+        }
+        _ => panic!("expected audio frame"),
+    }
+
+    // Drain without error.
+    loop {
+        match dec.receive_frame() {
+            Ok(_) => {}
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+}
