@@ -9,7 +9,8 @@ use std::io::Read;
 
 use oxideav_container::{ContainerRegistry, Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, Result, SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
+    StreamInfo, TimeBase,
 };
 
 use crate::header::{parse_header, S3mHeader};
@@ -33,7 +34,7 @@ fn probe(p: &oxideav_container::ProbeData) -> u8 {
     }
 }
 
-fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let mut blob = Vec::new();
     input.read_to_end(&mut blob)?;
     if blob.len() < 0x60 {

@@ -216,7 +216,7 @@ fn container_roundtrip_and_metadata() {
     // Open via the registry by format name.
     let cur = Box::new(Cursor::new(bytes.clone()));
     let mut demux = registries_containers
-        .open_demuxer("s3m", cur)
+        .open_demuxer("s3m", cur, &oxideav_core::NullCodecResolver)
         .expect("demuxer opens synthetic s3m");
 
     let md = demux.metadata();
