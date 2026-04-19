@@ -10,7 +10,7 @@
 //!   silence). Consumers that want individual channel streams
 //!   deinterleave by striding `2 * 32` i16 per output frame.
 
-use oxideav_codec::{CodecRegistry, Decoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result,
     SampleFormat, TimeBase,
@@ -33,7 +33,11 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_intra_only(false)
         .with_max_channels(32)
         .with_max_sample_rate(OUTPUT_SAMPLE_RATE);
-    reg.register_decoder_impl(CodecId::new(crate::CODEC_ID_STR), mixed_caps, make_mixed);
+    reg.register(
+        CodecInfo::new(CodecId::new(crate::CODEC_ID_STR))
+            .capabilities(mixed_caps)
+            .decoder(make_mixed),
+    );
 
     let mc_caps = CodecCapabilities::audio("s3m_sw_mc")
         .with_lossy(false)
@@ -42,10 +46,10 @@ pub fn register(reg: &mut CodecRegistry) {
         // Per-channel output is 2 * 32 = 64 interleaved samples per frame.
         .with_max_channels((CHANNEL_COUNT * 2) as u16)
         .with_max_sample_rate(OUTPUT_SAMPLE_RATE);
-    reg.register_decoder_impl(
-        CodecId::new(CODEC_ID_MULTICHANNEL),
-        mc_caps,
-        make_multichannel,
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_MULTICHANNEL))
+            .capabilities(mc_caps)
+            .decoder(make_multichannel),
     );
 }
 
