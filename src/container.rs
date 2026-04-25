@@ -7,11 +7,11 @@
 
 use std::io::Read;
 
-use oxideav_container::{ContainerRegistry, Demuxer, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
     StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, ReadSeek};
 
 use crate::header::{parse_header, S3mHeader};
 
@@ -26,7 +26,7 @@ pub fn register(reg: &mut ContainerRegistry) {
 }
 
 /// `SCRM` magic at offset 44 — the canonical Scream Tracker 3 marker.
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() >= 48 && &p.buf[44..48] == b"SCRM" {
         100
     } else {

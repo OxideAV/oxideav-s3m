@@ -5,8 +5,8 @@
 //! square-wave PCM instrument and one pattern that triggers that
 //! instrument at a few pitches.
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
+use oxideav_core::CodecRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase};
 use oxideav_s3m::container::OUTPUT_SAMPLE_RATE;
 use oxideav_s3m::decoder;
