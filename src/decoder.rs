@@ -12,7 +12,6 @@
 
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result,
-    SampleFormat, TimeBase,
 };
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
@@ -136,12 +135,8 @@ impl Decoder for S3mDecoder {
                     let pts = *emit_pts;
                     *emit_pts += produced as i64;
                     Ok(Frame::Audio(AudioFrame {
-                        format: SampleFormat::S16,
-                        channels: 2,
-                        sample_rate: OUTPUT_SAMPLE_RATE,
                         samples: produced as u32,
                         pts: Some(pts),
-                        time_base: TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
                         data: vec![bytes],
                     }))
                 }
@@ -163,12 +158,8 @@ impl Decoder for S3mDecoder {
                     let pts = *emit_pts;
                     *emit_pts += produced as i64;
                     Ok(Frame::Audio(AudioFrame {
-                        format: SampleFormat::S16,
-                        channels: stride as u16,
-                        sample_rate: OUTPUT_SAMPLE_RATE,
                         samples: produced as u32,
                         pts: Some(pts),
-                        time_base: TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
                         data: vec![bytes],
                     }))
                 }

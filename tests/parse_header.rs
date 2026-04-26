@@ -7,7 +7,7 @@
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::ContainerRegistry;
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_s3m::container::OUTPUT_SAMPLE_RATE;
 use oxideav_s3m::decoder;
 use oxideav_s3m::header::{parse_header, S3M_SIGNATURE};
@@ -250,9 +250,6 @@ fn decoder_emits_nonsilent_pcm() {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.channels, 2);
-                assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
-                assert_eq!(a.format, SampleFormat::S16);
                 total_samples += a.samples as u64;
                 for chunk in a.data[0].chunks_exact(2) {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]);
@@ -916,10 +913,7 @@ fn decoder_multichannel_emits_32_stereo_streams() {
     let frame = dec.receive_frame().expect("first frame");
     match frame {
         Frame::Audio(a) => {
-            assert_eq!(a.channels, 64, "expected 2*32 interleaved channels");
-            assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
-            assert_eq!(a.format, SampleFormat::S16);
-            // Bytes = samples * channels * 2 (i16).
+            // Bytes = samples * channels * 2 (i16); 2*32 interleaved channels.
             assert_eq!(a.data[0].len(), a.samples as usize * 64 * 2);
         }
         _ => panic!("expected audio frame"),
