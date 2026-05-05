@@ -239,7 +239,7 @@ fn decoder_emits_nonsilent_pcm() {
     decoder::register(&mut codec_reg);
 
     let params = CodecParameters::audio(CodecId::new("s3m"));
-    let mut dec = codec_reg.make_decoder(&params).expect("build s3m decoder");
+    let mut dec = codec_reg.first_decoder(&params).expect("build s3m decoder");
 
     let tb = TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64);
     let pkt = Packet::new(0, tb, bytes);
@@ -306,7 +306,7 @@ fn total_frames_for(bytes: &[u8]) -> u64 {
     let mut codec_reg = CodecRegistry::new();
     decoder::register(&mut codec_reg);
     let params = CodecParameters::audio(CodecId::new("s3m"));
-    let mut dec = codec_reg.make_decoder(&params).unwrap();
+    let mut dec = codec_reg.first_decoder(&params).unwrap();
     let tb = TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64);
     let pkt = Packet::new(0, tb, bytes.to_vec());
     dec.send_packet(&pkt).unwrap();
@@ -480,7 +480,7 @@ fn render_all(bytes: &[u8]) -> Vec<(i16, i16)> {
     let mut codec_reg = CodecRegistry::new();
     decoder::register(&mut codec_reg);
     let params = CodecParameters::audio(CodecId::new("s3m"));
-    let mut dec = codec_reg.make_decoder(&params).unwrap();
+    let mut dec = codec_reg.first_decoder(&params).unwrap();
     let tb = TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64);
     let pkt = Packet::new(0, tb, bytes.to_vec());
     dec.send_packet(&pkt).unwrap();
@@ -903,7 +903,7 @@ fn decoder_multichannel_emits_32_stereo_streams() {
 
     let params = CodecParameters::audio(CodecId::new(oxideav_s3m::CODEC_ID_MULTICHANNEL));
     let mut dec = codec_reg
-        .make_decoder(&params)
+        .first_decoder(&params)
         .expect("build s3m_multichannel decoder");
 
     let tb = TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64);
