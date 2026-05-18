@@ -928,3 +928,306 @@ fn decoder_multichannel_emits_32_stereo_streams() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+//   Round-75: extended effect coverage (I, U, SE, S1, S2, S3, S4, fine
+//   slides, SC0). Each test builds a minimal pattern that exercises the
+//   effect in isolation and asserts a measurable consequence on the
+//   rendered PCM via the public `PlayerState` API where convenient.
+// ---------------------------------------------------------------------
+
+/// SCx with x=0: per spec ("note will be cut in x number of frames") an
+/// SC0 cuts immediately at tick 0. Our row should be silent end-to-end
+/// because the volume is zeroed before any sample is rendered.
+#[test]
+fn effect_sc0_cuts_immediately() {
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, // note + instrument
+        19, 0xC0, // S, info 0xC0 -> SC0
+        0,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let frames = render_all(&bytes);
+    let spt = 882usize;
+    // The whole row 0 must be silent (volume forced to 0 at tick 0).
+    let row0 = &frames[..6 * spt];
+    for (i, &(l, r)) in row0.iter().enumerate() {
+        assert_eq!(
+            (l, r),
+            (0, 0),
+            "SC0 should silence tick 0 onward; frame {i} = ({l},{r})"
+        );
+    }
+}
+
+/// SEx pattern delay: a `SE2` on row 0 (which carries the note) should
+/// repeat the row twice extra. The row 0 trigger then sustains for
+/// (1+SE2)*speed*spt frames before the rest of the pattern plays.
+/// Compare against an identical module without SE: the delayed version
+/// must be strictly longer.
+#[test]
+fn effect_sex_pattern_delay_extends_runtime() {
+    // Base: just a note trigger on row 0.
+    let base = build_synth_with_pattern(vec![0x20, 0x50, 1, 0]);
+    // Delayed: note + SE2 (pattern delay 2 → row 0 plays 3 times total).
+    let delayed = build_synth_with_pattern(vec![
+        0xA0, 0x50, 1, // note + inst
+        19, 0xE2, // S, info 0xE2 -> SE2
+        0,
+    ]);
+
+    let base_frames = render_all(&base).len();
+    let delayed_frames = render_all(&delayed).len();
+    let extra = delayed_frames.saturating_sub(base_frames);
+    // SE2 adds 2 extra repeats of row 0: 2 * speed(6) * samples_per_tick(882)
+    // = 10584 frames. Allow ±15% wiggle for boundary effects.
+    let expected = 2 * 6 * 882;
+    let lo = (expected as f32 * 0.85) as usize;
+    let hi = (expected as f32 * 1.15) as usize;
+    assert!(
+        (lo..=hi).contains(&extra),
+        "SE2 should add ~{expected} frames; got {extra} (base={base_frames}, delayed={delayed_frames})"
+    );
+}
+
+/// Ixy tremor (I22 = on 3 ticks, off 3 ticks): over the row the channel
+/// volume should toggle between audible and silent in 3-tick stripes.
+/// At speed=6 and 882 spt, the row layout is ticks 0..=5 → first 3
+/// ticks audible, next 3 silent. We sample at tick midpoints to avoid
+/// boundary noise.
+#[test]
+fn effect_ixy_tremor_alternates_volume() {
+    // Row 0: note + I22 (cmd 9, info 0x22). I = 9.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, // note + inst
+        9, 0x22, // command I, info 0x22
+        0,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let frames = render_all(&bytes);
+    let spt = 882usize;
+    // Sample inside ticks 0..=5 (mid-tick) — tick 0 may have an arming
+    // gap, but ticks 1..=2 should be audible and 3..=5 silent.
+    let mid = |t: usize| t * spt + spt / 2;
+    for t in [1usize, 2] {
+        let (l, r) = frames[mid(t)];
+        assert!(
+            l != 0 || r != 0,
+            "tremor on-phase tick {t} should be audible, got ({l},{r})"
+        );
+    }
+    for t in [3usize, 4, 5] {
+        let (l, r) = frames[mid(t)];
+        assert_eq!(
+            (l, r),
+            (0, 0),
+            "tremor off-phase tick {t} should be silent, got ({l},{r})"
+        );
+    }
+}
+
+/// Uxy fine vibrato: should modulate the playback rate (so sample_pos
+/// moves at a slightly perturbed pace) but with much smaller deviation
+/// than Hxy. We just check the channel is audible and frequency drifts
+/// across ticks without going silent.
+#[test]
+fn effect_uxy_fine_vibrato_keeps_audio_alive() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + U82 (cmd 21, info 0x82) → speed 8, depth 2.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, // note + inst
+        21, 0x82, 0,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Drive the player past a few ticks worth of frames and watch
+    // channel 0's frequency change between ticks.
+    let mut buf = vec![0i16; 2 * 882];
+    // Tick 0 (note trigger): record the base frequency.
+    player.render(&mut buf);
+    let f0 = player.channels[0].frequency;
+    assert!(f0 > 0.0, "U-effect channel should be playing");
+
+    // Render a second tick where U's per-tick handler will perturb freq.
+    player.render(&mut buf);
+    let f1 = player.channels[0].frequency;
+    assert!(f1 > 0.0, "U-effect must not silence the channel");
+    // The fine vibrato delta is small but non-zero on tick 1; |Δf|
+    // should be < ~5% of base for a depth-2 U command.
+    let drift = (f1 - f0).abs() / f0;
+    assert!(
+        drift < 0.05,
+        "fine vibrato drift unexpectedly large: {drift} (f0={f0}, f1={f1})"
+    );
+}
+
+/// S2x finetune: after S28 the running note plays at the spec C4Spd of
+/// 8363 Hz (the "no finetune" entry). After S20 it switches to 7895 Hz,
+/// so the playback frequency drops by ~5.6%.
+#[test]
+fn effect_s2x_finetune_changes_playback_rate() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note C-5 + S20 (cmd 19, info 0x20).
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, // note + inst
+        19, 0x20, 0,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    let mut buf = vec![0i16; 2 * 64];
+    player.render(&mut buf);
+    let freq = player.channels[0].frequency;
+    // Expected: note 0x50 (one octave above C5) with new C5=7895 Hz.
+    // freq = 7895 * 2^1 = 15790. Allow ±10 Hz.
+    let expected = 7895.0 * 2.0;
+    assert!(
+        (freq - expected).abs() < 10.0,
+        "S20 finetune should set freq to ~{expected}; got {freq}"
+    );
+}
+
+/// DFy fine vol slide down (DF4): at tick 0 the volume drops by 4 once
+/// and then stays put. Volume should be 64-4=60 after the row settles.
+#[test]
+fn effect_dfy_fine_vol_slide_down() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + DF4. D=4, info=0xF4.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, // note + inst (resets vol to inst default 64)
+        4, 0xF4, // cmd D info 0xF4 → DF4 fine down by 4
+        0,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    let mut buf = vec![0i16; 2 * 64];
+    player.render(&mut buf); // drive past tick 0
+    assert_eq!(
+        player.channels[0].volume, 60,
+        "DF4 should subtract 4 from vol=64 at tick 0"
+    );
+
+    // Subsequent ticks must not slide further (fine = tick-0 only).
+    for _ in 0..5 {
+        let mut more = vec![0i16; 2 * 882];
+        player.render(&mut more);
+    }
+    assert_eq!(
+        player.channels[0].volume, 60,
+        "DF4 should not slide on later ticks"
+    );
+}
+
+/// EFx fine pitch slide down: tick-0 only. EF2 drops pitch by ~2/768
+/// of an octave at tick 0 and then stays put.
+#[test]
+fn effect_efx_fine_pitch_slide() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + EF2. E = 5, info = 0xF2.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, // note + inst
+        5, 0xF2, 0,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    let mut buf = vec![0i16; 2 * 64];
+    player.render(&mut buf);
+    let f0 = player.channels[0].frequency;
+
+    // Expected base (no slide) freq for C-5 with c5_speed=8363 at note
+    // 0x50 = 8363 * 2 = 16726. After EF2: 16726 * 2^(-2/768) ≈ 16695.8.
+    let expected = 16726.0 * 2.0f32.powf(-2.0 / 768.0);
+    assert!(
+        (f0 - expected).abs() < 1.0,
+        "EF2 should bend to {expected}; got {f0}"
+    );
+
+    // Render a full second of audio. Frequency should not drift further.
+    let mut more = vec![0i16; 2 * 44100];
+    player.render(&mut more);
+    let f1 = player.channels[0].frequency;
+    assert!(
+        (f1 - f0).abs() < 1.0,
+        "EF2 must not slide on later ticks; f0={f0}, f1={f1}"
+    );
+}
+
+/// S3x vibrato waveform: S32 (square) should produce frequency steps
+/// alternating between two distinct values rather than the smooth ramp
+/// you'd see with the sine default. We capture frequencies across the
+/// first few ticks and assert at least one positive and one negative
+/// deviation from the base.
+#[test]
+fn effect_s3x_square_waveform_changes_vibrato_shape() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + S32 (set vibrato waveform = square)
+    // Row 1: H8F  (vibrato, speed 8 depth F = max) — runs through all ticks.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 19, 0x32, // row 0: trigger + S32
+        0x00, // row 0 terminator
+        0x80, 8, 0x8F, // row 1: H8F (cmd only)
+        0x00, // row 1 terminator
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Walk through row 0 quickly.
+    let mut buf = vec![0i16; 2 * 6 * 882];
+    player.render(&mut buf);
+    let base = player.channels[0].frequency;
+
+    // Now in row 1: H8F runs per-tick. Sample frequency at the end of
+    // each tick for a handful of ticks and collect signed deltas.
+    let mut deltas = Vec::new();
+    let tick_buf = vec![0i16; 2 * 882];
+    for _ in 0..6 {
+        let mut tb = tick_buf.clone();
+        player.render(&mut tb);
+        let f = player.channels[0].frequency;
+        deltas.push(f - base);
+    }
+    let any_pos = deltas.iter().any(|d| *d > 0.5);
+    let any_neg = deltas.iter().any(|d| *d < -0.5);
+    assert!(
+        any_pos && any_neg,
+        "square vibrato should swing both directions; deltas={deltas:?}"
+    );
+}

@@ -23,11 +23,18 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
 - PCM instruments (8-bit signed/unsigned, 16-bit, mono and true-stereo).
 - AdLib instrument types are skipped (no OPL synth).
 - Effects: `Axx` (speed), `Bxx` (pos jump), `Cxx` (pattern break), `Dxy`
-  (volume slide), `Exx` / `Fxx` (pitch slides), `Gxx` (tone portamento),
-  `Hxy` (vibrato), `Jxy` (arpeggio), `Kxy` (vib+vol), `Lxy` (porta+vol),
-  `Oxx` (sample offset), `Qxy` (retrigger), `Rxy` (tremolo), `Txx`
-  (tempo), `Vxx` (global volume), `Xxx` (set pan), plus the `Sxy` family
-  (`S80` pan, `SBx` pattern loop, `SCx` note cut, `SDx` note delay).
+  (volume slide, including fine variants `DFy`/`DxF`/`DF0`), `Exx` /
+  `Fxx` (pitch slides, with fine `EFx`/`FFx` and extra-fine `EEx`/`FEx`),
+  `Gxx` (tone portamento), `Hxy` (vibrato), `Ixy` (tremor), `Jxy`
+  (arpeggio), `Kxy` (vib+vol), `Lxy` (porta+vol), `Oxx` (sample offset),
+  `Qxy` (retrigger), `Rxy` (tremolo), `Txx` (tempo), `Uxy` (fine
+  vibrato), `Vxx` (global volume), `Xxx` (set pan), plus the `Sxy`
+  family (`S1x` glissando, `S2x` finetune from the spec C4Spd table,
+  `S3x`/`S4x` vibrato/tremolo waveform select [sine, ramp-down, square,
+  random], `S80` pan, `SBx` pattern loop, `SCx` note cut [`SC0`
+  immediate], `SDx` note delay, `SEx` pattern delay). `S0x` filter and
+  `SFx` funkrepeat are spec'd as not implemented in ST3 itself and
+  decode as no-ops.
 - Per-channel pan (default-pan block or synthesised from channel settings).
 
 **Decode-only** â€” no S3M encoder is provided, by design. S3M is a tracker

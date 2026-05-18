@@ -33,6 +33,7 @@ pub mod cmd {
     pub const F_SLIDE_UP: u8 = 6;
     pub const G_TONE_PORTA: u8 = 7;
     pub const H_VIBRATO: u8 = 8;
+    pub const I_TREMOR: u8 = 9;
     pub const J_ARPEGGIO: u8 = 10;
     pub const K_VIB_VOL: u8 = 11;
     pub const L_PORT_VOL: u8 = 12;
@@ -41,8 +42,43 @@ pub mod cmd {
     pub const R_TREMOLO: u8 = 18;
     pub const S_EXTENDED: u8 = 19;
     pub const T_SET_TEMPO: u8 = 20;
+    pub const U_FINE_VIBRATO: u8 = 21;
     pub const V_GLOBAL_VOL: u8 = 22;
     pub const X_SET_PAN: u8 = 24;
+}
+
+/// 16-entry S2x finetune table from `ScreamTracker-v3.20-effects.txt`.
+/// Index = parameter nibble x (0..=F); value is the C4Spd (=C5 speed)
+/// that the running instrument should use for the rest of its lifetime
+/// on this channel.
+pub const S2X_FINETUNE_TABLE: [u32; 16] = [
+    7895, 7941, 7985, 8046, 8107, 8169, 8232, 8280, 8363, 8413, 8463, 8529, 8581, 8651, 8723, 8757,
+];
+
+/// Vibrato / tremolo waveform selector (S3x / S4x parameter low nibble).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Waveform {
+    /// Standard 64-entry approximated sine — ST3 default.
+    #[default]
+    Sine,
+    /// Linear ramp from +max down to -max over the period.
+    RampDown,
+    /// +max / -max square (no in-between values).
+    Square,
+    /// Random sample-per-tick LFO. Implemented with a 32-bit LCG so the
+    /// output is reproducible across runs of the same module.
+    Random,
+}
+
+impl Waveform {
+    fn from_nibble(x: u8) -> Self {
+        match x & 0x03 {
+            0 => Waveform::Sine,
+            1 => Waveform::RampDown,
+            2 => Waveform::Square,
+            _ => Waveform::Random,
+        }
+    }
 }
 
 /// Per-channel playback state.
@@ -76,6 +112,22 @@ pub struct Channel {
     /// SDx (note delay): pending trigger buffered at tick 0 for firing at
     /// tick `x`. `None` when no delay is active.
     pub pending_delay: Option<PendingTrigger>,
+    /// S1x: glissando control. When set, G (tone portamento) snaps to the
+    /// nearest semitone of the target rather than gliding continuously.
+    pub glissando: bool,
+    /// S3x: vibrato waveform for H / U / K vibrato terms.
+    pub vibrato_waveform: Waveform,
+    /// S4x: tremolo waveform for R volume vibrato.
+    pub tremolo_waveform: Waveform,
+    /// Per-channel LFO state for the `Random` waveform. Updated lazily;
+    /// only stepped when a vibrato / tremolo tick samples it.
+    pub random_state: u32,
+    /// Ixy tremor: counts ticks within the on/off cycle. Bit 7 = "in off
+    /// phase"; low 7 bits = ticks remaining in the current half-cycle.
+    pub tremor_phase: u8,
+    /// Volume captured when a row's Ixy command first fires, so we can
+    /// restore it after an off-phase. 0xFF = "no captured value yet".
+    pub tremor_base_volume: u8,
 }
 
 /// Note/instrument/volume stash for the SDx (note delay) effect.
@@ -107,6 +159,12 @@ impl Default for Channel {
             tremolo_pos: 0,
             last_note: 0,
             pending_delay: None,
+            glissando: false,
+            vibrato_waveform: Waveform::Sine,
+            tremolo_waveform: Waveform::Sine,
+            random_state: 0x1234_5678,
+            tremor_phase: 0,
+            tremor_base_volume: 0xFF,
         }
     }
 }
@@ -129,12 +187,53 @@ fn note_to_frequency(note: u8, c5_speed: u32) -> f32 {
     (c5_speed as f32) * 2.0f32.powf(delta as f32 / 12.0)
 }
 
-/// Simple 64-entry sine vibrato table (8-bit signed, range -64..=64).
-fn vibrato_sine(pos: u8) -> i32 {
-    // Classic ST3 vibrato table (approx sine). Using f32 to keep the
-    // code small; precision isn't critical for smoke tests.
-    let phase = (pos as f32) * (std::f32::consts::PI * 2.0 / 64.0);
-    (phase.sin() * 64.0) as i32
+/// Sample the selected vibrato/tremolo waveform at table position `pos`
+/// (0..=63), returning a signed integer in the range -64..=64.
+///
+/// `Random` consumes one step of the channel's LCG. The LCG (Numerical
+/// Recipes' 32-bit ranqd1) is reproducible across runs and lets each
+/// channel keep its own independent noise without pulling rand crates.
+fn waveform_sample(wf: Waveform, pos: u8, rng: &mut u32) -> i32 {
+    match wf {
+        Waveform::Sine => {
+            // Sine in [-64,+64] sampled from a 64-entry period.
+            let phase = (pos as f32) * (std::f32::consts::PI * 2.0 / 64.0);
+            (phase.sin() * 64.0) as i32
+        }
+        Waveform::RampDown => {
+            // Ramp from +64 at pos=0 down to ~-62 at pos=63.
+            let p = pos & 0x3F;
+            64 - (p as i32) * 2
+        }
+        Waveform::Square => {
+            if pos & 0x20 == 0 {
+                64
+            } else {
+                -64
+            }
+        }
+        Waveform::Random => {
+            // Numerical-recipes ranqd1: x' = 1664525 * x + 1013904223.
+            *rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // Take the top 8 bits as a signed value, scaled to ±64.
+            let signed = (*rng >> 24) as i8;
+            (signed as i32 / 2).clamp(-64, 64)
+        }
+    }
+}
+
+/// Quantise an arbitrary frequency to the nearest equal-tempered
+/// semitone relative to `c5_speed`. Used when S1x glissando control is
+/// enabled — tone portamento then slides note-by-note instead of
+/// continuously.
+fn snap_to_semitone(freq: f32, c5_speed: u32) -> f32 {
+    if freq <= 0.0 {
+        return freq;
+    }
+    let c5 = (c5_speed.max(1)) as f32;
+    let semis = (freq / c5).log2() * 12.0;
+    let n = semis.round();
+    c5 * 2.0f32.powf(n / 12.0)
 }
 
 /// Top-level player state.
@@ -172,6 +271,14 @@ pub struct PlayerState {
     /// loop state per pattern (globally, not per-channel).
     loop_start_row: u8,
     loop_count: Option<u8>,
+    /// SEx pattern delay: when non-zero we hold the current row, replaying
+    /// all per-tick effects but not re-triggering notes. Decremented at
+    /// the end of each row-cycle until zero.
+    pattern_delay_remaining: u8,
+    /// `true` when `next_row` consumed an SEx replay and the *next*
+    /// `enter_row` call should skip cell application. Reset every time
+    /// the row is fully advanced.
+    replaying_for_pattern_delay: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -227,6 +334,8 @@ impl PlayerState {
             pending_jump: None,
             loop_start_row: 0,
             loop_count: None,
+            pattern_delay_remaining: 0,
+            replaying_for_pattern_delay: false,
         }
     }
 
@@ -264,22 +373,39 @@ impl PlayerState {
         }
         let row_cells: Vec<Cell> = self.patterns[pat_idx].rows[self.row as usize].clone();
 
+        // SEx pattern delay: when we're in the middle of a held row, the
+        // notes are *not* re-triggered, but the row's tick-0 effects are
+        // also not re-armed (per-tick effects keep firing because the
+        // channel state still carries `command` / `info` from the
+        // original entry). We just skip the cell-application phase.
+        let replaying_held_row = self.replaying_for_pattern_delay;
+
         let mut row_speed: Option<u8> = None;
         let mut row_tempo: Option<u8> = None;
         let mut row_global_vol: Option<u8> = None;
         let mut row_jump: Option<Jump> = None;
 
         let mut row_loop_request: Option<u8> = None;
+        let mut row_pattern_delay: Option<u8> = None;
 
         for (ch_idx, cell) in row_cells.iter().enumerate() {
             if ch_idx >= self.channels.len() {
                 break;
             }
             let ch = &mut self.channels[ch_idx];
+            if replaying_held_row {
+                // Don't touch ch.command/info — keep prior row's state so
+                // per-tick effects (vibrato, slides, …) keep cycling.
+                continue;
+            }
             ch.command = cell.command;
             ch.info = cell.info;
             // Clear any leftover delayed trigger from a prior row.
             ch.pending_delay = None;
+            // Reset Ixy tremor each row (matches the spec: each Ixy event
+            // starts the on-cycle fresh from the channel's current vol).
+            ch.tremor_phase = 0;
+            ch.tremor_base_volume = 0xFF;
 
             // Detect SDx (note delay) before applying the row: when x > 0,
             // we stash the cell and skip the usual tick-0 trigger so the
@@ -313,8 +439,11 @@ impl PlayerState {
                     if inst_idx > 0 && inst_idx <= self.samples.len() {
                         let c5 = self.samples[inst_idx - 1].c5_speed.max(1);
                         let freq = note_to_frequency(cell.note, c5);
-                        // Tone portamento (G): don't retrigger, set target.
-                        if ch.command == cmd::G_TONE_PORTA && ch.frequency > 0.0 {
+                        // Tone portamento (G) or its volslide combo (L):
+                        // don't retrigger, set target.
+                        let porta =
+                            ch.command == cmd::G_TONE_PORTA || ch.command == cmd::L_PORT_VOL;
+                        if porta && ch.frequency > 0.0 {
                             ch.target_frequency = freq;
                         } else {
                             ch.frequency = freq;
@@ -341,6 +470,8 @@ impl PlayerState {
             }
 
             // Tick-0 effects (instant / row-level).
+            let x = ch.info >> 4;
+            let y = ch.info & 0x0F;
             match ch.command {
                 cmd::A_SET_SPEED if ch.info != 0 => {
                     row_speed = Some(ch.info);
@@ -359,6 +490,41 @@ impl PlayerState {
                         row: r,
                     });
                 }
+                cmd::D_VOL_SLIDE => {
+                    // Fine vol slides are tick-0 only. DFy = fine down by
+                    // y; DxF = fine up by x. The double-F case (DFF) is
+                    // spec'd as "slide up", which our DxF branch already
+                    // handles when x=0xF, y=0xF.
+                    if x == 0xF && y != 0 {
+                        // DFy: fine down by y.
+                        ch.volume = ch.volume.saturating_sub(y);
+                    } else if y == 0xF && x != 0 {
+                        // DxF: fine up by x.
+                        ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
+                    } else if x == 0xF && y == 0 {
+                        // DF0: per spec text "If y is 0, the command will
+                        // be treated as a volume slide up with a value of
+                        // f (15)." — fine up by 15.
+                        ch.volume = (ch.volume as u16 + 15).min(64) as u8;
+                    }
+                }
+                cmd::E_SLIDE_DOWN if ch.info >= 0xE0 => {
+                    // EFx: fine down by x. EEx: extra-fine (×0.25). Both
+                    // are tick-0 only.
+                    let amount = (ch.info & 0x0F) as f32;
+                    let scale = if (ch.info & 0xF0) == 0xE0 { 0.25 } else { 1.0 };
+                    let f = 2.0f32.powf(-amount * scale / 768.0);
+                    ch.frequency *= f;
+                    ch.target_frequency *= f;
+                }
+                cmd::F_SLIDE_UP if ch.info >= 0xE0 => {
+                    // FFx: fine up. FEx: extra-fine up. Tick-0 only.
+                    let amount = (ch.info & 0x0F) as f32;
+                    let scale = if (ch.info & 0xF0) == 0xE0 { 0.25 } else { 1.0 };
+                    let f = 2.0f32.powf(amount * scale / 768.0);
+                    ch.frequency *= f;
+                    ch.target_frequency *= f;
+                }
                 cmd::T_SET_TEMPO if ch.info >= 0x20 => {
                     row_tempo = Some(ch.info);
                 }
@@ -367,24 +533,56 @@ impl PlayerState {
                 }
                 cmd::S_EXTENDED => {
                     // Sxy: extended commands. Subcommand in high nibble.
-                    // Handled at tick 0:
-                    //   S8x — set pan
-                    //   SBx — pattern loop (x=0 sets start, x>0 jumps back x times)
-                    //   SCx — note cut at tick x (per-tick, but the arming
-                    //         lives on tick 0; the actual silence happens in
-                    //         `apply_per_tick`)
-                    //   SDx — note delay (x>0 handled above as
-                    //         `is_note_delay`; the fire lives in
-                    //         `apply_per_tick`)
                     let sub = ch.info >> 4;
                     let p = ch.info & 0x0F;
                     match sub {
+                        // S0x — Amiga filter, unimplemented per ST3 spec.
+                        0x0 => {}
+                        // S1x — glissando: 0 disables, non-zero enables.
+                        0x1 => ch.glissando = p != 0,
+                        // S2x — set finetune from the 16-entry C4Spd table.
+                        // Per the spec this changes the *running C5 speed*
+                        // semantically; we mirror that by updating the
+                        // already-triggered note's frequency relative to
+                        // its last-played note.
+                        0x2 => {
+                            let new_c5 = S2X_FINETUNE_TABLE[p as usize];
+                            if ch.last_note != 0 {
+                                let new_freq = note_to_frequency(ch.last_note, new_c5);
+                                ch.frequency = new_freq;
+                                ch.target_frequency = new_freq;
+                            }
+                        }
+                        // S3x — vibrato waveform.
+                        0x3 => ch.vibrato_waveform = Waveform::from_nibble(p),
+                        // S4x — tremolo waveform.
+                        0x4 => ch.tremolo_waveform = Waveform::from_nibble(p),
                         0x8 => ch.pan = p,
+                        // SAx — old stereo control; not implemented in ST3.
+                        0xA => {}
                         0xB => {
                             // Collect loop requests across channels; ST3
                             // applies the last one on the row.
                             row_loop_request = Some(p);
                         }
+                        // SCx — note cut: per-tick arming. SC0 = immediate
+                        // silence at tick 0.
+                        0xC if p == 0 => {
+                            ch.volume = 0;
+                        }
+                        0xC => {}
+                        // SDx (x>0) handled above as note_delay.
+                        // SD0 falls through as a normal trigger.
+                        0xD => {}
+                        // SEx — pattern delay: hold this row x extra
+                        // times. Reset back to 0 on the row that issues a
+                        // non-SEx command (handled implicitly because the
+                        // counter only ticks down).
+                        0xE => {
+                            row_pattern_delay = Some(p);
+                        }
+                        // SFx — funkrepeat; not implemented in ST3.
+                        0xF => {}
                         _ => {}
                     }
                 }
@@ -396,6 +594,12 @@ impl PlayerState {
                 }
                 _ => {}
             }
+        }
+
+        if replaying_held_row {
+            // Held rows do not re-trigger anything but still walk through
+            // the per-tick path for the rest of the row.
+            return;
         }
 
         // Resolve SBx (pattern loop) after the row is scanned. SB0 marks
@@ -438,6 +642,13 @@ impl PlayerState {
         }
         if let Some(g) = row_global_vol {
             self.global_volume = g;
+        }
+        if let Some(p) = row_pattern_delay {
+            // SEx arms the counter only on the first play of this row;
+            // the row plays once at full effect, then `p` extra repeats
+            // follow. We're in the first-play branch because
+            // `replaying_held_row` is false above.
+            self.pattern_delay_remaining = p;
         }
         if row_jump.is_some() {
             self.pending_jump = row_jump;
@@ -513,40 +724,25 @@ impl PlayerState {
                     ch.frequency = ch.target_frequency * mult;
                 }
                 cmd::K_VIB_VOL => {
-                    // Kxy: vibrato (uses last H params? — ST3 uses current
-                    // params; treat as H + D combination this tick).
-                    if ch.target_frequency > 0.0 {
-                        ch.vibrato_pos = (ch.vibrato_pos.wrapping_add(4)) & 0x3F;
-                        let delta = vibrato_sine(ch.vibrato_pos);
-                        let mult = 2.0f32.powf(delta as f32 / 768.0);
-                        ch.frequency = ch.target_frequency * mult;
-                    }
+                    // Kxy: vibrato + volume slide. ST3 uses the current
+                    // channel's vibrato speed/depth (carried from the last
+                    // H command); here we approximate by reusing the
+                    // current row's (x, y) infobyte as the H params.
+                    Self::apply_vibrato(ch, x, y, /* fine: */ false);
                     Self::apply_dxy(ch, x, y);
                 }
                 cmd::L_PORT_VOL => {
-                    // Lxy: tone porta + vol slide. Use last G step? — we
-                    // approximate with a fixed slide of 1 toward target.
-                    if ch.target_frequency > 0.0 && ch.frequency != ch.target_frequency {
-                        let f = if ch.frequency < ch.target_frequency {
-                            2.0f32.powf(1.0 / 768.0)
-                        } else {
-                            2.0f32.powf(-1.0 / 768.0)
-                        };
-                        let new_f = ch.frequency * f;
-                        ch.frequency = if (new_f - ch.target_frequency).abs()
-                            < (ch.frequency - ch.target_frequency).abs()
-                        {
-                            new_f
-                        } else {
-                            ch.target_frequency
-                        };
-                    }
+                    // Lxy: tone porta + vol slide. The tone-porta step
+                    // matches Gxx (info bytes per tick), then the vol
+                    // slide applies in Dxy form.
+                    Self::apply_tone_porta(ch, ch.info);
                     Self::apply_dxy(ch, x, y);
                 }
                 // Qxy: retrigger every y ticks; x = volume change code.
                 cmd::Q_RETRIGGER if y != 0 && (tick % y) == 0 && tick > 0 => {
                     ch.sample_pos = 0.0;
-                    // Volume modifier x (subset implemented):
+                    // Volume modifier x — table from ScreamTracker-v3.20
+                    // -effects.txt §Qxy. 0x8 is "?" in the spec, keep as no-op.
                     match x {
                         0x1 => ch.volume = ch.volume.saturating_sub(1),
                         0x2 => ch.volume = ch.volume.saturating_sub(2),
@@ -571,7 +767,9 @@ impl PlayerState {
                     let depth = y;
                     if speed != 0 || depth != 0 {
                         ch.tremolo_pos = (ch.tremolo_pos.wrapping_add(speed * 4)) & 0x3F;
-                        let delta = (vibrato_sine(ch.tremolo_pos) * depth as i32) / 64;
+                        let wf = ch.tremolo_waveform;
+                        let s = waveform_sample(wf, ch.tremolo_pos, &mut ch.random_state);
+                        let delta = (s * depth as i32) / 64;
                         let v = (ch.volume as i32 + delta).clamp(0, 64);
                         ch.volume = v as u8;
                     }
@@ -583,38 +781,97 @@ impl PlayerState {
                 cmd::E_SLIDE_DOWN if ch.info != 0 && ch.info < 0xE0 => {
                     let f = 2.0f32.powf(-(ch.info as f32) / 768.0);
                     ch.frequency *= f;
+                    ch.target_frequency *= f;
                 }
                 cmd::F_SLIDE_UP if ch.info != 0 && ch.info < 0xE0 => {
                     let f = 2.0f32.powf((ch.info as f32) / 768.0);
                     ch.frequency *= f;
+                    ch.target_frequency *= f;
                 }
                 // Gxx: slide toward target at rate info/per tick.
                 cmd::G_TONE_PORTA if ch.info != 0 && ch.target_frequency > 0.0 => {
-                    let step = ch.info as f32;
-                    if ch.frequency < ch.target_frequency {
-                        let f = 2.0f32.powf(step / 768.0);
-                        ch.frequency = (ch.frequency * f).min(ch.target_frequency);
-                    } else if ch.frequency > ch.target_frequency {
-                        let f = 2.0f32.powf(-step / 768.0);
-                        ch.frequency = (ch.frequency * f).max(ch.target_frequency);
-                    }
+                    Self::apply_tone_porta(ch, ch.info);
                 }
                 cmd::H_VIBRATO => {
                     // Hxy: vibrato. x = speed, y = depth.
-                    let speed = x;
-                    let depth = y;
-                    if speed != 0 || depth != 0 {
-                        ch.vibrato_pos = (ch.vibrato_pos.wrapping_add(speed * 4)) & 0x3F;
-                        let delta = (vibrato_sine(ch.vibrato_pos) * depth as i32) / 128;
-                        let mult = 2.0f32.powf(delta as f32 / 48.0);
-                        // Apply on a copy so we don't accumulate drift.
-                        // We rebase off target_frequency (last triggered note).
-                        if ch.target_frequency > 0.0 {
-                            ch.frequency = ch.target_frequency * mult;
-                        }
+                    Self::apply_vibrato(ch, x, y, /* fine: */ false);
+                }
+                // Ixy: tremor — flip the note on/off in (x+1)-on /
+                // (y+1)-off cycles. Spec lets x=y=0 mean "always on" /
+                // ineffective so the guard mirrors that.
+                cmd::I_TREMOR if (x | y) != 0 => {
+                    // Capture the row's starting volume the first time
+                    // tremor fires, so we can restore it during on-phases.
+                    if ch.tremor_base_volume == 0xFF {
+                        ch.tremor_base_volume = ch.volume;
+                    }
+                    // tremor_phase counter resets each row in enter_row;
+                    // every tick we step through the on→off→on cycle.
+                    let on_ticks = x as u16 + 1;
+                    let off_ticks = y as u16 + 1;
+                    let period = (on_ticks + off_ticks).max(1);
+                    let pos = (tick as u16) % period;
+                    if pos < on_ticks {
+                        ch.volume = ch.tremor_base_volume.min(64);
+                    } else {
+                        ch.volume = 0;
                     }
                 }
+                // Uxy: fine vibrato — four times more accurate than Hxy.
+                cmd::U_FINE_VIBRATO => {
+                    Self::apply_vibrato(ch, x, y, /* fine: */ true);
+                }
                 _ => {}
+            }
+        }
+    }
+
+    /// Hxy / Uxy / Kxy vibrato kernel. `fine = true` is the U variant
+    /// (4× more accurate, i.e. depth divided by 4).
+    fn apply_vibrato(ch: &mut Channel, speed: u8, depth: u8, fine: bool) {
+        if speed == 0 && depth == 0 {
+            return;
+        }
+        if ch.target_frequency <= 0.0 {
+            return;
+        }
+        ch.vibrato_pos = (ch.vibrato_pos.wrapping_add(speed * 4)) & 0x3F;
+        let wf = ch.vibrato_waveform;
+        let s = waveform_sample(wf, ch.vibrato_pos, &mut ch.random_state);
+        let div = if fine { 512 } else { 128 };
+        let delta = (s * depth as i32) / div;
+        let mult = 2.0f32.powf(delta as f32 / 48.0);
+        ch.frequency = ch.target_frequency * mult;
+    }
+
+    /// Gxx / Lxy tone-portamento kernel. `step` is the info byte (units
+    /// 1/64ths of a semitone). Honours the per-channel glissando flag
+    /// (S1x) by snapping to the nearest semitone when the slide step
+    /// would otherwise overshoot the target.
+    fn apply_tone_porta(ch: &mut Channel, step: u8) {
+        if step == 0 || ch.target_frequency <= 0.0 {
+            return;
+        }
+        let s = step as f32;
+        let prev = ch.frequency;
+        if prev < ch.target_frequency {
+            let f = 2.0f32.powf(s / 768.0);
+            ch.frequency = (prev * f).min(ch.target_frequency);
+        } else if prev > ch.target_frequency {
+            let f = 2.0f32.powf(-s / 768.0);
+            ch.frequency = (prev * f).max(ch.target_frequency);
+        }
+        if ch.glissando {
+            // S1x: snap each step to the nearest semitone of the channel's
+            // current C5 reference. We derive C5 from target_frequency by
+            // assuming last_note: target = c5 * 2^((note-48)/12).
+            if ch.last_note != 0 {
+                let oct = (ch.last_note >> 4) as i32;
+                let semi = (ch.last_note & 0x0F) as i32;
+                let n = oct * 12 + semi;
+                let delta = n - 48;
+                let c5 = ch.target_frequency / 2.0f32.powf(delta as f32 / 12.0);
+                ch.frequency = snap_to_semitone(ch.frequency, c5.round().max(1.0) as u32);
             }
         }
     }
@@ -641,6 +898,19 @@ impl PlayerState {
     }
 
     fn next_row(&mut self) {
+        // SEx pattern delay: when the counter is still positive, replay
+        // the same row instead of advancing. Each replay consumes one
+        // unit. A pattern jump (B/C) and pattern-loop SBx still take
+        // priority, matching ST3 behaviour where those commands end the
+        // delay early.
+        if self.pattern_delay_remaining > 0 && self.pending_jump.is_none() {
+            self.pattern_delay_remaining -= 1;
+            self.replaying_for_pattern_delay = true;
+            return;
+        }
+        // Drop any stale delay carryover (a row with no SEx clears it).
+        self.pattern_delay_remaining = 0;
+        self.replaying_for_pattern_delay = false;
         if let Some(jump) = self.pending_jump.take() {
             if let Some(order) = jump.order {
                 self.order_index = order;
@@ -743,13 +1013,14 @@ impl PlayerState {
             l += cl;
             r += cr;
         }
-        // Mix-down gain. ST3's nominal master_volume is 48 (out of 127);
-        // libxmp/openmpt treat that as the "neutral" setting and so do
-        // we. Channel-count compensation uses sqrt rather than linear
-        // division — typical S3M content has only a few channels at
-        // their peak simultaneously, so dividing by N (instead of √N)
-        // crushes the perceived loudness by ~6-12 dB on big modules.
-        // Final clamp catches the rare actual peak.
+        // Mix-down gain. ST3's nominal master_volume is 48 (out of 127),
+        // which is what F10/Setup defaults the SOUNDCFG slider to; we
+        // treat that as the "neutral" 1.0 setting. Channel-count
+        // compensation uses sqrt rather than linear division — typical
+        // S3M content has only a few channels at their peak
+        // simultaneously, so dividing by N (instead of √N) crushes the
+        // perceived loudness by ~6-12 dB on big modules. Final clamp
+        // catches the rare actual peak.
         let mv = (self.master_volume.max(1) as f32) / 48.0;
         let gv = (self.global_volume as f32) / 64.0;
         let norm = (self.active_channels as f32).max(1.0).sqrt();
@@ -892,5 +1163,57 @@ pub mod tests {
         let f4 = note_to_frequency(0x40, 8363);
         let f5 = note_to_frequency(0x50, 8363);
         assert!((f5 / f4 - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn waveform_square_is_bipolar_constant() {
+        let mut rng = 0u32;
+        // First half (pos < 32) → +64; second half → -64.
+        assert_eq!(waveform_sample(Waveform::Square, 0, &mut rng), 64);
+        assert_eq!(waveform_sample(Waveform::Square, 31, &mut rng), 64);
+        assert_eq!(waveform_sample(Waveform::Square, 32, &mut rng), -64);
+        assert_eq!(waveform_sample(Waveform::Square, 63, &mut rng), -64);
+    }
+
+    #[test]
+    fn waveform_rampdown_decreases() {
+        let mut rng = 0u32;
+        let a = waveform_sample(Waveform::RampDown, 0, &mut rng);
+        let b = waveform_sample(Waveform::RampDown, 16, &mut rng);
+        let c = waveform_sample(Waveform::RampDown, 32, &mut rng);
+        assert!(a > b && b > c, "ramp should be strictly decreasing");
+        assert_eq!(a, 64);
+        assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn waveform_random_changes_state() {
+        let mut rng = 0x1234_5678u32;
+        let initial = rng;
+        let _ = waveform_sample(Waveform::Random, 0, &mut rng);
+        assert_ne!(rng, initial, "random must advance the LCG");
+    }
+
+    #[test]
+    fn snap_to_semitone_rounds_to_exact_note() {
+        let c5 = 8363u32;
+        // 8363 * 2^(7/12) ≈ 12544 (~G-5).  Add 2.4% drift — should snap
+        // back to the exact semitone value.
+        let drifted = 12544.0 * 1.005;
+        let snapped = snap_to_semitone(drifted, c5);
+        let exact = (c5 as f32) * 2.0f32.powf(7.0 / 12.0);
+        assert!(
+            (snapped - exact).abs() < 1.0,
+            "snapped={snapped}, exact={exact}"
+        );
+    }
+
+    #[test]
+    fn s2x_table_endpoints_match_spec() {
+        // From docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt §S2x:
+        //  S20 → 7895 Hz, S28 → 8363 Hz (no finetune), S2F → 8757 Hz.
+        assert_eq!(S2X_FINETUNE_TABLE[0x0], 7895);
+        assert_eq!(S2X_FINETUNE_TABLE[0x8], 8363);
+        assert_eq!(S2X_FINETUNE_TABLE[0xF], 8757);
     }
 }

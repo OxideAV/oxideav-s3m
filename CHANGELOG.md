@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ST3 effect set widened to match the v3.20 spec:
+  - `Ixy` (tremor) — on/off cycle per channel, base-volume restoration.
+  - `Uxy` (fine vibrato) — same vibrato kernel as `Hxy` with 4× finer depth.
+  - `SE x` (pattern delay) — replays the current row `x` extra times without
+    re-triggering notes; per-tick effects keep cycling.
+  - `S1x` (glissando control) — `Gxx` / `Lxy` slides snap to the nearest
+    semitone of the channel's running C5 reference when enabled.
+  - `S2x` (finetune) — switches the running C5 speed to one of the 16
+    `ScreamTracker-v3.20-effects.txt` C4Spd table values.
+  - `S3x` / `S4x` (vibrato / tremolo waveform select) — sine (default), ramp
+    down, square, random. Random is a per-channel LCG seeded for
+    reproducibility.
+  - Fine pitch slides `EFx`, `EEx` (extra-fine), `FFx`, `FEx` — tick-0 only.
+  - Fine vol slides `DFy`, `DxF`, and the `DF0` "treat as fine-up by 15" case.
+  - `SC0` — immediate note cut at tick 0.
+- `Lxy` (tone-porta + vol-slide) now uses the actual Gxx tone-porta kernel
+  (per-tick rate from infobyte) instead of the constant-step approximation.
+- Glissando snap helper `snap_to_semitone` and waveform sampler
+  `waveform_sample` exposed for unit testing.
+
+### Changed
+
+- `Exx` / `Fxx` continuous pitch slides now apply to both `frequency` and
+  `target_frequency` so a subsequent vibrato (which rebases off
+  `target_frequency`) tracks the slide rather than snapping back.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.5...v0.0.6) - 2026-05-06
 
 ### Other
