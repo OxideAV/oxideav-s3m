@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ST3 **effect memory** ("%" semantics from the multimedia.cx behavioural
+  reference): per-channel storage of the latest nonzero parameter for
+  each command; a row with the same command and parameter 0 reuses the
+  stored value. `H` / `U` share a slot (fine vibrato shares memory with
+  vibrato per spec), and the entire `Sxy` family collapses onto a single
+  slot. Covers `D`, `E`, `F`, `H`, `I`, `J`, `K`, `L`, `O`, `Q`, `R`,
+  `S`, `U`.
+- `S3x` / `S4x` waveform select now respects bit 2 ("don't reset
+  waveform position when a new note plays"), e.g. `S34`, `S3E`.
 - ST3 effect set widened to match the v3.20 spec:
   - `Ixy` (tremor) — on/off cycle per channel, base-volume restoration.
   - `Uxy` (fine vibrato) — same vibrato kernel as `Hxy` with 4× finer depth.
@@ -34,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Exx` / `Fxx` continuous pitch slides now apply to both `frequency` and
   `target_frequency` so a subsequent vibrato (which rebases off
   `target_frequency`) tracks the slide rather than snapping back.
+- `Dxy` volume-slide cases aligned with the multimedia.cx behavioural
+  reference: `DFF` is fine slide *up* by 15 (previously slid down 15),
+  `D0F` / `DF0` now slide on every tick (including tick 0) per the wiki,
+  and a `Dxy` with both nibbles in 1..=E is treated as `D0y` (slide down
+  by y) per the documented ST3 quirk.
+- `SC0` (note-cut tick 0) is now a no-op — per multimedia.cx §SCx, an
+  `SC0` is *ignored* by ST3 rather than cutting immediately. The earlier
+  immediate-silence implementation was rolled back.
+- `Cxx` (pattern break) with a decoded row >= 64 is now ignored per the
+  multimedia.cx behavioural reference (was previously clamped to row 63
+  which produced an unintended jump).
 
 ## [0.0.6](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.5...v0.0.6) - 2026-05-06
 

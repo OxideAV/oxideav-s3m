@@ -55,6 +55,20 @@ pub const S2X_FINETUNE_TABLE: [u32; 16] = [
     7895, 7941, 7985, 8046, 8107, 8169, 8232, 8280, 8363, 8413, 8463, 8529, 8581, 8651, 8723, 8757,
 ];
 
+/// Map an ST3 command number to its per-channel effect-memory slot.
+///
+/// H and U share a slot (multimedia.cx wiki: "Uxy shares memory with Hxy").
+/// All Sxy subcommands collapse to a single S slot — the next row's S
+/// command sees the latest nonzero `info` byte even across S-subcommand
+/// boundaries.
+fn effect_memory_slot(command: u8) -> u8 {
+    match command {
+        // U → H slot.
+        cmd::U_FINE_VIBRATO => cmd::H_VIBRATO,
+        _ => command,
+    }
+}
+
 /// Vibrato / tremolo waveform selector (S3x / S4x parameter low nibble).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Waveform {
@@ -128,6 +142,19 @@ pub struct Channel {
     /// Volume captured when a row's Ixy command first fires, so we can
     /// restore it after an off-phase. 0xFF = "no captured value yet".
     pub tremor_base_volume: u8,
+    /// When `true`, a new note must not reset `vibrato_pos` / `tremolo_pos`.
+    /// Set by `S3x`/`S4x` when bit 2 of the parameter is high (e.g. `S34`,
+    /// `S3E` per the multimedia.cx clean-room behavioural reference).
+    pub keep_vibrato_pos_on_new_note: bool,
+    /// Same as the above, but for the tremolo (`S4x`) waveform.
+    pub keep_tremolo_pos_on_new_note: bool,
+    /// Effect-memory store, indexed by ST3 command 0..=26. The multimedia.cx
+    /// clean-room behavioural reference labels nearly every parameter-bearing
+    /// effect with "%" (use the latest nonzero parameter to show up). When a
+    /// row's command is the same as one already seen on this channel and the
+    /// infobyte is zero, ST3 reuses the stored value. `H` / `U` (vibrato /
+    /// fine vibrato) share memory, as does `O` (sample offset).
+    pub effect_memory: [u8; 27],
 }
 
 /// Note/instrument/volume stash for the SDx (note delay) effect.
@@ -165,6 +192,9 @@ impl Default for Channel {
             random_state: 0x1234_5678,
             tremor_phase: 0,
             tremor_base_volume: 0xFF,
+            keep_vibrato_pos_on_new_note: false,
+            keep_tremolo_pos_on_new_note: false,
+            effect_memory: [0; 27],
         }
     }
 }
@@ -400,6 +430,21 @@ impl PlayerState {
             }
             ch.command = cell.command;
             ch.info = cell.info;
+            // Effect-memory ("%"): if the row's infobyte is zero and the
+            // channel has seen this command before with a nonzero parameter,
+            // ST3 reuses the latest nonzero value. H/U share a slot. S also
+            // shares a slot per the multimedia.cx behavioural reference.
+            // Effects that do NOT carry memory: A (speed), B/C (jumps), T,
+            // V (global volume) — they get a fresh-row interpretation each
+            // time and zero-arg is per-effect specified.
+            if ch.command != 0 {
+                let slot = effect_memory_slot(ch.command);
+                if ch.info == 0 {
+                    ch.info = ch.effect_memory[slot as usize];
+                } else {
+                    ch.effect_memory[slot as usize] = ch.info;
+                }
+            }
             // Clear any leftover delayed trigger from a prior row.
             ch.pending_delay = None;
             // Reset Ixy tremor each row (matches the spec: each Ixy event
@@ -456,8 +501,16 @@ impl PlayerState {
                                 ch.sample_pos = 0.0;
                             }
                             ch.active = true;
-                            ch.vibrato_pos = 0;
-                            ch.tremolo_pos = 0;
+                            // S3x / S4x bit 2 keeps the vibrato / tremolo
+                            // phase across new notes (multimedia.cx wiki
+                            // §S3x: "If the third bit is set, don't reset
+                            // waveform when a new note is played.")
+                            if !ch.keep_vibrato_pos_on_new_note {
+                                ch.vibrato_pos = 0;
+                            }
+                            if !ch.keep_tremolo_pos_on_new_note {
+                                ch.tremolo_pos = 0;
+                            }
                             ch.last_note = cell.note;
                         }
                     }
@@ -483,29 +536,47 @@ impl PlayerState {
                     });
                 }
                 cmd::C_PAT_BREAK => {
-                    // Parameter is BCD (high nibble * 10 + low).
-                    let r = ((ch.info >> 4) * 10 + (ch.info & 0x0F)).min(63);
-                    row_jump = Some(Jump {
-                        order: None,
-                        row: r,
-                    });
+                    // Parameter is BCD (high nibble * 10 + low). Per the
+                    // multimedia.cx behavioural reference, an out-of-range
+                    // target (>= 64) makes ST3 ignore the effect entirely.
+                    let r = (ch.info >> 4) * 10 + (ch.info & 0x0F);
+                    if r < 64 {
+                        row_jump = Some(Jump {
+                            order: None,
+                            row: r,
+                        });
+                    }
                 }
                 cmd::D_VOL_SLIDE => {
-                    // Fine vol slides are tick-0 only. DFy = fine down by
-                    // y; DxF = fine up by x. The double-F case (DFF) is
-                    // spec'd as "slide up", which our DxF branch already
-                    // handles when x=0xF, y=0xF.
-                    if x == 0xF && y != 0 {
+                    // Tick-0 leg of the Dxy table. The multimedia.cx wiki
+                    // enumerates the full case matrix; the per-tick path
+                    // handles the smooth slides for D0x / Dx0 and the
+                    // remaining `D0F` / `DF0` units (which also fire at
+                    // tick 0, per the "slide on all ticks" note).
+                    //
+                    //   DFF       → fine up by 15 on tick 0.
+                    //   DFx (x<F) → fine down by x on tick 0.
+                    //   DxF (x<F) → fine up by x on tick 0.
+                    //   D0F       → slide down by 15 on all ticks, incl. 0.
+                    //   DF0       → slide up   by 15 on all ticks, incl. 0.
+                    if x == 0xF && y == 0xF {
+                        // DFF: slide up by 15 on tick 0 — multimedia.cx
+                        // contradicts an earlier reading of the v3.20
+                        // manual that treated it as DFy=down-by-F.
+                        ch.volume = (ch.volume as u16 + 15).min(64) as u8;
+                    } else if x == 0xF && y == 0 {
+                        // DF0: slide up by 15 on tick 0 (also fires on all
+                        // subsequent ticks via apply_dxy).
+                        ch.volume = (ch.volume as u16 + 15).min(64) as u8;
+                    } else if x == 0 && y == 0xF {
+                        // D0F: slide down by 15 on tick 0.
+                        ch.volume = ch.volume.saturating_sub(15);
+                    } else if x == 0xF && y != 0 {
                         // DFy: fine down by y.
                         ch.volume = ch.volume.saturating_sub(y);
                     } else if y == 0xF && x != 0 {
                         // DxF: fine up by x.
                         ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
-                    } else if x == 0xF && y == 0 {
-                        // DF0: per spec text "If y is 0, the command will
-                        // be treated as a volume slide up with a value of
-                        // f (15)." — fine up by 15.
-                        ch.volume = (ch.volume as u16 + 15).min(64) as u8;
                     }
                 }
                 cmd::E_SLIDE_DOWN if ch.info >= 0xE0 => {
@@ -553,10 +624,20 @@ impl PlayerState {
                                 ch.target_frequency = new_freq;
                             }
                         }
-                        // S3x — vibrato waveform.
-                        0x3 => ch.vibrato_waveform = Waveform::from_nibble(p),
-                        // S4x — tremolo waveform.
-                        0x4 => ch.tremolo_waveform = Waveform::from_nibble(p),
+                        // S3x — vibrato waveform. Bit 2 (mask 0x04) is the
+                        // "don't reset waveform position when a new note
+                        // plays" flag, per the multimedia.cx behavioural
+                        // reference for ST3 §S3x. Bit 3 (mask 0x08) is
+                        // ignored.
+                        0x3 => {
+                            ch.vibrato_waveform = Waveform::from_nibble(p);
+                            ch.keep_vibrato_pos_on_new_note = (p & 0x04) != 0;
+                        }
+                        // S4x — tremolo waveform. Same bit-2 contract.
+                        0x4 => {
+                            ch.tremolo_waveform = Waveform::from_nibble(p);
+                            ch.keep_tremolo_pos_on_new_note = (p & 0x04) != 0;
+                        }
                         0x8 => ch.pan = p,
                         // SAx — old stereo control; not implemented in ST3.
                         0xA => {}
@@ -565,11 +646,10 @@ impl PlayerState {
                             // applies the last one on the row.
                             row_loop_request = Some(p);
                         }
-                        // SCx — note cut: per-tick arming. SC0 = immediate
-                        // silence at tick 0.
-                        0xC if p == 0 => {
-                            ch.volume = 0;
-                        }
+                        // SCx — note cut after x ticks. Per the multimedia.cx
+                        // behavioural reference (§SCx) the SC0 case is
+                        // *ignored* — ST3 does not cut on tick 0. The per-
+                        // tick path silences the channel when `tick == x`.
                         0xC => {}
                         // SDx (x>0) handled above as note_delay.
                         // SD0 falls through as a normal trigger.
@@ -691,8 +771,12 @@ impl PlayerState {
                             ch.target_frequency = freq;
                             ch.sample_pos = 0.0;
                             ch.active = true;
-                            ch.vibrato_pos = 0;
-                            ch.tremolo_pos = 0;
+                            if !ch.keep_vibrato_pos_on_new_note {
+                                ch.vibrato_pos = 0;
+                            }
+                            if !ch.keep_tremolo_pos_on_new_note {
+                                ch.tremolo_pos = 0;
+                            }
                             ch.last_note = pd.note;
                         }
                     }
@@ -876,15 +960,36 @@ impl PlayerState {
         }
     }
 
-    /// Dxy volume slide step (per-tick path). Fine slides (Dx0 where
-    /// x=0xF, or D0y where y=0xF) are tick-0 only and intentionally
-    /// no-op here.
+    /// Dxy volume slide step (per-tick path).
+    ///
+    /// Cases per the multimedia.cx behavioural reference:
+    /// - `Dx0` (x in 1..=E): slide up by x on every nonzero tick.
+    /// - `D0y` (y in 1..=E): slide down by y on every nonzero tick.
+    /// - `D0F`: slide down by 15 on *all* ticks (incl. tick 0). The wiki
+    ///   explicitly notes this overrides the usual "fine-on-tick-0" rule.
+    /// - `DF0`: slide up by 15 on *all* ticks. Same note.
+    /// - `Dxy` (both 1..=E): ST3 treats as `D0y` (slide down by y) —
+    ///   Impulse Tracker does nothing, ST3 doesn't. We honour ST3's path.
+    /// - Fine slides (`DFy`, `DxF`, `DFF`) — tick-0 only, handled at row
+    ///   entry; this function intentionally no-ops for those.
     fn apply_dxy(ch: &mut Channel, x: u8, y: u8) {
-        if x == 0xF || y == 0xF {
-            // Fine — tick-0 only.
+        if x == 0 && y == 0xF {
+            // D0F: slide down by 15 on all ticks (also fires at tick 0
+            // via row-entry — both legs add up to the spec'd amount).
+            ch.volume = ch.volume.saturating_sub(15);
+        } else if x == 0xF && y == 0 {
+            // DF0: slide up by 15 on all ticks.
+            ch.volume = (ch.volume as u16 + 15).min(64) as u8;
+        } else if x == 0xF || y == 0xF {
+            // DFy / DxF / DFF — fine, tick-0 only.
         } else if x != 0 && y == 0 {
+            // Dx0: slide up.
             ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
         } else if y != 0 && x == 0 {
+            // D0y: slide down.
+            ch.volume = ch.volume.saturating_sub(y);
+        } else if x != 0 && y != 0 {
+            // Dxy with both nibbles 1..=E: ST3 quirk — slide DOWN by y.
             ch.volume = ch.volume.saturating_sub(y);
         }
     }

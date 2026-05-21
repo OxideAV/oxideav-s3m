@@ -22,19 +22,28 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
 
 - PCM instruments (8-bit signed/unsigned, 16-bit, mono and true-stereo).
 - AdLib instrument types are skipped (no OPL synth).
-- Effects: `Axx` (speed), `Bxx` (pos jump), `Cxx` (pattern break), `Dxy`
-  (volume slide, including fine variants `DFy`/`DxF`/`DF0`), `Exx` /
-  `Fxx` (pitch slides, with fine `EFx`/`FFx` and extra-fine `EEx`/`FEx`),
-  `Gxx` (tone portamento), `Hxy` (vibrato), `Ixy` (tremor), `Jxy`
-  (arpeggio), `Kxy` (vib+vol), `Lxy` (porta+vol), `Oxx` (sample offset),
-  `Qxy` (retrigger), `Rxy` (tremolo), `Txx` (tempo), `Uxy` (fine
-  vibrato), `Vxx` (global volume), `Xxx` (set pan), plus the `Sxy`
+- Effects: `Axx` (speed), `Bxx` (pos jump), `Cxx` (pattern break — rows
+  64+ ignored per ST3), `Dxy` volume slide — full multimedia.cx case
+  matrix including `D0F`/`DF0` (slide-on-all-ticks), `DFF` (fine up by
+  15), `DFy`/`DxF` fine variants, and the ST3 `Dxy` both-nibbles-nonzero
+  quirk (treats as `D0y`/slide-down). `Exx` / `Fxx` pitch slides (with
+  fine `EFx`/`FFx` and extra-fine `EEx`/`FEx`), `Gxx` (tone portamento),
+  `Hxy` (vibrato), `Ixy` (tremor), `Jxy` (arpeggio), `Kxy` (vib+vol),
+  `Lxy` (porta+vol), `Oxx` (sample offset), `Qxy` (retrigger), `Rxy`
+  (tremolo), `Txx` (tempo), `Uxy` (fine vibrato — shares memory with
+  `Hxy`), `Vxx` (global volume), `Xxx` (set pan), plus the `Sxy`
   family (`S1x` glissando, `S2x` finetune from the spec C4Spd table,
   `S3x`/`S4x` vibrato/tremolo waveform select [sine, ramp-down, square,
-  random], `S80` pan, `SBx` pattern loop, `SCx` note cut [`SC0`
-  immediate], `SDx` note delay, `SEx` pattern delay). `S0x` filter and
-  `SFx` funkrepeat are spec'd as not implemented in ST3 itself and
-  decode as no-ops.
+  random] with bit-2 "keep position across new note" support, `S80`
+  pan, `SBx` pattern loop, `SCx` note cut [`SC0` ignored per spec],
+  `SDx` note delay, `SEx` pattern delay). `S0x` filter and `SFx`
+  funkrepeat are spec'd as not implemented in ST3 itself and decode
+  as no-ops.
+- **Effect memory** (the ST3 "%" semantics): channels remember the
+  latest nonzero parameter for each command and substitute it back in
+  when a row carries the same command with parameter 0. `H` / `U` and
+  the entire `Sxy` family share their slots per the multimedia.cx
+  behavioural reference.
 - Per-channel pan (default-pan block or synthesised from channel settings).
 
 **Decode-only** — no S3M encoder is provided, by design. S3M is a tracker

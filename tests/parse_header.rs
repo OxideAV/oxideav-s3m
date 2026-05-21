@@ -940,7 +940,10 @@ fn decoder_multichannel_emits_32_stereo_streams() {
 /// SC0 cuts immediately at tick 0. Our row should be silent end-to-end
 /// because the volume is zeroed before any sample is rendered.
 #[test]
-fn effect_sc0_cuts_immediately() {
+fn effect_sc0_is_ignored_per_st3_spec() {
+    // Per the multimedia.cx behavioural reference §SCx: "If the argument
+    // is 0, the effect is ignored." An SC0 must therefore NOT silence
+    // the channel — the note plays normally for the full row.
     let pat_body: Vec<u8> = vec![
         0xA0, 0x50, 1, // note + instrument
         19, 0xC0, // S, info 0xC0 -> SC0
@@ -949,15 +952,13 @@ fn effect_sc0_cuts_immediately() {
     let bytes = build_synth_with_pattern(pat_body);
     let frames = render_all(&bytes);
     let spt = 882usize;
-    // The whole row 0 must be silent (volume forced to 0 at tick 0).
+    // Row 0 should contain at least some audible output (not solid zero).
     let row0 = &frames[..6 * spt];
-    for (i, &(l, r)) in row0.iter().enumerate() {
-        assert_eq!(
-            (l, r),
-            (0, 0),
-            "SC0 should silence tick 0 onward; frame {i} = ({l},{r})"
-        );
-    }
+    let any_audible = row0.iter().any(|&(l, r)| l != 0 || r != 0);
+    assert!(
+        any_audible,
+        "SC0 should be ignored — channel must remain audible across row 0"
+    );
 }
 
 /// SEx pattern delay: a `SE2` on row 0 (which carries the note) should
@@ -1229,5 +1230,276 @@ fn effect_s3x_square_waveform_changes_vibrato_shape() {
     assert!(
         any_pos && any_neg,
         "square vibrato should swing both directions; deltas={deltas:?}"
+    );
+}
+
+/// Effect-memory: a row with `H00` after a prior `H82` should reuse the
+/// `0x82` parameter (vibrato speed 8, depth 2) rather than acting like
+/// `H00`/no-op. The multimedia.cx behavioural reference labels Hxy with
+/// "%" — "Get xy from the latest nonzero effect parameter".
+#[test]
+fn effect_memory_hxy_recalls_prior_parameter() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + H35 (vibrato speed 3, depth 5)
+    // Row 1: H00      (must reuse memory → still vibrates)
+    //
+    // H35 was chosen so that vibrato_pos values across ticks don't all
+    // land on sine zero-crossings — speed 3 (vibrato_pos += 12 / tick)
+    // avoids the multiple-of-32 issue that H82 would hit.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 8, 0x35, // row 0: trigger + H35
+        0x00, // end row 0
+        0x80, 8, 0x00, // row 1: H00 (cmd only)
+        0x00, // end row 1
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Walk through row 0.
+    let mut buf = vec![0i16; 2 * 6 * 882];
+    player.render(&mut buf);
+
+    // We're now at row 1 (H00). After memory recall the channel's stored
+    // info should match the prior row's parameter 0x35.
+    assert_eq!(
+        player.channels[0].info, 0x35,
+        "H00 must recall the latest nonzero Hxy parameter (0x35)"
+    );
+
+    // Drive a few ticks of row 1 and verify the vibrato is still active —
+    // frequency must deviate from the row-1 base over consecutive ticks.
+    let base = player.channels[0].frequency;
+    let tick_buf = vec![0i16; 2 * 882];
+    let mut moved = false;
+    for _ in 0..5 {
+        let mut tb = tick_buf.clone();
+        player.render(&mut tb);
+        if (player.channels[0].frequency - base).abs() > 0.5 {
+            moved = true;
+            break;
+        }
+    }
+    assert!(
+        moved,
+        "H00 with memory should keep vibrating; base={base}, cur={}",
+        player.channels[0].frequency
+    );
+}
+
+/// Effect-memory shared between Hxy and Uxy: an `H82` followed by `U00`
+/// (cmd 21, info 0) must reuse the `0x82` parameter (multimedia.cx
+/// behavioural reference: "Uxy (*) — Fine vibrato. This effect shares
+/// memory with Hxy.")
+#[test]
+fn effect_memory_uxy_shares_with_hxy() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + H82.
+    // Row 1: U00 — must pick up the 0x82 from the H slot.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 8, 0x82, // row 0: trigger + H82
+        0x00, // end row 0
+        0x80, 21, 0x00, // row 1: U00 (cmd 21 = U)
+        0x00, // end row 1
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Walk past row 0.
+    let mut buf = vec![0i16; 2 * 6 * 882];
+    player.render(&mut buf);
+
+    // Now in row 1 (U00). The shared H-slot memory should have made info=0x82.
+    assert_eq!(
+        player.channels[0].info, 0x82,
+        "U00 must recall the H-slot memory of 0x82"
+    );
+}
+
+/// Effect-memory across Dxy / Exy / Fxy / Oxy etc.: a fresh `D04` on row
+/// 0 sets the channel slot; a later `D00` reuses it. Verified by the
+/// channel's stored `info` value after the second row.
+#[test]
+fn effect_memory_dxy_recalls_prior_parameter() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + D04 (slide down by 4 per tick).
+    // Row 1: D00 — reuse the 0x04 stored on the D slot.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 4, 0x04, // row 0: trigger + D04
+        0x00, // end row 0
+        0x80, 4, 0x00, // row 1: D00 (cmd 4 = D)
+        0x00, // end row 1
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Walk past row 0.
+    let mut buf = vec![0i16; 2 * 6 * 882];
+    player.render(&mut buf);
+
+    assert_eq!(
+        player.channels[0].info, 0x04,
+        "D00 must recall the latest nonzero Dxy parameter (0x04)"
+    );
+}
+
+/// DFF must be treated as "fine slide up by 15" — the multimedia.cx
+/// clean-room behavioural reference enumerates this case explicitly.
+/// A prior fade-down to 0 followed by DFF should bring the volume up.
+#[test]
+fn effect_dff_is_fine_slide_up_by_fifteen() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + DFF (D=4, info=0xFF). Initial inst volume = 64.
+    // Expected: 64 + 15 clamped to 64.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 4, 0xFF, // row 0: trigger + DFF
+        0x00,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    let mut buf = vec![0i16; 2 * 64];
+    player.render(&mut buf);
+    assert_eq!(
+        player.channels[0].volume, 64,
+        "DFF must add 15 (clamped) at tick 0, not subtract"
+    );
+}
+
+/// Cxx with row >= 64 (decimal) must be ignored per multimedia.cx §Cxy.
+/// We send C99 (decimal 99) on row 1 — a normal player would jump to
+/// row 99 of pattern 0, which is out of bounds. ST3 instead leaves the
+/// pattern walking normally.
+#[test]
+fn effect_cxx_out_of_range_is_ignored() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + C99 (cmd 3 = C, info 0x99 = decimal 99 — invalid).
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 3, 0x99, // row 0: trigger + C99
+        0x00,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Drive past row 0; player must advance to row 1 (not jump elsewhere).
+    let mut buf = vec![0i16; 2 * 6 * 882];
+    player.render(&mut buf);
+    assert_eq!(
+        player.row, 1,
+        "C99 (decimal 99 = out-of-range) must be ignored; expected row 1"
+    );
+    assert_eq!(
+        player.order_index, 0,
+        "Out-of-range Cxx must not advance to the next order"
+    );
+}
+
+/// Dxy with both nibbles in 1..=E is a Scream Tracker quirk: per the
+/// multimedia.cx behavioural reference, ST3 treats it as D0y (slide
+/// *down* by y), not as a combined up+down. Sample D54 starting from
+/// volume 64 with speed 6 (5 nonzero ticks) → 64 - (5 * 4) = 44.
+#[test]
+fn effect_dxy_both_nibbles_nonzero_slides_down_by_y() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + D54 (cmd 4 = D, x=5, y=4). ST3 quirk → D04 behaviour.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 4, 0x54, // row 0: trigger + D54
+        0x00,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Render a full row (6 ticks at speed 6). Ticks 1..=5 each apply
+    // a -y=4 slide; tick 0 is the trigger/no-op for non-fine cases.
+    let mut buf = vec![0i16; 2 * 6 * 882];
+    player.render(&mut buf);
+    // 64 - 4 * 5 = 44.
+    assert_eq!(
+        player.channels[0].volume, 44,
+        "Dxy with both nibbles nonzero must slide DOWN by y per ST3"
+    );
+}
+
+/// S3x bit-2 set (e.g. S34 = square waveform with no-reset-on-new-note)
+/// must keep the vibrato phase across a subsequent note trigger.
+#[test]
+fn effect_s3x_bit2_preserves_vibrato_position() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + S36 (vibrato wf=square|2, no-reset bit=4 → 0x36).
+    // Row 1: H82 (kick the vibrato so vibrato_pos advances)
+    // Row 2: note again — vibrato_pos MUST survive the new trigger.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 19, 0x36, // row 0: trigger + S36 (square, no-reset)
+        0x00, 0x80, 8, 0x82, // row 1: H82 (cmd only)
+        0x00, 0x20, 0x50, 1, // row 2: re-trigger same note (no cmd)
+        0x00,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Drive through rows 0 + 1 so vibrato_pos has advanced.
+    let mut buf = vec![0i16; 2 * 12 * 882];
+    player.render(&mut buf);
+    let pos_after_row1 = player.channels[0].vibrato_pos;
+    assert!(
+        pos_after_row1 != 0,
+        "vibrato_pos should have advanced through H82"
+    );
+
+    // Drive through tick 0 of row 2 — the trigger. With S36, the position
+    // must NOT reset to zero.
+    let mut tb = vec![0i16; 2 * 64];
+    player.render(&mut tb);
+    assert_eq!(
+        player.channels[0].vibrato_pos, pos_after_row1,
+        "S36 (bit 2 set) must preserve vibrato_pos across new note"
     );
 }
