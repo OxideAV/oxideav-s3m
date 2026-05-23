@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Qxy retrigger** rebuilt to the multimedia.cx behavioural reference
+  (§Qxy): a per-channel tick counter that increments on *every* tick
+  (including tick 0), retriggers the sample when it reaches the retrig
+  value `y`, and resets to 0. The counter is global to the channel across
+  rows — a new note carrying Qxy does **not** restart it; only a row
+  without Qxy (or song start) clears it. `Q?0` (retrig value 0) is ignored.
+- Exact Qxy volume-modifier table (`retrigger_volume`) including the
+  64-entry `Q_TWO_THIRDS` lookup for the `x == 6` ("×2/3") case
+  transcribed verbatim from the wiki's `TwoThirds[64]` listing, and the
+  documented `x == 8` ("?") no-op.
+
+### Changed
+
+- Qxy no longer keys off `tick % y` (which excluded tick 0 and restarted
+  each row); it now uses the persistent per-channel counter above, so
+  retrig values that don't evenly divide the song speed keep their cadence
+  across row boundaries and a retrig can land on tick 0.
+
+### Added (earlier)
+
 - ST3 **effect memory** ("%" semantics from the multimedia.cx behavioural
   reference): per-channel storage of the latest nonzero parameter for
   each command; a row with the same command and parameter 0 reuses the

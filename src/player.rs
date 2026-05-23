@@ -55,6 +55,48 @@ pub const S2X_FINETUNE_TABLE: [u32; 16] = [
     7895, 7941, 7985, 8046, 8107, 8169, 8232, 8280, 8363, 8413, 8463, 8529, 8581, 8651, 8723, 8757,
 ];
 
+/// Qxy retrigger "×2/3" volume table (x == 6).
+///
+/// The multimedia.cx ST3 behavioural reference (§Qxy) notes the `*2/3`
+/// volume modifier is *not* exactly `vol * 2 / 3`; ST3 uses this 64-entry
+/// lookup table indexed by the channel's current (active) volume 0..=63.
+/// Transcribed verbatim from the `TwoThirds: array [0..63] of Byte` listing
+/// in `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`.
+pub const Q_TWO_THIRDS: [u8; 64] = [
+    0, 0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 6, 7, 8, 8, 9, 10, 10, 11, 11, 12, 13, 13, 14, 15, 15, 16, 16,
+    17, 18, 18, 19, 20, 20, 21, 21, 22, 23, 23, 24, 25, 25, 26, 26, 27, 28, 28, 29, 30, 30, 31, 31,
+    32, 33, 33, 34, 35, 35, 36, 36, 37, 38, 38, 39,
+];
+
+/// Apply the Qxy volume modifier `x` to a current active volume `vol`,
+/// returning the new clamped (0..=64) volume.
+///
+/// Table from `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+/// §Qxy ("Values for x"). `x == 0` and `x == 8` are documented no-ops
+/// ("0" and "?" respectively). `x == 6` uses the [`Q_TWO_THIRDS`] table
+/// rather than an exact `vol*2/3`.
+fn retrigger_volume(vol: u8, x: u8) -> u8 {
+    let v = vol.min(64);
+    match x {
+        0x1 => v.saturating_sub(1),
+        0x2 => v.saturating_sub(2),
+        0x3 => v.saturating_sub(4),
+        0x4 => v.saturating_sub(8),
+        0x5 => v.saturating_sub(16),
+        0x6 => Q_TWO_THIRDS[v.min(63) as usize],
+        0x7 => v / 2,
+        0x9 => (v as u16 + 1).min(64) as u8,
+        0xA => (v as u16 + 2).min(64) as u8,
+        0xB => (v as u16 + 4).min(64) as u8,
+        0xC => (v as u16 + 8).min(64) as u8,
+        0xD => (v as u16 + 16).min(64) as u8,
+        0xE => ((v as u16) * 3 / 2).min(64) as u8,
+        0xF => (v as u16 * 2).min(64) as u8,
+        // 0x0 (no slide) and 0x8 ("?") are no-ops.
+        _ => v,
+    }
+}
+
 /// Map an ST3 command number to its per-channel effect-memory slot.
 ///
 /// H and U share a slot (multimedia.cx wiki: "Uxy shares memory with Hxy").
@@ -136,6 +178,13 @@ pub struct Channel {
     /// Per-channel LFO state for the `Random` waveform. Updated lazily;
     /// only stepped when a vibrato / tremolo tick samples it.
     pub random_state: u32,
+    /// Qxy retrigger tick counter. Incremented on every tick (including
+    /// tick 0); when it reaches/exceeds the retrig value `y` the sample is
+    /// retriggered and the counter resets to 0. Per the multimedia.cx
+    /// behavioural reference (§Qxy) this counter is *global to the channel
+    /// across rows* — a new note with Qxy does NOT reset it; only a row
+    /// without the Qxy effect (or song start) clears it back to 0.
+    pub retrig_counter: u8,
     /// Ixy tremor: counts ticks within the on/off cycle. Bit 7 = "in off
     /// phase"; low 7 bits = ticks remaining in the current half-cycle.
     pub tremor_phase: u8,
@@ -190,6 +239,7 @@ impl Default for Channel {
             vibrato_waveform: Waveform::Sine,
             tremolo_waveform: Waveform::Sine,
             random_state: 0x1234_5678,
+            retrig_counter: 0,
             tremor_phase: 0,
             tremor_base_volume: 0xFF,
             keep_vibrato_pos_on_new_note: false,
@@ -451,6 +501,14 @@ impl PlayerState {
             // starts the on-cycle fresh from the channel's current vol).
             ch.tremor_phase = 0;
             ch.tremor_base_volume = 0xFF;
+            // Qxy retrigger counter: per the multimedia.cx behavioural
+            // reference (§Qxy), the counter is reset *only* when a row
+            // without the Qxy effect is encountered (or at song start).
+            // A row that *does* carry Qxy — even a brand-new note — keeps
+            // the running counter so the retrig cadence is unbroken.
+            if ch.command != cmd::Q_RETRIGGER {
+                ch.retrig_counter = 0;
+            }
 
             // Detect SDx (note delay) before applying the row: when x > 0,
             // we stash the cell and skip the usual tick-0 trigger so the
@@ -595,6 +653,13 @@ impl PlayerState {
                     let f = 2.0f32.powf(amount * scale / 768.0);
                     ch.frequency *= f;
                     ch.target_frequency *= f;
+                }
+                cmd::Q_RETRIGGER => {
+                    // Qxy is processed on every tick *including tick 0*,
+                    // so the counter must advance here too. A tick-0 retrig
+                    // can fire immediately after the new note (per the
+                    // multimedia.cx §Qxy "retrig on tick 0" note).
+                    Self::apply_retrigger(ch);
                 }
                 cmd::T_SET_TEMPO if ch.info >= 0x20 => {
                     row_tempo = Some(ch.info);
@@ -822,29 +887,10 @@ impl PlayerState {
                     Self::apply_tone_porta(ch, ch.info);
                     Self::apply_dxy(ch, x, y);
                 }
-                // Qxy: retrigger every y ticks; x = volume change code.
-                cmd::Q_RETRIGGER if y != 0 && (tick % y) == 0 && tick > 0 => {
-                    ch.sample_pos = 0.0;
-                    // Volume modifier x — table from ScreamTracker-v3.20
-                    // -effects.txt §Qxy. 0x8 is "?" in the spec, keep as no-op.
-                    match x {
-                        0x1 => ch.volume = ch.volume.saturating_sub(1),
-                        0x2 => ch.volume = ch.volume.saturating_sub(2),
-                        0x3 => ch.volume = ch.volume.saturating_sub(4),
-                        0x4 => ch.volume = ch.volume.saturating_sub(8),
-                        0x5 => ch.volume = ch.volume.saturating_sub(16),
-                        0x6 => ch.volume = (ch.volume * 2 / 3).min(64),
-                        0x7 => ch.volume /= 2,
-                        0x9 => ch.volume = (ch.volume + 1).min(64),
-                        0xA => ch.volume = (ch.volume + 2).min(64),
-                        0xB => ch.volume = (ch.volume + 4).min(64),
-                        0xC => ch.volume = (ch.volume + 8).min(64),
-                        0xD => ch.volume = (ch.volume + 16).min(64),
-                        0xE => ch.volume = ((ch.volume as u16) * 3 / 2).min(64) as u8,
-                        0xF => ch.volume = (ch.volume * 2).min(64),
-                        _ => {}
-                    }
-                }
+                // Qxy: retrigger note every y ticks with volume modifier x.
+                // The full per-tick counter logic (incl. tick 0, run from
+                // `enter_row`) lives in `apply_retrigger`.
+                cmd::Q_RETRIGGER => Self::apply_retrigger(ch),
                 cmd::R_TREMOLO => {
                     // Rxy: like vibrato but applied to volume.
                     let speed = x;
@@ -991,6 +1037,31 @@ impl PlayerState {
         } else if x != 0 && y != 0 {
             // Dxy with both nibbles 1..=E: ST3 quirk — slide DOWN by y.
             ch.volume = ch.volume.saturating_sub(y);
+        }
+    }
+
+    /// Qxy retrigger step (runs on EVERY tick, including tick 0).
+    ///
+    /// Per the multimedia.cx behavioural reference (§Qxy):
+    /// - `y == 0` (retrig value) → the effect is ignored.
+    /// - A per-channel counter is incremented on each tick. When it
+    ///   reaches/exceeds `y`, the sample is retriggered (sample_pos → 0),
+    ///   the active volume is modified by the `x` table ([`retrigger_volume`]),
+    ///   and the counter resets to 0.
+    /// - The counter is *not* reset by a new note carrying Qxy — only a
+    ///   row without Qxy clears it (handled in `enter_row`). It is
+    ///   independent of song speed and can retrig on tick 0.
+    fn apply_retrigger(ch: &mut Channel) {
+        let x = ch.info >> 4;
+        let y = ch.info & 0x0F;
+        if y == 0 {
+            return;
+        }
+        ch.retrig_counter = ch.retrig_counter.saturating_add(1);
+        if ch.retrig_counter >= y {
+            ch.sample_pos = 0.0;
+            ch.volume = retrigger_volume(ch.volume, x);
+            ch.retrig_counter = 0;
         }
     }
 
@@ -1311,6 +1382,84 @@ pub mod tests {
             (snapped - exact).abs() < 1.0,
             "snapped={snapped}, exact={exact}"
         );
+    }
+
+    #[test]
+    fn q_two_thirds_table_endpoints_and_spread() {
+        // Verbatim spot-checks of the TwoThirds[64] table from
+        // docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html §Qxy.
+        assert_eq!(Q_TWO_THIRDS[0], 0);
+        assert_eq!(Q_TWO_THIRDS[1], 0);
+        assert_eq!(Q_TWO_THIRDS[2], 1);
+        assert_eq!(Q_TWO_THIRDS[3], 1);
+        assert_eq!(Q_TWO_THIRDS[63], 39);
+        // The table is monotonic non-decreasing.
+        for w in Q_TWO_THIRDS.windows(2) {
+            assert!(w[1] >= w[0]);
+        }
+    }
+
+    #[test]
+    fn retrigger_volume_modifiers_match_spec_table() {
+        // §Qxy "Values for x". Use a base volume of 32 (mid-range) so the
+        // subtract/add/multiply cases are all observable without clamping.
+        assert_eq!(retrigger_volume(32, 0x0), 32); // no change
+        assert_eq!(retrigger_volume(32, 0x1), 31); // -1
+        assert_eq!(retrigger_volume(32, 0x2), 30); // -2
+        assert_eq!(retrigger_volume(32, 0x3), 28); // -4
+        assert_eq!(retrigger_volume(32, 0x4), 24); // -8
+        assert_eq!(retrigger_volume(32, 0x5), 16); // -16
+        assert_eq!(retrigger_volume(32, 0x6), Q_TWO_THIRDS[32]); // *2/3 table
+        assert_eq!(retrigger_volume(32, 0x7), 16); // *1/2
+        assert_eq!(retrigger_volume(32, 0x8), 32); // "?" — no change
+        assert_eq!(retrigger_volume(32, 0x9), 33); // +1
+        assert_eq!(retrigger_volume(32, 0xA), 34); // +2
+        assert_eq!(retrigger_volume(32, 0xB), 36); // +4
+        assert_eq!(retrigger_volume(32, 0xC), 40); // +8
+        assert_eq!(retrigger_volume(32, 0xD), 48); // +16
+        assert_eq!(retrigger_volume(32, 0xE), 48); // *3/2
+        assert_eq!(retrigger_volume(32, 0xF), 64); // *2
+                                                   // Clamping: subtract saturates at 0, add/multiply clamp to 64.
+        assert_eq!(retrigger_volume(4, 0x5), 0);
+        assert_eq!(retrigger_volume(60, 0xF), 64);
+    }
+
+    #[test]
+    fn retrigger_counter_persists_and_fires_at_y() {
+        // Drive apply_retrigger directly with Q05 (y=5) and confirm the
+        // counter walks 1..5, fires (resets to 0, retrig sample_pos→0)
+        // on the 5th call, and that it carries across calls (not reset
+        // by the helper itself).
+        let mut ch = Channel {
+            info: 0x05,
+            command: cmd::Q_RETRIGGER,
+            volume: 32,
+            sample_pos: 100.0,
+            ..Channel::default()
+        };
+        for expected in 1..5 {
+            PlayerState::apply_retrigger(&mut ch);
+            assert_eq!(ch.retrig_counter, expected);
+            assert_eq!(ch.sample_pos, 100.0, "no retrig before counter hits y");
+        }
+        PlayerState::apply_retrigger(&mut ch);
+        assert_eq!(ch.retrig_counter, 0, "counter resets after firing");
+        assert_eq!(ch.sample_pos, 0.0, "sample retriggered to start");
+    }
+
+    #[test]
+    fn retrigger_y0_is_ignored() {
+        let mut ch = Channel {
+            info: 0x90, // Q90: y == 0
+            command: cmd::Q_RETRIGGER,
+            volume: 32,
+            sample_pos: 50.0,
+            ..Channel::default()
+        };
+        PlayerState::apply_retrigger(&mut ch);
+        // y == 0 → effect ignored: counter untouched, no retrig.
+        assert_eq!(ch.retrig_counter, 0);
+        assert_eq!(ch.sample_pos, 50.0);
     }
 
     #[test]

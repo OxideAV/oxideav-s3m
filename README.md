@@ -29,7 +29,10 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   quirk (treats as `D0y`/slide-down). `Exx` / `Fxx` pitch slides (with
   fine `EFx`/`FFx` and extra-fine `EEx`/`FEx`), `Gxx` (tone portamento),
   `Hxy` (vibrato), `Ixy` (tremor), `Jxy` (arpeggio), `Kxy` (vib+vol),
-  `Lxy` (porta+vol), `Oxx` (sample offset), `Qxy` (retrigger), `Rxy`
+  `Lxy` (porta+vol), `Oxx` (sample offset), `Qxy` (retrigger — persistent
+  per-channel tick counter that survives across rows and can fire on
+  tick 0, with the full `x` volume-modifier table including the exact
+  64-entry `TwoThirds` lookup for the `x=6` ×2/3 case), `Rxy`
   (tremolo), `Txx` (tempo), `Uxy` (fine vibrato — shares memory with
   `Hxy`), `Vxx` (global volume), `Xxx` (set pan), plus the `Sxy`
   family (`S1x` glissando, `S2x` finetune from the spec C4Spd table,

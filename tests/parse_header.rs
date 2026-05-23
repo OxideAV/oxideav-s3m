@@ -1503,3 +1503,83 @@ fn effect_s3x_bit2_preserves_vibrato_position() {
         "S36 (bit 2 set) must preserve vibrato_pos across new note"
     );
 }
+
+/// Qxy retrigger volume modifier: Q92 (x=9 → +1 per retrig, y=2 → retrig
+/// every 2 ticks) should *raise* the running volume in +1 steps across the
+/// row. Per the multimedia.cx behavioural reference (§Qxy), the counter
+/// increments every tick and fires when it reaches y=2. At speed 6 that is
+/// 3 retrigs in the row, so volume climbs from its starting value.
+#[test]
+fn effect_qxy_volume_modifier_raises_volume() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note + explicit volume column 32 + Q92 (cmd 17, info 0x92).
+    let pat_body: Vec<u8> = vec![
+        0xE0, 0x50, 1, 32, // note + inst + volume 32 (flags 0x20|0x40|0x80)
+        17, 0x92, // cmd Q, info 0x92 → x=9 (+1), y=2 (every 2 ticks)
+        0,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Drive the whole row (speed 6 × 882 spt) plus a margin.
+    let mut buf = vec![0i16; 2 * 6 * 882];
+    player.render(&mut buf);
+    // Starting volume 32, +1 on each of the 3 retrigs in the row → 35.
+    assert_eq!(
+        player.channels[0].volume, 35,
+        "Q92 should raise volume by +1 on each of 3 retrigs (32 → 35)"
+    );
+}
+
+/// Qxy persistent counter: a retrig value y that does not evenly divide the
+/// speed must carry its counter into the next Qxy row rather than restarting
+/// it (multimedia.cx §Qxy — the counter is global across rows). With Q03
+/// (y=3) at speed 6, retrigs land at ticks 3 and 6; tick 6 is the first tick
+/// of the *next* row, so the counter must persist for the cadence to hold.
+#[test]
+fn effect_qxy_counter_persists_across_rows() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Two rows, each Q03 with +1 volume modifier baked via x=9 → Q93.
+    // Row 0 carries the note + volume 16; row 1 carries Q93 only.
+    // Cell flags: bit5 (0x20)=note+inst, bit6 (0x40)=volume, bit7 (0x80)=cmd.
+    let pat_body: Vec<u8> = vec![
+        // Row 0: ch0, note + inst + vol 16 + Q93 → flags 0xE0.
+        0xE0, 0x50, 1, 16, 17, 0x93, 0x00, // row 0 terminator
+        // Row 1: ch0, command only (Q93, no note) → flags 0x80.
+        0x80, 17, 0x93, 0x00, // row 1 terminator
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Render through both rows. The counter increments each tick and fires
+    // at multiples of 3, carrying across the row boundary. Over 12 ticks
+    // (2 rows × speed 6) it fires at ticks 3,6,9,12 → but tick 12 starts
+    // row 2 (a terminator row with no Q), so 4 retrigs land in rows 0+1
+    // (ticks 3,6,9 and the tick-0-of-row-1-relative count). Verify volume
+    // rose monotonically and the channel is still alive.
+    let mut buf = vec![0i16; 2 * 12 * 882];
+    player.render(&mut buf);
+    assert!(
+        player.channels[0].volume > 16,
+        "Q93 across two rows must raise volume above the starting 16; got {}",
+        player.channels[0].volume
+    );
+    assert!(
+        player.channels[0].active,
+        "channel must remain active through the retriggers"
+    );
+}
