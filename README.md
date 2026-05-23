@@ -28,8 +28,13 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   15), `DFy`/`DxF` fine variants, and the ST3 `Dxy` both-nibbles-nonzero
   quirk (treats as `D0y`/slide-down). `Exx` / `Fxx` pitch slides (with
   fine `EFx`/`FFx` and extra-fine `EEx`/`FEx`), `Gxx` (tone portamento),
-  `Hxy` (vibrato), `Ixy` (tremor), `Jxy` (arpeggio), `Kxy` (vib+vol),
-  `Lxy` (porta+vol), `Oxx` (sample offset), `Qxy` (retrigger — persistent
+  `Hxy` (vibrato), `Ixy` (tremor), `Jxy` (arpeggio), `Kxy` (vib+vol —
+  literally `H00 + Dxy`: the vibrato leg *continues* the channel's running
+  H/U vibrato from effect memory, not Kxy's own nibbles), `Lxy`
+  (porta+vol — `G00 + Dxy`: the porta leg continues the running G tone
+  portamento at its remembered rate; a *fine* volume-slide form in either
+  `Kxy`/`Lxy` infobyte suppresses both the slide and the dual H00/G00 leg
+  per multimedia.cx §Kxy), `Oxx` (sample offset), `Qxy` (retrigger — persistent
   per-channel tick counter that survives across rows and can fire on
   tick 0, with the full `x` volume-modifier table including the exact
   64-entry `TwoThirds` lookup for the `x=6` ×2/3 case), `Rxy`

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Kxy / Lxy dual commands** corrected to the multimedia.cx behavioural
+  reference (§Kxy / §Lxy). `Kxy` is `H00 + Dxy`: the vibrato leg now
+  *continues the channel's running vibrato* using the remembered H/U
+  speed/depth from effect memory rather than re-using Kxy's own `(x, y)`
+  nibbles (which are the volume slide). `Lxy` is `G00 + Dxy`: the porta
+  leg now continues tone portamento at the remembered G rate instead of
+  passing Lxy's infobyte to the porta kernel. Additionally, a *fine*
+  volume-slide form (`DFy` / `DxF` / `DFF`) in either infobyte now
+  suppresses both the volume slide and the dual H00/G00 leg — the wiki's
+  "fine slides do not work, and the other effect is also not performed"
+  rule. The slide-on-all-ticks forms `D0F` / `DF0` are not fine and keep
+  running. New helpers `is_fine_volslide` / `vibrato_memory` cover this.
+
 ### Added
 
 - **Qxy retrigger** rebuilt to the multimedia.cx behavioural reference

@@ -872,19 +872,29 @@ impl PlayerState {
                     let mult = 2.0f32.powf(semis as f32 / 12.0);
                     ch.frequency = ch.target_frequency * mult;
                 }
-                cmd::K_VIB_VOL => {
-                    // Kxy: vibrato + volume slide. ST3 uses the current
-                    // channel's vibrato speed/depth (carried from the last
-                    // H command); here we approximate by reusing the
-                    // current row's (x, y) infobyte as the H params.
-                    Self::apply_vibrato(ch, x, y, /* fine: */ false);
+                // Kxy = "H00 + Dxy" (multimedia.cx §Kxy). The vibrato leg is
+                // H00 — it *continues the vibrato already running* on the
+                // channel using the remembered H speed/depth, NOT Kxy's own
+                // (x, y) nibbles (those are the volume slide).
+                //
+                // §Kxy also notes the volume slide differs from Dxy: when a
+                // *fine* slide is requested (DFy / DxF / DFF forms) the slide
+                // does nothing AND the "other" effect (H00) is also
+                // suppressed (the guard below). D0F / DF0 (slide-on-all-ticks)
+                // are not fine and still run.
+                cmd::K_VIB_VOL if !Self::is_fine_volslide(x, y) => {
+                    let (h_speed, h_depth) = Self::vibrato_memory(ch);
+                    Self::apply_vibrato(ch, h_speed, h_depth, /* fine: */ false);
                     Self::apply_dxy(ch, x, y);
                 }
-                cmd::L_PORT_VOL => {
-                    // Lxy: tone porta + vol slide. The tone-porta step
-                    // matches Gxx (info bytes per tick), then the vol
-                    // slide applies in Dxy form.
-                    Self::apply_tone_porta(ch, ch.info);
+                // Lxy = "G00 + Dxy" (multimedia.cx §Lxy). The porta leg is G00
+                // — it *continues the tone portamento already running* using
+                // the remembered G rate, NOT Lxy's own infobyte. Same
+                // fine-slide suppression rule as Kxy (the guard disables both
+                // the volume slide and the G00 porta).
+                cmd::L_PORT_VOL if !Self::is_fine_volslide(x, y) => {
+                    let g_rate = ch.effect_memory[cmd::G_TONE_PORTA as usize];
+                    Self::apply_tone_porta(ch, g_rate);
                     Self::apply_dxy(ch, x, y);
                 }
                 // Qxy: retrigger note every y ticks with volume modifier x.
@@ -954,6 +964,26 @@ impl PlayerState {
                 _ => {}
             }
         }
+    }
+
+    /// Is the (x, y) infobyte a *fine* volume slide? (`DFy` / `DxF` / `DFF`.)
+    ///
+    /// Per multimedia.cx §Kxy, a fine volume-slide form in a Kxy/Lxy infobyte
+    /// disables the slide *and* the dual "other" effect (H00 / G00). The
+    /// slide-on-all-ticks forms `D0F` (x==0,y==F) and `DF0` (x==F,y==0) are
+    /// **not** fine and must keep working, so they are excluded here.
+    fn is_fine_volslide(x: u8, y: u8) -> bool {
+        (x == 0xF && y != 0) || (y == 0xF && x != 0)
+    }
+
+    /// Remembered vibrato speed/depth for the H00 leg of Kxy.
+    ///
+    /// Kxy continues whatever vibrato the channel already had running, so the
+    /// speed/depth come from the shared H/U effect-memory slot rather than
+    /// Kxy's own nibbles. Returns `(speed, depth)` from `effect_memory[H]`.
+    fn vibrato_memory(ch: &Channel) -> (u8, u8) {
+        let info = ch.effect_memory[cmd::H_VIBRATO as usize];
+        (info >> 4, info & 0x0F)
     }
 
     /// Hxy / Uxy / Kxy vibrato kernel. `fine = true` is the U variant
@@ -1460,6 +1490,97 @@ pub mod tests {
         // y == 0 → effect ignored: counter untouched, no retrig.
         assert_eq!(ch.retrig_counter, 0);
         assert_eq!(ch.sample_pos, 50.0);
+    }
+
+    #[test]
+    fn is_fine_volslide_matches_dxy_fine_forms() {
+        // multimedia.cx §Kxy: a *fine* slide (DFy / DxF / DFF) suppresses
+        // both the volume slide and the H00/G00 dual effect.
+        assert!(PlayerState::is_fine_volslide(0xF, 0x3)); // DF3 (fine down 3)
+        assert!(PlayerState::is_fine_volslide(0x3, 0xF)); // D3F (fine up 3)
+        assert!(PlayerState::is_fine_volslide(0xF, 0xF)); // DFF (fine up 15)
+                                                          // Slide-on-all-ticks forms are NOT fine and must keep running.
+        assert!(!PlayerState::is_fine_volslide(0x0, 0xF)); // D0F
+        assert!(!PlayerState::is_fine_volslide(0xF, 0x0)); // DF0
+                                                           // Ordinary continuous slides are not fine either.
+        assert!(!PlayerState::is_fine_volslide(0x2, 0x0)); // D20
+        assert!(!PlayerState::is_fine_volslide(0x0, 0x4)); // D04
+    }
+
+    #[test]
+    fn vibrato_memory_reads_h_slot_not_k_nibbles() {
+        // Kxy's H00 leg must read the channel's remembered H speed/depth,
+        // never Kxy's own (x, y) nibbles. Stash H82 in the shared H/U slot.
+        let mut ch = Channel::default();
+        ch.effect_memory[cmd::H_VIBRATO as usize] = 0x82; // speed 8, depth 2
+        assert_eq!(PlayerState::vibrato_memory(&ch), (8, 2));
+    }
+
+    #[test]
+    fn kxy_vibrato_uses_remembered_h_params() {
+        // Per §Kxy ("H00 + Dxy"), a K02 continues the vibrato that an
+        // earlier H82 began — so the pitch must wobble at H82's depth, not
+        // K02's. Drive the vibrato kernel with the *remembered* params and
+        // confirm the frequency moves away from the base.
+        let mut ch = Channel {
+            target_frequency: 8363.0,
+            frequency: 8363.0,
+            ..Channel::default()
+        };
+        ch.effect_memory[cmd::H_VIBRATO as usize] = 0x24; // remembered H24
+        let (h_speed, h_depth) = PlayerState::vibrato_memory(&ch);
+        assert_eq!((h_speed, h_depth), (2, 4));
+        // First vibrato step from pos 0 advances by speed*4 = 8; the sine
+        // sample at pos 8 (sin(π/4)) is nonzero, so the depth-4 wobble must
+        // shift the pitch off the carrier.
+        PlayerState::apply_vibrato(&mut ch, h_speed, h_depth, false);
+        assert_ne!(
+            ch.frequency, 8363.0,
+            "Kxy vibrato must move pitch using the remembered H depth"
+        );
+        // A would-be K02-as-H02 (depth 2, speed 0) would NOT advance the
+        // phase (speed 0 → no-op): confirm the depth-only path is inert so
+        // the remembered-params path is demonstrably different.
+        let mut ch2 = Channel {
+            target_frequency: 8363.0,
+            frequency: 8363.0,
+            ..Channel::default()
+        };
+        PlayerState::apply_vibrato(&mut ch2, 0, 2, false); // K02 nibbles direct
+        assert_eq!(
+            ch2.frequency, 8363.0,
+            "speed-0 vibrato is a no-op; proves K02 nibbles are wrong params"
+        );
+    }
+
+    #[test]
+    fn lxy_porta_uses_remembered_g_rate() {
+        // Lxy = "G00 + Dxy": the porta leg continues at the remembered G
+        // rate. With a remembered G of 0x04 and a target above the current
+        // pitch, the channel must glide up toward the target.
+        let mut ch = Channel {
+            frequency: 8000.0,
+            target_frequency: 8363.0,
+            ..Channel::default()
+        };
+        ch.effect_memory[cmd::G_TONE_PORTA as usize] = 0x04; // remembered G04
+        let before = ch.frequency;
+        let g_rate = ch.effect_memory[cmd::G_TONE_PORTA as usize];
+        PlayerState::apply_tone_porta(&mut ch, g_rate);
+        assert!(
+            ch.frequency > before && ch.frequency <= ch.target_frequency,
+            "Lxy must glide toward target using remembered G rate (got {})",
+            ch.frequency
+        );
+        // A remembered G of 0 (no prior G) means no glide — the porta leg
+        // is a genuine no-op, matching "G00 with empty memory".
+        let mut ch0 = Channel {
+            frequency: 8000.0,
+            target_frequency: 8363.0,
+            ..Channel::default()
+        };
+        PlayerState::apply_tone_porta(&mut ch0, 0);
+        assert_eq!(ch0.frequency, 8000.0);
     }
 
     #[test]
