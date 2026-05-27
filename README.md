@@ -22,6 +22,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
 
 - PCM instruments (8-bit signed/unsigned, 16-bit, mono and true-stereo).
 - AdLib instrument types are skipped (no OPL synth).
+- **Channel mute flag (`+128` in the header's channel-settings byte)**:
+  per the ST3 format reference, a channel byte of `0x80 | type` marks
+  the slot as disabled while keeping its pattern data live. The decoder
+  now reads pattern cells for muted channels (so jumps, loops, and
+  pattern delays stay consistent with what a real ST3 would compute)
+  but the mixer silences their output. AdLib slots (type 16..=31)
+  without the `+128` flag are also reported as muted in the PCM path,
+  since OPL synthesis is out of scope.
 - Effects: `Axx` (speed), `Bxx` (pos jump), `Cxx` (pattern break — rows
   64+ ignored per ST3), `Dxy` volume slide — full multimedia.cx case
   matrix including `D0F`/`DF0` (slide-on-all-ticks), `DFF` (fine up by

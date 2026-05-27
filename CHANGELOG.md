@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Channel mute flag** (`+128` in the file header's channel-settings byte,
+  per the ST3 archive-team format reference
+  `docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt`: "Channel settings
+  for 32 channels, 255=unused, +128=disabled"). The decoder now exposes a
+  per-slot `S3mHeader::muted` array and the mixer silences muted channels
+  while still parsing their pattern data — pattern jumps, SBx loop counters,
+  and SEx pattern delays stay consistent with the real ST3 behaviour. AdLib
+  slots (channel type 16..=31) without the `+128` flag are also reported as
+  muted since the PCM mixer does not synthesise OPL voices. Adds three
+  header parser tests, three mixer-level player tests, and one end-to-end
+  multichannel-decoder integration test covering the silence guarantee.
+
 ### Changed
 
 - **Kxy / Lxy dual commands** corrected to the multimedia.cx behavioural

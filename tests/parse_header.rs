@@ -1583,3 +1583,140 @@ fn effect_qxy_counter_persists_across_rows() {
         "channel must remain active through the retriggers"
     );
 }
+
+/// Build a 4-channel synth with channel 1 muted (`+128` flag set in the
+/// header's channel-settings byte). Channel 0 is a normal left-PCM-1
+/// slot; channel 1 carries `0x81` (= disabled / muted left-PCM-2);
+/// channels 2 and 3 are also active. The pattern triggers the square-wave
+/// sample on channels 0 and 1 with identical notes so the mute is the
+/// only observable difference between their outputs.
+fn build_synth_with_muted_channel() -> Vec<u8> {
+    use oxideav_s3m::header::S3M_SIGNATURE;
+
+    let mut out = vec![0u8; 0x60];
+    out[..b"SYNTH-MUTE".len()].copy_from_slice(b"SYNTH-MUTE");
+    out[0x1C] = 0x1A;
+    out[0x1D] = 0x10;
+    out[0x20..0x22].copy_from_slice(&2u16.to_le_bytes());
+    out[0x22..0x24].copy_from_slice(&1u16.to_le_bytes());
+    out[0x24..0x26].copy_from_slice(&1u16.to_le_bytes());
+    out[0x28..0x2A].copy_from_slice(&0x1320u16.to_le_bytes());
+    out[0x2A..0x2C].copy_from_slice(&2u16.to_le_bytes());
+    out[0x2C..0x30].copy_from_slice(S3M_SIGNATURE);
+    out[0x30] = 64;
+    out[0x31] = 6;
+    out[0x32] = 125;
+    out[0x33] = 0x30 | 0x80;
+    // Channel settings: 0=active(0x00), 1=muted(0x81), 2=active(0x02),
+    // 3=active(0x03), rest unused.
+    for (i, c) in out[0x40..0x40 + 32].iter_mut().enumerate() {
+        *c = match i {
+            0 => 0x00,
+            1 => 0x81,
+            2 => 0x02,
+            3 => 0x03,
+            _ => 0xFF,
+        };
+    }
+    out.extend_from_slice(&[0, 0xFF]);
+    let ins_pp_off = out.len();
+    out.extend_from_slice(&[0, 0]);
+    let pat_pp_off = out.len();
+    out.extend_from_slice(&[0, 0]);
+    while out.len() % 16 != 0 {
+        out.push(0);
+    }
+    let inst_off = out.len();
+    let inst_parapointer = (inst_off >> 4) as u16;
+    let mut inst = vec![0u8; 80];
+    inst[0] = 1;
+    inst[0x10..0x14].copy_from_slice(&16u32.to_le_bytes());
+    inst[0x18..0x1C].copy_from_slice(&16u32.to_le_bytes());
+    inst[0x1C] = 64;
+    inst[0x1F] = 1; // loop on
+    inst[0x20..0x24].copy_from_slice(&8363u32.to_le_bytes());
+    inst[0x4C..0x50].copy_from_slice(b"SCRS");
+    out.extend_from_slice(&inst);
+    while out.len() % 16 != 0 {
+        out.push(0);
+    }
+    let pat_off = out.len();
+    let pat_parapointer = (pat_off >> 4) as u16;
+    // Row 0: trigger on ch0 and ch1 with the same C-5 note + instrument 1.
+    // Record format: flag byte | note | inst, terminated with 0 byte.
+    // flags=0x20 (note+inst), channel index in low 5 bits.
+    let pat_body: Vec<u8> = vec![
+        0x20, 0x50, 1, // ch0 trigger
+        0x21, 0x50, 1,    // ch1 trigger
+        0x00, // row 0 terminator
+    ];
+    let mut body = pat_body;
+    body.resize(body.len() + 128, 0);
+    let total_len = (2 + body.len()) as u16;
+    out.extend_from_slice(&total_len.to_le_bytes());
+    out.extend_from_slice(&body);
+    while out.len() % 16 != 0 {
+        out.push(0);
+    }
+    let sample_off = out.len();
+    let sample_parapointer = (sample_off >> 4) as u32;
+    for i in 0..16 {
+        out.push(if i < 8 { 0xE0 } else { 0x20 });
+    }
+    let mem_hi = (sample_parapointer >> 16) as u8;
+    let mem_lo = (sample_parapointer & 0xFFFF) as u16;
+    out[inst_off + 0x0D] = mem_hi;
+    out[inst_off + 0x0E..inst_off + 0x10].copy_from_slice(&mem_lo.to_le_bytes());
+    out[ins_pp_off..ins_pp_off + 2].copy_from_slice(&inst_parapointer.to_le_bytes());
+    out[pat_pp_off..pat_pp_off + 2].copy_from_slice(&pat_parapointer.to_le_bytes());
+    out
+}
+
+/// Multichannel decode path: an S3M whose channel 1 carries the `+128`
+/// disabled marker in its channel-settings byte must produce silence on
+/// that channel's stereo pair, while the otherwise-identical channel 0
+/// (active) emits non-zero audio.
+#[test]
+fn muted_channel_outputs_silent_pair_via_multichannel_decoder() {
+    use oxideav_s3m::CODEC_ID_MULTICHANNEL;
+
+    let bytes = build_synth_with_muted_channel();
+
+    let mut codec_reg = CodecRegistry::new();
+    decoder::register(&mut codec_reg);
+    let params = CodecParameters::audio(CodecId::new(CODEC_ID_MULTICHANNEL));
+    let mut dec = codec_reg
+        .first_decoder(&params)
+        .expect("build multichannel s3m decoder");
+    let tb = TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64);
+    let pkt = Packet::new(0, tb, bytes);
+    dec.send_packet(&pkt).unwrap();
+
+    // Multichannel format emits 32 stereo pairs (64 channels) per frame.
+    // We accumulate per-channel nonzero counts and confirm the muted
+    // channel (1) is silent while the active twin (0) is not.
+    let mut nonzero = vec![0u64; 32];
+    while let Ok(Frame::Audio(a)) = dec.receive_frame() {
+        // Frame layout: i16 stereo pairs for ch0..=ch31 interleaved.
+        for frame_bytes in a.data[0].chunks_exact(2 * 2 * 32) {
+            for (ch, pair) in frame_bytes.chunks_exact(4).enumerate() {
+                let l = i16::from_le_bytes([pair[0], pair[1]]);
+                let r = i16::from_le_bytes([pair[2], pair[3]]);
+                if l != 0 || r != 0 {
+                    nonzero[ch] += 1;
+                }
+            }
+        }
+    }
+
+    assert!(
+        nonzero[0] > 100,
+        "active channel 0 must emit non-silent audio (got {} nonzero frames)",
+        nonzero[0]
+    );
+    assert_eq!(
+        nonzero[1], 0,
+        "muted channel 1 must emit pure silence (got {} nonzero frames)",
+        nonzero[1]
+    );
+}

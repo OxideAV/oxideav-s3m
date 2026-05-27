@@ -204,6 +204,11 @@ pub struct Channel {
     /// infobyte is zero, ST3 reuses the stored value. `H` / `U` (vibrato /
     /// fine vibrato) share memory, as does `O` (sample offset).
     pub effect_memory: [u8; 27],
+    /// Channel mute flag (`+128` in the file header's channel-settings
+    /// byte). When set, the mixer skips this channel and emits silence on
+    /// its slot; pattern parsing and per-tick state updates still run so
+    /// jump / loop / delay state stays consistent.
+    pub muted: bool,
 }
 
 /// Note/instrument/volume stash for the SDx (note delay) effect.
@@ -245,6 +250,7 @@ impl Default for Channel {
             keep_vibrato_pos_on_new_note: false,
             keep_tremolo_pos_on_new_note: false,
             effect_memory: [0; 27],
+            muted: false,
         }
     }
 }
@@ -378,6 +384,7 @@ impl PlayerState {
         let channels = (0..n_channels)
             .map(|i| Channel {
                 pan: header.pans.get(i).copied().unwrap_or(8) & 0x0F,
+                muted: header.muted.get(i).copied().unwrap_or(false),
                 ..Channel::default()
             })
             .collect();
@@ -1137,8 +1144,27 @@ impl PlayerState {
     }
 
     /// Mix one sample from one channel. Returns (left, right) in -1..=1.
+    ///
+    /// Muted channels (`+128` in the file's channel-settings byte, or AdLib
+    /// slots we don't synthesise) still advance their sample cursor — that
+    /// keeps a Q/G/H state-bearing pattern row consistent with what a real
+    /// ST3 would render if you later unmute the slot mid-song — but emit
+    /// silence into the bus.
     fn mix_channel(ch: &mut Channel, samples: &[SampleBody], out_rate: f32) -> (f32, f32) {
         if !ch.active || ch.frequency <= 0.0 {
+            return (0.0, 0.0);
+        }
+        if ch.muted {
+            // Still advance the read cursor so loop counters / sample-end
+            // detection match the unmuted path, then return silence.
+            let idx = ch.instrument as usize;
+            if idx > 0 && idx <= samples.len() {
+                let len = samples[idx - 1].pcm.len() as f64;
+                if ch.sample_pos < len {
+                    let step = (ch.frequency as f64) / (out_rate as f64);
+                    ch.sample_pos += step;
+                }
+            }
             return (0.0, 0.0);
         }
         let idx = ch.instrument as usize;
@@ -1590,5 +1616,96 @@ pub mod tests {
         assert_eq!(S2X_FINETUNE_TABLE[0x0], 7895);
         assert_eq!(S2X_FINETUNE_TABLE[0x8], 8363);
         assert_eq!(S2X_FINETUNE_TABLE[0xF], 8757);
+    }
+
+    /// Build a `SampleBody` of `len` constant-value PCM frames so the
+    /// mixer has something non-zero to read when the channel is unmuted.
+    fn dummy_sample(len: usize) -> SampleBody {
+        SampleBody {
+            pcm: vec![16_000i16; len],
+            pcm_right: None,
+            loop_start: 0,
+            loop_end: 0,
+            looped: false,
+            volume: 64,
+            c5_speed: 8363,
+        }
+    }
+
+    #[test]
+    fn muted_channel_emits_silence_in_mixer() {
+        // A muted channel with an active voice + non-zero volume must
+        // produce (0.0, 0.0) per mix step — never any audio. Confirm
+        // both branches of the mute flag (unmuted = audio, muted = silence)
+        // with the same sample / volume / frequency setup so the mute is
+        // the only variable.
+        let samples = vec![dummy_sample(64)];
+        let mut unmuted = Channel {
+            instrument: 1,
+            frequency: 8363.0,
+            sample_pos: 0.0,
+            volume: 64,
+            pan: 8,
+            active: true,
+            target_frequency: 8363.0,
+            ..Channel::default()
+        };
+        let mut muted = unmuted.clone();
+        muted.muted = true;
+        let (l1, r1) = PlayerState::mix_channel(&mut unmuted, &samples, 44_100.0);
+        let (l2, r2) = PlayerState::mix_channel(&mut muted, &samples, 44_100.0);
+        assert!(l1.abs() + r1.abs() > 0.01, "unmuted must emit audio");
+        assert_eq!((l2, r2), (0.0, 0.0), "muted must emit silence");
+    }
+
+    #[test]
+    fn muted_channel_still_advances_sample_position() {
+        // A muted channel must keep its read cursor consistent with the
+        // unmuted equivalent so unmuting mid-song picks up at the right
+        // sample — not at offset 0. Drive one mix tick on each, confirm
+        // both ended at the same `sample_pos`.
+        let samples = vec![dummy_sample(1024)];
+        let mut unmuted = Channel {
+            instrument: 1,
+            frequency: 8363.0,
+            sample_pos: 0.0,
+            volume: 64,
+            active: true,
+            target_frequency: 8363.0,
+            ..Channel::default()
+        };
+        let mut muted = unmuted.clone();
+        muted.muted = true;
+        for _ in 0..200 {
+            PlayerState::mix_channel(&mut unmuted, &samples, 44_100.0);
+            PlayerState::mix_channel(&mut muted, &samples, 44_100.0);
+        }
+        // Same step size on both branches, so cursors must match exactly.
+        assert_eq!(
+            muted.sample_pos, unmuted.sample_pos,
+            "muted cursor must advance like the unmuted equivalent"
+        );
+        assert!(
+            muted.sample_pos > 0.0,
+            "muted cursor must move off zero (got {})",
+            muted.sample_pos
+        );
+    }
+
+    #[test]
+    fn muted_channel_silent_when_voice_inactive() {
+        // Symmetric sanity: muted + inactive (no current note) must also
+        // emit (0,0) and not advance anything.
+        let samples = vec![dummy_sample(64)];
+        let mut ch = Channel {
+            instrument: 1,
+            frequency: 0.0,
+            active: false,
+            muted: true,
+            ..Channel::default()
+        };
+        let (l, r) = PlayerState::mix_channel(&mut ch, &samples, 44_100.0);
+        assert_eq!((l, r), (0.0, 0.0));
+        assert_eq!(ch.sample_pos, 0.0);
     }
 }

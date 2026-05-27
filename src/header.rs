@@ -24,7 +24,8 @@
 //! 0x35   1 byte   DP       — default pan flag (0xFC = use pan values below)
 //! 0x36   8 bytes  Reserved
 //! 0x3E   2 bytes  Special  — parapointer to special data (unused)
-//! 0x40  32 bytes  Channel settings — 0..=7 left, 8..=15 right, 16..=31 adlib, 0xFF = disabled
+//! 0x40  32 bytes  Channel settings — 0..=7 left, 8..=15 right, 16..=31 adlib,
+//!                  bit 7 set (e.g. 0x80 | type) = muted, 0xFF = unused
 //! 0x60  OrdNum    Order table — 0xFE = marker, 0xFF = end
 //! ...   InsNum*2  Instrument parapointer table
 //! ...   PatNum*2  Pattern parapointer table
@@ -126,11 +127,23 @@ pub struct S3mHeader {
     pub stereo: bool,
     /// Default-pan flag — 0xFC means the 32 pan bytes at end of header are valid.
     pub default_pan_flag: u8,
-    /// Channel settings, 32 entries: bit 7 = disabled, low bits = map.
+    /// Channel settings, 32 entries. Per the ST3 archive-team format reference
+    /// (`docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt`):
+    ///   `0xFF` = slot unused (not assigned to any output);
+    ///   bit 7 set (`0x80 | type`, e.g. `0x83` = "muted left PCM channel 4")
+    ///     = channel is *muted* but its pattern data is still read;
+    ///   otherwise the low bits are the channel type
+    ///     (0..=7 left PCM, 8..=15 right PCM, 16..=31 AdLib).
     pub channels: [u8; CHANNEL_COUNT],
     /// Pan values for 32 channels (0..=15); populated from the default
     /// pan block or synthesized from `channels` (left/right bank split).
     pub pans: [u8; CHANNEL_COUNT],
+    /// Per-channel muted flag — true when the channel settings byte has
+    /// bit 7 set (`0x80 | type`). Muted channels still parse pattern data
+    /// (so jumps, loops, pattern-delay see consistent state) but produce
+    /// no audio in the mixer. `0xFF` (unused) is treated as muted, since
+    /// no output channel is mapped to it.
+    pub muted: [bool; CHANNEL_COUNT],
     /// Raw order list (0xFE marker rows and 0xFF end markers preserved).
     pub order: Vec<u8>,
     /// Per-instrument definitions (parsed from parapointers).
@@ -253,6 +266,20 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
 
     let enabled_channels = channels.iter().filter(|&&c| c != 0xFF && c < 16).count() as u8;
 
+    // Per-channel mute flag: bit 7 (`+128`) marks a channel as disabled in
+    // the file-format spec. We treat 0xFF (unused) as muted too — there's no
+    // mapped output for it. The pattern parser still reads cells for muted
+    // channels so jumps / loops / pattern-delay see consistent state; the
+    // mixer silences them in `render`.
+    let mut muted = [false; CHANNEL_COUNT];
+    for (i, c) in channels.iter().enumerate() {
+        // 0xFF = unused. Otherwise bit 7 set (mask 0x80) = explicitly muted.
+        // AdLib slots (16..=31) without bit 7 are valid AdLib channels in
+        // ST3 — we don't render those (no OPL synth), so report them as
+        // muted to keep the audio path silent without confusing the parser.
+        muted[i] = *c == 0xFF || (*c & 0x80) != 0 || (*c & 0x7F) >= 16;
+    }
+
     Ok(S3mHeader {
         song_name,
         ord_num,
@@ -269,6 +296,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
         default_pan_flag,
         channels,
         pans,
+        muted,
         order,
         instruments,
         pattern_offsets,
@@ -354,5 +382,84 @@ mod tests {
         bytes[0x2C..0x30].copy_from_slice(S3M_SIGNATURE);
         bytes[0x1D] = 0x00;
         assert!(parse_header(&bytes).is_err());
+    }
+
+    /// Build a minimal header byte string with a given 32-byte channel
+    /// settings array. Used to exercise the muted-flag derivation.
+    ///
+    /// The header references zero instruments and zero patterns so we only
+    /// need the 0x60-byte fixed header plus a 2-byte order table with an
+    /// 0xFF end marker.
+    fn build_min_header(channel_settings: [u8; CHANNEL_COUNT]) -> Vec<u8> {
+        let mut b = vec![0u8; 0x60];
+        b[0x1D] = 0x10;
+        // Counts: 1 order, 0 ins, 0 pat (empty module).
+        b[0x20..0x22].copy_from_slice(&1u16.to_le_bytes());
+        b[0x22..0x24].copy_from_slice(&0u16.to_le_bytes());
+        b[0x24..0x26].copy_from_slice(&0u16.to_le_bytes());
+        b[0x2C..0x30].copy_from_slice(S3M_SIGNATURE);
+        b[0x30] = 64;
+        b[0x31] = 6;
+        b[0x32] = 125;
+        b[0x33] = 0x30;
+        b[0x40..0x40 + CHANNEL_COUNT].copy_from_slice(&channel_settings);
+        // Order: one 0xFF end marker.
+        b.push(0xFF);
+        b
+    }
+
+    #[test]
+    fn muted_flag_set_for_unused_slots() {
+        // Channel 0 active (left-PCM-1), all other slots 0xFF (unused).
+        let mut settings = [0xFFu8; CHANNEL_COUNT];
+        settings[0] = 0x00;
+        let bytes = build_min_header(settings);
+        let h = parse_header(&bytes).unwrap();
+        assert!(!h.muted[0], "channel 0 (type 0x00) must not be muted");
+        for slot in 1..CHANNEL_COUNT {
+            assert!(h.muted[slot], "unused slot {slot} must report muted");
+        }
+    }
+
+    #[test]
+    fn muted_flag_set_for_plus128_disabled_channels() {
+        // Per `docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt`
+        // ("Channel settings ... 255=unused,+128=disabled"), bit 7 set
+        // marks a channel as muted while the low bits still describe the
+        // mapped output type. Channels 0 and 1 = active; 2 = muted-with-
+        // type-2 (`0x82`); 3 = muted-with-type-3 (`0x83`).
+        let mut settings = [0xFFu8; CHANNEL_COUNT];
+        settings[0] = 0x00;
+        settings[1] = 0x01;
+        settings[2] = 0x82;
+        settings[3] = 0x83;
+        let bytes = build_min_header(settings);
+        let h = parse_header(&bytes).unwrap();
+        assert!(!h.muted[0]);
+        assert!(!h.muted[1]);
+        assert!(h.muted[2], "+128 disabled channel must be muted");
+        assert!(h.muted[3]);
+        // enabled_channels counts unmuted PCM channels only (used as the
+        // mixer normalisation divisor) — must report 2, not 4.
+        assert_eq!(h.enabled_channels, 2);
+    }
+
+    #[test]
+    fn muted_flag_set_for_adlib_slots() {
+        // AdLib melody (0x10..=0x18) and drum (0x19..=0x1D) slots are
+        // valid file-format entries but ST3 doesn't synthesise AdLib in
+        // the PCM mixer path. Mark them muted so the output stays silent
+        // instead of running an uninitialised PCM voice.
+        let mut settings = [0xFFu8; CHANNEL_COUNT];
+        settings[0] = 0x10; // melody 1
+        settings[1] = 0x18; // melody 9
+        settings[2] = 0x1D; // drum 5
+        let bytes = build_min_header(settings);
+        let h = parse_header(&bytes).unwrap();
+        assert!(h.muted[0]);
+        assert!(h.muted[1]);
+        assert!(h.muted[2]);
+        // No PCM channels enabled → enabled_channels = 0.
+        assert_eq!(h.enabled_channels, 0);
     }
 }
