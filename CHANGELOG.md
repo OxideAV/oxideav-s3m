@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Default-pan resolution now matches the ScreamTracker 3.20 spec**
+  (`docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt` §"Channel pan
+  settings") and the FireLight S3M Player Tutorial §2.8 / §2.8.1
+  (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt`). The
+  spec says that when a pan byte's bit 5 is clear, the channel's pan
+  must fall back to a default keyed by the master-volume stereo flag
+  — `3` for left-bank PCM slots (channel type `0..=7`), `C` for
+  right-bank slots (`8..=15`) in stereo mode; `7` (centre) for every
+  channel in mono mode. The previous implementation collapsed the
+  bit-5-clear case to `0x08` regardless of mode, so stereo modules
+  whose pan block contained well-formed entries with bit 5 unset
+  would lose their bank separation, and mono modules would not be
+  forced to the centre. Adds the FireLight §2.8.1 mono override —
+  in mono mode every channel pans to `7`, regardless of any explicit
+  pan byte read from the pan block. Five new tests under
+  `tests/parse_header.rs` cover the four resolution branches (stereo
+  / mono × no-block / bit-5-clear / bit-5-set) plus the mono
+  override.
+
 ### Changed
 
 - **`SCx` (note cut) now freezes the channel instead of zeroing volume**,

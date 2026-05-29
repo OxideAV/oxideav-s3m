@@ -1788,3 +1788,223 @@ fn effect_scx_thaws_on_following_h_command() {
         "row 1 must be audible after Hxx thaws the SCx freeze (got {row1_nonzero}/{row_frames})"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Default-pan resolution tests — ScreamTracker-v3.20-s3m.txt
+// §"Channel pan settings" + FireLight-S3M-Player-Tutorial.txt §2.8 / §2.8.1
+//
+// The spec defines two cases for each channel's pan resolution:
+//
+//   * Bit 5 of the pan byte set → low nibble is the explicit pan position (0..=15).
+//   * Bit 5 clear (or no pan block) → use the spec defaults:
+//       - stereo mode: 3 for left PCM slots (type 0..=7),
+//                      C for right PCM slots (type 8..=15);
+//       - mono mode:   7 (centre).
+//
+// FireLight §2.8.1 adds: in mono mode "all the panning values should be set
+// to the MIDDLE, regardless of any other panning information given before".
+// The mono override beats any explicit pan byte.
+
+/// Build the minimal 0x60-byte top header used by the pan tests.
+/// `stereo` controls bit 7 of the master-volume byte. The 32-byte channel
+/// settings block fills with slot indices 0..=N-1 (active) and 0xFF for
+/// the rest. `pan_block` is appended verbatim after the order /
+/// instrument-table / pattern-table fixed area when non-empty.
+fn build_pan_header_module(
+    stereo: bool,
+    active_channels: u8,
+    pan_block: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let mut out = vec![0u8; 0x60];
+    let name = b"SYNTH-PAN";
+    out[..name.len()].copy_from_slice(name);
+    out[0x1C] = 0x1A;
+    out[0x1D] = 0x10;
+    // 2 orders, 1 instrument, 1 pattern.
+    out[0x20..0x22].copy_from_slice(&2u16.to_le_bytes());
+    out[0x22..0x24].copy_from_slice(&1u16.to_le_bytes());
+    out[0x24..0x26].copy_from_slice(&1u16.to_le_bytes());
+    out[0x28..0x2A].copy_from_slice(&0x1320u16.to_le_bytes());
+    out[0x2A..0x2C].copy_from_slice(&2u16.to_le_bytes());
+    out[0x2C..0x30].copy_from_slice(S3M_SIGNATURE);
+    out[0x30] = 64;
+    out[0x31] = 6;
+    out[0x32] = 125;
+    // Master volume — bit 7 set when stereo, clear when mono.
+    out[0x33] = 0x30 | (if stereo { 0x80 } else { 0x00 });
+    // d.p flag: 0xFC iff caller supplied a pan block.
+    out[0x35] = if pan_block.is_some() { 0xFC } else { 0x00 };
+    // Channel settings — `active_channels` distinct PCM slots (0..N-1)
+    // mapped to channels 0..N-1, then 0xFF for the rest. We deliberately
+    // include slots from both banks (some <8 = "left PCM", some >=8 =
+    // "right PCM") so stereo defaults exercise both branches.
+    for (i, c) in out[0x40..0x40 + 32].iter_mut().enumerate() {
+        *c = if (i as u8) < active_channels {
+            i as u8
+        } else {
+            0xFF
+        };
+    }
+    // Order table (2 bytes: pattern 0, end marker).
+    out.extend_from_slice(&[0, 0xFF]);
+    // Instrument parapointer table (1 entry, patched later).
+    let ins_pp_off = out.len();
+    out.extend_from_slice(&[0, 0]);
+    // Pattern parapointer table (1 entry, patched later).
+    let pat_pp_off = out.len();
+    out.extend_from_slice(&[0, 0]);
+    // Optional 32-byte pan block immediately after the pattern-pp table.
+    if let Some(block) = pan_block {
+        out.extend_from_slice(block);
+    }
+    // Pad to 16, add a stub instrument so parse_header completes.
+    while out.len() % 16 != 0 {
+        out.push(0);
+    }
+    let inst_off = out.len();
+    let inst_parapointer = (inst_off >> 4) as u16;
+    let mut inst = vec![0u8; 80];
+    inst[0] = 1;
+    inst[0x10..0x14].copy_from_slice(&16u32.to_le_bytes());
+    inst[0x1C] = 64;
+    inst[0x20..0x24].copy_from_slice(&8363u32.to_le_bytes());
+    inst[0x4C..0x50].copy_from_slice(b"SCRS");
+    out.extend_from_slice(&inst);
+    while out.len() % 16 != 0 {
+        out.push(0);
+    }
+    let pat_off = out.len();
+    let pat_parapointer = (pat_off >> 4) as u16;
+    // Empty pattern body (2-byte length + 64 row terminators).
+    let mut pat_body: Vec<u8> = vec![0u8; 64];
+    let total_len = (2 + pat_body.len()) as u16;
+    out.extend_from_slice(&total_len.to_le_bytes());
+    out.append(&mut pat_body);
+    while out.len() % 16 != 0 {
+        out.push(0);
+    }
+    let sample_off = out.len();
+    let sample_parapointer = (sample_off >> 4) as u32;
+    out.extend(std::iter::repeat(0x80_u8).take(16));
+    let mem_hi = (sample_parapointer >> 16) as u8;
+    let mem_lo = (sample_parapointer & 0xFFFF) as u16;
+    out[inst_off + 0x0D] = mem_hi;
+    out[inst_off + 0x0E..inst_off + 0x10].copy_from_slice(&mem_lo.to_le_bytes());
+    out[ins_pp_off..ins_pp_off + 2].copy_from_slice(&inst_parapointer.to_le_bytes());
+    out[pat_pp_off..pat_pp_off + 2].copy_from_slice(&pat_parapointer.to_le_bytes());
+    out
+}
+
+#[test]
+fn pan_stereo_no_block_uses_left_or_right_bank_default() {
+    // No pan block, stereo mode: each channel falls back to the spec
+    // default keyed by channel-settings slot — `< 8` → 3, `>= 8` → C.
+    // Slot 0xFF (unused) gets the centre value 8.
+    let bytes = build_pan_header_module(true, 10, None);
+    let h = parse_header(&bytes).unwrap();
+    // Slots 0..=7 are configured as channel type 0..=7 → "left bank" → 3.
+    for i in 0..8 {
+        assert_eq!(
+            h.pans[i], 0x03,
+            "stereo-no-block channel {i} (slot {}) should fall back to 0x03 (left default)",
+            i
+        );
+    }
+    // Slots 8..=9 are channel type 8..=9 → "right bank" → C.
+    for i in 8..10 {
+        assert_eq!(
+            h.pans[i], 0x0C,
+            "stereo-no-block channel {i} (slot {}) should fall back to 0x0C (right default)",
+            i
+        );
+    }
+    // Disabled slots (10..=31): centre value (no PCM output mapped).
+    for i in 10..32 {
+        assert_eq!(
+            h.pans[i], 0x08,
+            "stereo-no-block disabled channel {i} should report centre 0x08"
+        );
+    }
+}
+
+#[test]
+fn pan_mono_no_block_centres_every_channel_at_seven() {
+    // Mono mode (master-volume bit 7 clear), no pan block: every channel
+    // — active and disabled alike — must be the mono default 7 per spec.
+    let bytes = build_pan_header_module(false, 10, None);
+    let h = parse_header(&bytes).unwrap();
+    for i in 0..32 {
+        assert_eq!(
+            h.pans[i], 0x07,
+            "mono-no-block channel {i} should be centre 0x07 (got {:#x})",
+            h.pans[i]
+        );
+    }
+}
+
+#[test]
+fn pan_stereo_block_bit5_clear_uses_bank_default_not_eight() {
+    // Stereo mode + pan block present, with bit 5 (mask 0x20) clear on
+    // every channel: the spec says we must fall back to the *bank*
+    // default (3 or C) — not blindly to 8 — for each channel.
+    // Pre-fix the implementation used 0x08 here.
+    let block = [0u8; 32]; // bit 5 clear everywhere
+    let bytes = build_pan_header_module(true, 10, Some(&block));
+    let h = parse_header(&bytes).unwrap();
+    for i in 0..8 {
+        assert_eq!(
+            h.pans[i], 0x03,
+            "stereo-block-bit5-clear channel {i} (left bank) should be 0x03"
+        );
+    }
+    for i in 8..10 {
+        assert_eq!(
+            h.pans[i], 0x0C,
+            "stereo-block-bit5-clear channel {i} (right bank) should be 0x0C"
+        );
+    }
+}
+
+#[test]
+fn pan_stereo_block_bit5_set_honours_explicit_pan_value() {
+    // Stereo mode + pan block present, with bit 5 set on every entry: the
+    // low nibble is the explicit pan position and must be preserved
+    // verbatim (no bank-default fallback). Use distinct values so a
+    // copy-paste bug shows up.
+    let mut block = [0u8; 32];
+    for (i, slot) in block.iter_mut().enumerate() {
+        // Bit 5 set + low nibble = (i & 0x0F).
+        *slot = 0x20 | ((i as u8) & 0x0F);
+    }
+    let bytes = build_pan_header_module(true, 10, Some(&block));
+    let h = parse_header(&bytes).unwrap();
+    for i in 0..32 {
+        assert_eq!(
+            h.pans[i],
+            (i as u8) & 0x0F,
+            "explicit-pan channel {i} must equal the low nibble of the pan byte"
+        );
+    }
+}
+
+#[test]
+fn pan_mono_override_beats_explicit_pan_byte() {
+    // FireLight §2.8.1: in mono mode every channel pans to the centre 7,
+    // *regardless of any explicit pan information specified before*. So
+    // even with a pan block that sets explicit values (bit 5 set), mono
+    // mode must override them all to 0x07.
+    let mut block = [0u8; 32];
+    for (i, slot) in block.iter_mut().enumerate() {
+        // bit 5 set + low nibble = some non-centre value (alternating 0 and F).
+        *slot = 0x20 | (if i & 1 == 0 { 0x00 } else { 0x0F });
+    }
+    let bytes = build_pan_header_module(false, 10, Some(&block));
+    let h = parse_header(&bytes).unwrap();
+    for i in 0..32 {
+        assert_eq!(
+            h.pans[i], 0x07,
+            "mono-override channel {i} must be 0x07 (got {:#x})",
+            h.pans[i]
+        );
+    }
+}

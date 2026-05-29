@@ -68,7 +68,16 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   when a row carries the same command with parameter 0. `H` / `U` and
   the entire `Sxy` family share their slots per the multimedia.cx
   behavioural reference.
-- Per-channel pan (default-pan block or synthesised from channel settings).
+- **Per-channel default pan resolution**: the pan byte's bit 5 selects
+  between an explicit low-nibble value and the spec defaults. When a
+  channel's bit 5 is clear (or no `d.p == 0xFC` pan block is present)
+  the parser falls back to the spec defaults keyed by the master-volume
+  stereo flag — stereo mode resolves left PCM slots (channel type
+  `0..=7`) to pan `3` and right PCM slots (`8..=15`) to pan `C`, while
+  mono mode (bit 7 of master volume clear) sets every pan to the
+  centre `7`. The FireLight tutorial §2.8.1 mono override is also
+  honoured: in mono mode every channel is forced to centre regardless
+  of any explicit pan byte read from the pan block.
 
 **Decode-only** — no S3M encoder is provided, by design. S3M is a tracker
 *source* format; re-emitting one is out of scope.

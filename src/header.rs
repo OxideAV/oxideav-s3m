@@ -244,23 +244,66 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
         pattern_offsets.push(parapointer << 4);
     }
 
-    // Default pan block (32 bytes) if default_pan_flag == 0xFC.
+    // Default pan resolution per the ST3 archive-team format reference
+    // (`docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt` §"Channel pan
+    // settings") and FireLight tutorial §2.8 / §2.8.1
+    // (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt`).
+    //
+    // The spec rule for each pan byte's bit 5: "1=default pan position
+    // specified, 0=use defaults: for mono 7, for stereo 3 or C." Bit 5
+    // is also the per-channel fallback selector inside the optional 32-byte
+    // pan block (present when `d.p == 0xFC`). Channels without bit 5 set
+    // — or modules with no pan block at all — fall back to spec defaults
+    // keyed by the master-volume stereo flag:
+    //   * Stereo: left PCM slots (channel type 0..=7) → 3, right PCM
+    //     slots (8..=15) → C. Unused slots (0xFF) get the centre value
+    //     since they emit no audio.
+    //   * Mono: every channel → 7 ("middle"). FireLight §2.8.1 also says
+    //     that in mono mode "all the panning values should be set to the
+    //     MIDDLE, regardless of any other panning information given before"
+    //     — i.e. the mono override beats an explicitly-specified pan byte.
+    //     We implement that as a final sweep over the resolved pan array.
+    fn stereo_default_pan(channel_settings: u8) -> u8 {
+        // Mute / AdLib slots have no PCM output mapping — assign the
+        // centre value so the field is well-defined without affecting
+        // anything audible.
+        if channel_settings == 0xFF {
+            return 0x08;
+        }
+        let slot = channel_settings & 0x0F;
+        if slot < 8 {
+            0x03
+        } else {
+            0x0C
+        }
+    }
+
     let mut pans = [0u8; CHANNEL_COUNT];
     if default_pan_flag == 0xFC && bytes.len() >= pat_table_end + CHANNEL_COUNT {
         for (i, p) in pans.iter_mut().enumerate() {
             let raw = bytes[pat_table_end + i];
-            // Low nibble is pan 0..=15 if bit 5 is set; else default.
-            *p = if raw & 0x20 != 0 { raw & 0x0F } else { 0x08 };
+            *p = if raw & 0x20 != 0 {
+                // Bit 5 set: low nibble is the explicit pan position.
+                raw & 0x0F
+            } else if stereo {
+                stereo_default_pan(channels[i])
+            } else {
+                // Mono fallback per spec.
+                0x07
+            };
         }
     } else {
-        // Derive from channel settings: 0..=7 → left (0x03), 8..=15 → right (0x0C).
+        // No pan block: use the spec default keyed by stereo flag.
         for (i, c) in channels.iter().enumerate() {
-            if *c == 0xFF {
-                pans[i] = 0x08; // doesn't matter, channel disabled
-            } else {
-                let slot = c & 0x0F;
-                pans[i] = if slot < 8 { 0x03 } else { 0x0C };
-            }
+            pans[i] = if stereo { stereo_default_pan(*c) } else { 0x07 };
+        }
+    }
+
+    // FireLight §2.8.1 mono override — in mono mode every channel pans
+    // to the centre regardless of the bytes we just resolved.
+    if !stereo {
+        for p in pans.iter_mut() {
+            *p = 0x07;
         }
     }
 
