@@ -754,8 +754,30 @@ impl PlayerState {
                             ch.keep_tremolo_pos_on_new_note = (p & 0x04) != 0;
                         }
                         0x8 => ch.pan = p,
-                        // SAx — old stereo control; not implemented in ST3.
-                        0xA => {}
+                        // SAx — legacy "stereo control" 16-position pan.
+                        //
+                        // Per the FireLight S3M Player Tutorial §6.23
+                        // (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt`)
+                        // this is a pre-ST3 panning command kept around for
+                        // compatibility with legacy modules such as
+                        // PANIC.S3M and STRSHINE.S3M. The tutorial spells
+                        // out the bit-swap algorithm:
+                        //
+                        //     if (eparmy > 7), then temp = eparmy - 8
+                        //     else                  temp = eparmy + 8
+                        //     setpan(temp)
+                        //
+                        // i.e. the high bit of the parameter nibble is
+                        // toggled before it is written to the channel pan
+                        // slot. The ST3.20 effects reference
+                        // (`ScreamTracker-v3.20-effects.txt` §SAx) calls
+                        // out PANIC by Future Crew as the canonical
+                        // dependent: "The only .S3M file released that
+                        // would support it is the soundtrack from Panic by
+                        // Future Crew." ST3 itself stopped emitting SAx in
+                        // new files (the editor uses S8x now), so this
+                        // path only matters for back-catalogue playback.
+                        0xA => ch.pan = p ^ 0x08,
                         0xB => {
                             // Collect loop requests across channels; ST3
                             // applies the last one on the row.

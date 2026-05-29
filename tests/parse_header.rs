@@ -2008,3 +2008,100 @@ fn pan_mono_override_beats_explicit_pan_byte() {
         );
     }
 }
+
+/// SAx (legacy stereo control) toggles the high bit of the parameter
+/// nibble and writes the result to the channel pan slot. Per the
+/// FireLight S3M Player Tutorial §6.23:
+///
+///     if (eparmy > 7), then temp = eparmy - 8
+///     else                  temp = eparmy + 8
+///     setpan(temp)
+///
+/// This is the bit-swap (XOR 0x8) form. So SA0 → pan 8, SA7 → pan 15,
+/// SA8 → pan 0, SAF → pan 7. Row 0 here triggers a note with SA0, which
+/// must land the channel on pan slot 8 (centre-right of the 16-position
+/// scale).
+#[test]
+fn effect_sax_pan_zero_lands_on_pan_eight() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: trigger + SA0. Channel 0's default pan in our synth header
+    // is `0` (bank-left slot 0), so the SA0 → pan 8 result must be a
+    // genuine state change, not a no-op happening to match the default.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 19, 0xA0, // row 0: trigger + SA0
+        0x00, // row 0 terminator
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Drive tick 0 of row 0.
+    let mut tb = vec![0i16; 2 * 64];
+    player.render(&mut tb);
+    assert_eq!(
+        player.channels[0].pan, 8,
+        "SA0 must map to pan 8 (XOR 0x8 of the parameter nibble)"
+    );
+}
+
+/// SAx full mapping: every value in 0..=0xF must round-trip through the
+/// XOR-0x8 swap. Walks the cases that aren't already covered by the
+/// dedicated SA0 test above.
+#[test]
+fn effect_sax_full_nibble_swap_mapping() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::PlayerState;
+    use oxideav_s3m::samples::extract_samples;
+
+    // For each `x` we build a fresh module with row-0 trigger + SAx,
+    // then read the channel pan after one tick. This isolates the
+    // mapping from any cross-row state (no shared effect memory effects
+    // creep in because each module is a one-row module).
+    let cases: [(u8, u8); 16] = [
+        (0x0, 8),
+        (0x1, 9),
+        (0x2, 10),
+        (0x3, 11),
+        (0x4, 12),
+        (0x5, 13),
+        (0x6, 14),
+        (0x7, 15),
+        (0x8, 0),
+        (0x9, 1),
+        (0xA, 2),
+        (0xB, 3),
+        (0xC, 4),
+        (0xD, 5),
+        (0xE, 6),
+        (0xF, 7),
+    ];
+    for (x, expected_pan) in cases {
+        let pat_body: Vec<u8> = vec![
+            0xA0,
+            0x50,
+            1,
+            19,
+            0xA0 | x, // row 0: trigger + SAx
+            0x00,
+        ];
+        let bytes = build_synth_with_pattern(pat_body);
+        let h = parse_header(&bytes).unwrap();
+        let samples = extract_samples(&h, &bytes);
+        let patterns = unpack_all(&h, &bytes);
+        let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+        let mut tb = vec![0i16; 2 * 64];
+        player.render(&mut tb);
+        assert_eq!(
+            player.channels[0].pan, expected_pan,
+            "SA{x:X} must map to pan {expected_pan} (FireLight §6.23 XOR 0x8 swap)"
+        );
+    }
+}

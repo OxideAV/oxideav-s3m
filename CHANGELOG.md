@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SAx (legacy stereo control) is now implemented** per the FireLight
+  S3M Player Tutorial §6.23
+  (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt`). The
+  command swaps the high bit of its parameter nibble before writing the
+  result to the channel pan slot — `SA0` lands on pan 8, `SA7` on pan
+  15, `SA8` on pan 0, `SAF` on pan 7. The pseudocode `if (eparmy > 7)
+  then temp = eparmy - 8 else temp = eparmy + 8; setpan(temp)` is
+  exactly equivalent to `pan ^ 0x08`. ST3 itself stopped emitting `SAx`
+  in new files (the editor uses `S8x` now), but the ScreamTracker 3.20
+  effects reference
+  (`docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt` §SAx)
+  documents PANIC.S3M by Future Crew as the canonical dependent for
+  back-catalogue playback, and the FireLight tutorial adds STRSHINE.S3M
+  to the list. The previous implementation silently dropped the
+  command; modules using it would have their channel pan inherited
+  from the default-pan path, mis-routing the stereo image. Two new
+  tests under `tests/parse_header.rs` cover the `SA0` → pan 8 case
+  in isolation plus a full sweep of every value in 0..=0xF asserting
+  the XOR-0x8 mapping holds across the whole nibble.
+
 ### Fixed
 
 - **Default-pan resolution now matches the ScreamTracker 3.20 spec**

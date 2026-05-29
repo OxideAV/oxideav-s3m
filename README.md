@@ -51,9 +51,12 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   family (`S1x` glissando, `S2x` finetune from the spec C4Spd table,
   `S3x`/`S4x` vibrato/tremolo waveform select [sine, ramp-down, square,
   random] with bit-2 "keep position across new note" support, `S80`
-  pan, `SBx` pattern loop, `SCx` note cut [`SC0` ignored per spec],
-  `SDx` note delay, `SEx` pattern delay). `S0x` filter and `SFx`
-  funkrepeat are spec'd as not implemented in ST3 itself and decode
+  pan, `SAx` legacy stereo control [pre-ST3 16-position pan with the
+  XOR-0x8 nibble swap from FireLight §6.23, kept around for
+  PANIC.S3M / STRSHINE.S3M compatibility], `SBx` pattern loop, `SCx`
+  note cut [`SC0` ignored per spec], `SDx` note delay, `SEx` pattern
+  delay). `S0x` filter and `SFx` funkrepeat are spec'd as not
+  implemented in ST3 itself and decode
   as no-ops.
 - **`SCx` freeze/resume semantics**: per the multimedia.cx behavioural
   reference, an `SCx` cut does **not** zero the channel volume — it
