@@ -103,6 +103,27 @@ fn retrigger_volume(vol: u8, x: u8) -> u8 {
 /// All Sxy subcommands collapse to a single S slot — the next row's S
 /// command sees the latest nonzero `info` byte even across S-subcommand
 /// boundaries.
+/// Is this an SCx-freeze "resume" command?
+///
+/// Per the multimedia.cx behavioural reference (§SCx): "When the note is
+/// cut, the volume is not set to 0. Instead playback is temporarily
+/// frozen and may be resumed by a following Exx, Fxx, Gxx, Hxx, Jxx,
+/// Kxx, Lxx or Uxx command." A row carrying any of those commands on a
+/// frozen channel thaws it before the row's tick-0 effects fire.
+fn is_scx_resume_command(command: u8) -> bool {
+    matches!(
+        command,
+        cmd::E_SLIDE_DOWN
+            | cmd::F_SLIDE_UP
+            | cmd::G_TONE_PORTA
+            | cmd::H_VIBRATO
+            | cmd::J_ARPEGGIO
+            | cmd::K_VIB_VOL
+            | cmd::L_PORT_VOL
+            | cmd::U_FINE_VIBRATO
+    )
+}
+
 fn effect_memory_slot(command: u8) -> u8 {
     match command {
         // U → H slot.
@@ -209,6 +230,15 @@ pub struct Channel {
     /// its slot; pattern parsing and per-tick state updates still run so
     /// jump / loop / delay state stays consistent.
     pub muted: bool,
+    /// SCx "frozen" state. Per the multimedia.cx behavioural reference
+    /// (§SCx): "the volume is *not* set to 0. Instead playback is
+    /// temporarily *frozen* and may be *resumed by a following Exx, Fxx,
+    /// Gxx, Hxx, Jxx, Kxx, Lxx or Uxx command*." When `true`, the mixer
+    /// emits silence for the channel and the sample read cursor halts,
+    /// but the channel's volume / frequency / sample_pos are preserved so
+    /// a thawing E/F/G/H/J/K/L/U command (or a fresh note trigger) can
+    /// resume playback from where it stopped.
+    pub frozen: bool,
 }
 
 /// Note/instrument/volume stash for the SDx (note delay) effect.
@@ -251,6 +281,7 @@ impl Default for Channel {
             keep_tremolo_pos_on_new_note: false,
             effect_memory: [0; 27],
             muted: false,
+            frozen: false,
         }
     }
 }
@@ -487,6 +518,14 @@ impl PlayerState {
             }
             ch.command = cell.command;
             ch.info = cell.info;
+            // SCx freeze resume: per multimedia.cx §SCx, any of Exx, Fxx,
+            // Gxx, Hxx, Jxx, Kxx, Lxx, Uxx thaws a frozen channel. This
+            // happens on the *row* the command appears, irrespective of
+            // its parameter — the wiki names the commands without nibble
+            // qualifications.
+            if ch.frozen && is_scx_resume_command(ch.command) {
+                ch.frozen = false;
+            }
             // Effect-memory ("%"): if the row's infobyte is zero and the
             // channel has seen this command before with a nonzero parameter,
             // ST3 reuses the latest nonzero value. H/U share a slot. S also
@@ -566,6 +605,10 @@ impl PlayerState {
                                 ch.sample_pos = 0.0;
                             }
                             ch.active = true;
+                            // A fresh note trigger thaws an SCx-frozen
+                            // channel: the new note replaces the held
+                            // sample so "frozen" is no longer meaningful.
+                            ch.frozen = false;
                             // S3x / S4x bit 2 keeps the vibrato / tremolo
                             // phase across new notes (multimedia.cx wiki
                             // §S3x: "If the third bit is set, don't reset
@@ -843,6 +886,8 @@ impl PlayerState {
                             ch.target_frequency = freq;
                             ch.sample_pos = 0.0;
                             ch.active = true;
+                            // SDx-deferred trigger thaws SCx freeze.
+                            ch.frozen = false;
                             if !ch.keep_vibrato_pos_on_new_note {
                                 ch.vibrato_pos = 0;
                             }
@@ -859,11 +904,17 @@ impl PlayerState {
                 }
             }
 
-            // SCx (note cut): silence the channel at tick x.
+            // SCx (note cut): freeze the channel at tick x. Per the
+            // multimedia.cx behavioural reference §SCx, the volume is
+            // *not* zeroed — playback is temporarily frozen so that a
+            // later Exx/Fxx/Gxx/Hxx/Jxx/Kxx/Lxx/Uxx command (or a fresh
+            // note trigger on a subsequent row) can resume it. The
+            // mixer reads `frozen` and emits silence while holding
+            // sample_pos / volume / frequency intact.
             if ch.command == cmd::S_EXTENDED && (ch.info >> 4) == 0xC {
                 let cut_tick = ch.info & 0x0F;
                 if tick == cut_tick {
-                    ch.volume = 0;
+                    ch.frozen = true;
                 }
             }
 
@@ -1152,6 +1203,14 @@ impl PlayerState {
     /// silence into the bus.
     fn mix_channel(ch: &mut Channel, samples: &[SampleBody], out_rate: f32) -> (f32, f32) {
         if !ch.active || ch.frequency <= 0.0 {
+            return (0.0, 0.0);
+        }
+        if ch.frozen {
+            // SCx-frozen channel: emit silence and *do not* advance the
+            // sample read cursor — per multimedia.cx §SCx, "playback is
+            // temporarily frozen" until an Exx/Fxx/Gxx/Hxx/Jxx/Kxx/Lxx/
+            // Uxx command (or a fresh note) thaws it. Holding sample_pos
+            // lets the resume pick up exactly where the cut landed.
             return (0.0, 0.0);
         }
         if ch.muted {
@@ -1707,5 +1766,93 @@ pub mod tests {
         let (l, r) = PlayerState::mix_channel(&mut ch, &samples, 44_100.0);
         assert_eq!((l, r), (0.0, 0.0));
         assert_eq!(ch.sample_pos, 0.0);
+    }
+
+    #[test]
+    fn frozen_channel_emits_silence_and_holds_position() {
+        // Per multimedia.cx §SCx, SCx freezes playback: the mixer emits
+        // silence AND the sample read cursor does not advance, so a
+        // later resume picks up exactly where the cut landed. Symmetric
+        // to the unfrozen baseline: same instrument / frequency / volume.
+        let samples = vec![dummy_sample(1024)];
+        let mut thawed = Channel {
+            instrument: 1,
+            frequency: 8363.0,
+            sample_pos: 100.0,
+            volume: 64,
+            pan: 8,
+            active: true,
+            target_frequency: 8363.0,
+            ..Channel::default()
+        };
+        let mut frozen = thawed.clone();
+        frozen.frozen = true;
+        for _ in 0..200 {
+            PlayerState::mix_channel(&mut thawed, &samples, 44_100.0);
+            PlayerState::mix_channel(&mut frozen, &samples, 44_100.0);
+        }
+        // The thawed branch must have advanced past the starting cursor.
+        assert!(
+            thawed.sample_pos > 100.0,
+            "thawed cursor must move (got {})",
+            thawed.sample_pos
+        );
+        // The frozen branch must have produced silence AND not advanced.
+        // We re-mix one more step on each and check the frozen output.
+        let (fl, fr) = PlayerState::mix_channel(&mut frozen, &samples, 44_100.0);
+        assert_eq!((fl, fr), (0.0, 0.0), "frozen must emit silence");
+        assert_eq!(
+            frozen.sample_pos, 100.0,
+            "frozen cursor must hold its starting value (got {})",
+            frozen.sample_pos
+        );
+        // Channel state is preserved so a resume can take over.
+        assert_eq!(frozen.volume, 64);
+        assert!(frozen.active);
+        assert_eq!(frozen.frequency, 8363.0);
+    }
+
+    #[test]
+    fn is_scx_resume_command_covers_the_eight_resume_effects() {
+        // The wiki §SCx lists exactly E, F, G, H, J, K, L, U as the
+        // commands that thaw a frozen channel. Any other ST3 command
+        // does not thaw.
+        for c in [
+            cmd::E_SLIDE_DOWN,
+            cmd::F_SLIDE_UP,
+            cmd::G_TONE_PORTA,
+            cmd::H_VIBRATO,
+            cmd::J_ARPEGGIO,
+            cmd::K_VIB_VOL,
+            cmd::L_PORT_VOL,
+            cmd::U_FINE_VIBRATO,
+        ] {
+            assert!(
+                is_scx_resume_command(c),
+                "command {c} must thaw an SCx-frozen channel"
+            );
+        }
+        // Commands that explicitly DO NOT thaw — including the ones the
+        // wiki omits: A, B, C, D, I, O, Q, R, S, T, V, X.
+        for c in [
+            0u8, // no command
+            cmd::A_SET_SPEED,
+            cmd::B_POS_JUMP,
+            cmd::C_PAT_BREAK,
+            cmd::D_VOL_SLIDE,
+            cmd::I_TREMOR,
+            cmd::O_SAMPLE_OFFSET,
+            cmd::Q_RETRIGGER,
+            cmd::R_TREMOLO,
+            cmd::S_EXTENDED,
+            cmd::T_SET_TEMPO,
+            cmd::V_GLOBAL_VOL,
+            cmd::X_SET_PAN,
+        ] {
+            assert!(
+                !is_scx_resume_command(c),
+                "command {c} must NOT thaw a frozen channel"
+            );
+        }
     }
 }

@@ -55,6 +55,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
   `SDx` note delay, `SEx` pattern delay). `S0x` filter and `SFx`
   funkrepeat are spec'd as not implemented in ST3 itself and decode
   as no-ops.
+- **`SCx` freeze/resume semantics**: per the multimedia.cx behavioural
+  reference, an `SCx` cut does **not** zero the channel volume â€” it
+  *freezes* playback so the mixer emits silence and the sample read
+  cursor stops advancing, while the channel keeps its volume /
+  frequency / sample position intact. A subsequent `Exx`, `Fxx`, `Gxx`,
+  `Hxx`, `Jxx`, `Kxx`, `Lxx`, or `Uxx` command on a later row (or any
+  fresh note trigger, including the `SDx`-deferred form) thaws the
+  channel and playback resumes from where the cut landed.
 - **Effect memory** (the ST3 "%" semantics): channels remember the
   latest nonzero parameter for each command and substitute it back in
   when a row carries the same command with parameter 0. `H` / `U` and

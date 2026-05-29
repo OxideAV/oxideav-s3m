@@ -1720,3 +1720,71 @@ fn muted_channel_outputs_silent_pair_via_multichannel_decoder() {
         nonzero[1]
     );
 }
+
+/// SCx + H-command sequence: row 0 cuts the channel at tick 1, row 1
+/// carries an Hxx vibrato (a documented "resume" command per
+/// multimedia.cx §SCx). The mixer must be silent across the cut tick
+/// and audible again starting with row 1.
+#[test]
+fn effect_scx_thaws_on_following_h_command() {
+    // Row 0: note C-5 + instrument 1 + SC1 (cut at tick 1).
+    //   flags 0xA0 (note+inst + cmd), note 0x50, inst 1, cmd S (19),
+    //   info 0xC1 -> SC01.
+    // Row 1: Hxx vibrato — H21 (speed=2, depth=1) on channel 0.
+    //   flags 0x80 (cmd only), cmd H (8), info 0x21.
+    let mut pat = vec![
+        // Row 0
+        0xA0, 0x50, 1, 19, 0xC1, 0x00, // row 0 terminator
+        // Row 1
+        0x80, 8, 0x21, 0x00, // row 1 terminator
+    ];
+    // Cap the pattern at exactly two rows so we don't keep rendering empty
+    // rows forever; we want enough audio to measure rows 0..=2.
+    pat.resize(pat.len() + 64, 0);
+    let bytes = build_synth_with_pattern(pat);
+    let frames = render_all(&bytes);
+    assert!(!frames.is_empty(), "decoder produced no frames");
+
+    let spt = 882usize; // samples per tick at 44100Hz / 125bpm
+    let row_frames = 6 * spt; // speed=6 ticks per row
+
+    // Tick 0 of row 0 must be audible (note plays before cut).
+    let tick0_nonzero = frames[..spt]
+        .iter()
+        .filter(|(l, r)| *l != 0 || *r != 0)
+        .count();
+    assert!(
+        tick0_nonzero > spt / 4,
+        "row 0 tick 0 must be audible before SCx fires (got {tick0_nonzero}/{spt})"
+    );
+
+    // Row 0 ticks 1..=5 should be silent (channel is frozen).
+    // Skip into tick 2 to give the cut-tick handler a moment.
+    let row0_post_cut = &frames[2 * spt..row_frames];
+    let post_cut_nonzero = row0_post_cut
+        .iter()
+        .filter(|(l, r)| *l != 0 || *r != 0)
+        .count();
+    assert_eq!(
+        post_cut_nonzero, 0,
+        "row 0 ticks 2..6 must be silent after SCx (got {post_cut_nonzero} nonzero)"
+    );
+
+    // Row 1: the Hxx command must thaw the channel. The looped square-wave
+    // instrument keeps playing, with vibrato modulating the pitch. Across
+    // row 1's 6 ticks (5292 frames) the output must be substantially audible.
+    let row1_start = row_frames;
+    let row1_end = 2 * row_frames;
+    assert!(
+        frames.len() >= row1_end,
+        "test rendered only {} frames; need >= {} for row 1 inspection",
+        frames.len(),
+        row1_end
+    );
+    let row1 = &frames[row1_start..row1_end];
+    let row1_nonzero = row1.iter().filter(|(l, r)| *l != 0 || *r != 0).count();
+    assert!(
+        row1_nonzero > row_frames / 4,
+        "row 1 must be audible after Hxx thaws the SCx freeze (got {row1_nonzero}/{row_frames})"
+    );
+}

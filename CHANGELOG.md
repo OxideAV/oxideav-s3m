@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`SCx` (note cut) now freezes the channel instead of zeroing volume**,
+  matching the multimedia.cx behavioural reference §SCx ("the volume is
+  *not* set to 0. Instead playback is temporarily *frozen* and may be
+  *resumed by a following Exx, Fxx, Gxx, Hxx, Jxx, Kxx, Lxx or Uxx
+  command*"). Previously the cut-tick handler wrote `volume = 0`, which
+  prevented spec-correct resumption: a later vibrato / portamento /
+  arpeggio on the same channel needed an explicit volume command to
+  become audible again. The new `Channel.frozen` flag silences the mixer
+  output AND halts the sample read cursor, while leaving volume,
+  frequency, and sample position intact for resume. A `new helper
+  is_scx_resume_command` thaws the channel on the eight listed commands
+  (E/F/G/H/J/K/L/U) and on any fresh note trigger — both immediate and
+  `SDx`-deferred. Adds three tests (`frozen_channel_emits_silence_and_holds_position`,
+  `is_scx_resume_command_covers_the_eight_resume_effects`, plus an
+  integration test `effect_scx_thaws_on_following_h_command` exercising
+  the full row-cycle).
+
 ### Added
 
 - **Channel mute flag** (`+128` in the file header's channel-settings byte,
