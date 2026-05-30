@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.6...v0.0.7) - 2026-05-29
+
+### Other
+
+- implement legacy stereo control per FireLight tutorial §6.23
+- spec-correct default-pan resolution + mono override
+- freeze/resume semantics per multimedia.cx — no longer zeroes volume
+- honour the channel-settings `+128` mute flag
+- continue running vibrato/porta (H00/G00 + Dxy) per multimedia.cx
+- Qxy retrigger: persistent per-channel counter + exact volume-modifier table
+- ST3 effect-memory + DFF/D0F/DF0/SC0/Cxx multimedia.cx alignment
+- round-75 effect-set widening (Ixy / Uxy / SEx / S1x..S4x / fine slides / SC0)
+
 ### Added
 
 - **SAx (legacy stereo control) is now implemented** per the FireLight
