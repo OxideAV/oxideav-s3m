@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Header flag bit 6 — fast slides / "ST3.00 volume slides"** wired
+  into the Dxy tick-0 path. Per the multimedia.cx behavioural reference
+  at `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+  §Flags: "if enabled, *all* volume slides occur *every* tick" and
+  "automatically enabled if tracker version is == 0x1300." Modules
+  that set the flag (or that carry CwtV `0x1300`, the original ST3.00
+  release) now get an extra slide step at tick 0 for the continuous
+  `Dx0` / `D0y` / `Dxy` (1..=E) forms — matching what a real ST3 would
+  emit. Fine slides (`DFx` / `DxF` / `DFF`) are explicitly excluded
+  per the same source ("unless we're doing a fineslide, we slide on
+  all ticks"); `D0F` / `DF0` are unaffected because they were already
+  slide-on-all-ticks regardless of the flag. New `apply_dxy_tick0_fast_slide`
+  helper covers the leg in isolation and is exercised by four targeted
+  unit tests (the `Dx0` and `D0y` cases, the negative skip-list for
+  fine / D0F / DF0 / D00, and the ST3 `Dxy` quirk).
+- **Header flag bit 4 — Amiga limits** clamp the channel's playback
+  frequency to the PAL Amiga's hardware period range `[113, 856]`
+  clock units (≈ `[16 725, 126 703]` Hz), per the same source §Flags:
+  "Amiga limits (limit periods to confine to 113 <= x <= 856)". The
+  base clock comes from the documented `8363 * 1712 = 14 317 456 Hz`
+  constant (also under §Playback Notes). New `clamp_amiga` helper plus
+  `AMIGA_CLOCK_HZ` / `AMIGA_LIMIT_PERIOD_MIN` / `AMIGA_LIMIT_PERIOD_MAX`
+  constants. The clamp is applied at every frequency-mutating site:
+  note triggers (immediate and `SDx`-deferred), `S2x` finetune, the
+  fine + continuous `E*` / `F*` pitch slides, the `Gxx` and `Lxy`-G00
+  tone portamento legs, the `Hxy` / `Uxy` / `Kxy`-H00 vibrato legs and
+  `Jxy` arpeggio. Both `frequency` and `target_frequency` are clamped
+  because tone portamento and the pitch slides rebase off
+  `target_frequency`; clamping only `frequency` would let the next
+  vibrato step silently re-escape the legal window. Five unit tests
+  cover the low / high / disabled / legal-pass-through / zero-skip
+  branches.
+- **Initial speed / tempo spec edge cases.** Per the multimedia.cx
+  reference ("Initial speed ... if 0 *or 255*, it is ignored ..."
+  and "Initial tempo - if less than 33, it is ignored ..."), the
+  ` PlayerState::new` constructor now treats `initial_speed` of `0`
+  or `0xFF` as "use the default" (was: only `0` fell back), and
+  `initial_tempo < 33` as the same (was: only `0` fell back). This
+  matches the per-row `Txx` command's `info >= 0x20` guard so a row-0
+  `T20` and an `initial_tempo` byte of `32` behave identically.
+  Three new unit tests cover the speed-0xFF case, the tempo<33 sweep,
+  and the new "33 is the first accepted tempo" boundary.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.6...v0.0.7) - 2026-05-29
 
 ### Other

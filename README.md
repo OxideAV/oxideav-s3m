@@ -81,6 +81,33 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   centre `7`. The FireLight tutorial §2.8.1 mono override is also
   honoured: in mono mode every channel is forced to centre regardless
   of any explicit pan byte read from the pan block.
+- **Header-flag-driven playback modes**
+  - **Fast slides (header flag bit 6, or CwtV == `0x1300`)** — the
+    original ST3.00 release shipped with a "fast slides" mode where the
+    `Dx0` / `D0y` / `Dxy` (1..=E) volume slides also fire at tick 0,
+    on top of the per-tick path's nonzero-tick steps. Per the
+    multimedia.cx behavioural reference (§Dxy: "Also slide on tick 0,
+    if fast slides are enabled"), later versions only do so when bit 6
+    of the file's flag word is explicitly set; a CwtV of `0x1300` auto-
+    arms the mode regardless of the flag. Fine forms (`DFx` / `DxF` /
+    `DFF`) are unaffected, as are the always-slide-on-all-ticks `D0F`
+    / `DF0` units.
+  - **Amiga limits (header flag bit 4)** — modules that opt in get their
+    playback frequency clamped to the PAL Amiga's hardware period range
+    `[113, 856]` clock units, i.e. `[AMIGA_CLOCK_HZ / 856,
+    AMIGA_CLOCK_HZ / 113]` ≈ `[16 725, 126 703]` Hz. The clamp covers
+    note triggers (immediate and `SDx`-deferred), `S2x` finetune, the
+    fine + continuous pitch slides (`E*` / `F*`), tone portamento
+    (`Gxx`, `Lxy`'s G00 leg), vibrato (`Hxy`, `Uxy`, `Kxy`'s H00 leg)
+    and `Jxy` arpeggio, so neither the audible pitch nor the
+    target-tracking pitch ever escape the range.
+- **Initial speed / tempo spec edge cases** — per the multimedia.cx
+  behavioural reference, the file's "initial speed" byte is ignored
+  when its value is `0` *or* `255` (Axx with parameter `0xFF` still
+  works, so the magic number is unusual but legal), and the "initial
+  tempo" byte is ignored when below `33` (matching the same
+  `Txx >= 0x20` guard the per-row tempo command honours). Both fall
+  back to the spec defaults (`speed = 6`, `bpm = 125`) when ignored.
 
 **Decode-only** — no S3M encoder is provided, by design. S3M is a tracker
 *source* format; re-emitting one is out of scope.

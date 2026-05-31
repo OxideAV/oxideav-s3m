@@ -353,6 +353,22 @@ fn snap_to_semitone(freq: f32, c5_speed: u32) -> f32 {
     c5 * 2.0f32.powf(n / 12.0)
 }
 
+/// Lower / upper period bound for the header's "Amiga limits" flag
+/// (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html` §Flags
+/// bit 4: "Amiga limits (limit periods to confine to 113 <= x <= 856)").
+///
+/// The PAL Amiga clock (14_317_456 Hz, the project-standard 8363 * 1712
+/// constant called out in the same multimedia.cx file under "Playback
+/// Notes / Base clock") relates period (clock cycles per sample) to
+/// playback frequency (Hz) by `freq = AMIGA_CLOCK / period`. So a period
+/// range of `[113, 856]` translates to a frequency range of roughly
+/// `[16_725, 126_703]` Hz. The constants below carry the spec's
+/// integer period bounds; the player converts them on demand so the
+/// truncation matches whatever the active sample rate works at.
+pub const AMIGA_CLOCK_HZ: u32 = 14_317_456;
+pub const AMIGA_LIMIT_PERIOD_MIN: u32 = 113;
+pub const AMIGA_LIMIT_PERIOD_MAX: u32 = 856;
+
 /// Top-level player state.
 pub struct PlayerState {
     pub samples: Vec<SampleBody>,
@@ -373,6 +389,24 @@ pub struct PlayerState {
     /// Used as the mixer's normalisation divisor — dividing by all 32
     /// slots makes typical 4–8 channel modules far too quiet.
     pub active_channels: u8,
+
+    /// Header flag bit 6 ("ST3.00 volume slides" — fast slides). Per
+    /// `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+    /// §Flags: "if enabled, *all* volume slides occur *every* tick"
+    /// and the bit is "automatically enabled if tracker version is
+    /// == 0x1300" (i.e. CwtV == 0x1300, the original ST3.00). The
+    /// Dxy per-tick path consults this when deciding whether the
+    /// `D0x` / `Dx0` continuous slides also fire at tick 0; fine
+    /// slides (`DFx` / `DxF` / `DFF`) are explicitly unaffected
+    /// (same source: "unless we're doing a fineslide, we slide on
+    /// all ticks").
+    pub fast_slides: bool,
+    /// Header flag bit 4 ("Amiga limits"). Per the same source: "limit
+    /// periods to confine to 113 <= x <= 856". When set, the mixer
+    /// clamps every channel's playback frequency to
+    /// `[AMIGA_CLOCK_HZ / 856, AMIGA_CLOCK_HZ / 113]` Hz so that the
+    /// effective period never escapes the PAL Amiga's hardware range.
+    pub amiga_limits: bool,
 
     pub order_index: u8,
     pub row: u8,
@@ -421,16 +455,37 @@ impl PlayerState {
             .collect();
         let initial_pan = header.pans.to_vec();
 
-        let speed = if header.initial_speed == 0 {
+        // Initial speed / tempo edge cases per the multimedia.cx behavioural
+        // reference at `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+        // under "Initial speed" / "Initial tempo":
+        //   * "Initial speed ... if 0 *or 255*, it is ignored and the previous
+        //     value used when you loaded the song is used instead." We're a
+        //     fresh-load player, so "the previous value" is whatever DEFAULT_SPEED
+        //     stands in for.
+        //   * "Initial tempo - if less than 33, it is ignored and the previous
+        //     value used when you loaded the song is used instead." This mirrors
+        //     the Txx command guard (`ch.info >= 0x20`) so the initial path
+        //     stays consistent with what a same-value Txx on row 0 would do.
+        let speed = if header.initial_speed == 0 || header.initial_speed == 0xFF {
             DEFAULT_SPEED
         } else {
             header.initial_speed
         };
-        let bpm = if header.initial_tempo == 0 {
+        let bpm = if header.initial_tempo < 33 {
             DEFAULT_BPM
         } else {
             header.initial_tempo
         };
+
+        // Header flag derivation per `multimedia-cx-scream-tracker-3.html`
+        // §Flags ("Bit 4: Amiga limits ...", "Bit 6: ST3.00 volume slides ...
+        // automatically enabled if tracker version is == 0x1300"). The
+        // tracker-version coupling matches the documented behaviour that the
+        // original ST3.00 release (CwtV == 0x1300) always ran the fast-slides
+        // path regardless of the flag byte; later versions only do so when
+        // bit 6 is explicitly set.
+        let fast_slides = (header.flags & (1 << 6)) != 0 || header.tracker_version == 0x1300;
+        let amiga_limits = (header.flags & (1 << 4)) != 0;
 
         PlayerState {
             samples,
@@ -443,6 +498,8 @@ impl PlayerState {
             global_volume: header.global_volume.min(64),
             master_volume: header.master_volume.min(127),
             active_channels: header.enabled_channels.max(1),
+            fast_slides,
+            amiga_limits,
             order_index: 0,
             row: 0,
             tick: 0,
@@ -454,6 +511,51 @@ impl PlayerState {
             loop_count: None,
             pattern_delay_remaining: 0,
             replaying_for_pattern_delay: false,
+        }
+    }
+
+    /// Lower frequency bound (Hz) of the Amiga-limits clamp.
+    ///
+    /// Period `856` (max) → frequency `AMIGA_CLOCK_HZ / 856 ≈ 16725` Hz.
+    /// Below this the period would exceed `856` clock units, which the
+    /// PAL Amiga hardware refused to produce on the original units the
+    /// flag was added to emulate.
+    #[inline]
+    pub fn amiga_limit_freq_low(&self) -> f32 {
+        (AMIGA_CLOCK_HZ as f32) / (AMIGA_LIMIT_PERIOD_MAX as f32)
+    }
+
+    /// Upper frequency bound (Hz) of the Amiga-limits clamp.
+    ///
+    /// Period `113` (min) → frequency `AMIGA_CLOCK_HZ / 113 ≈ 126703` Hz.
+    #[inline]
+    pub fn amiga_limit_freq_high(&self) -> f32 {
+        (AMIGA_CLOCK_HZ as f32) / (AMIGA_LIMIT_PERIOD_MIN as f32)
+    }
+
+    /// Apply the Amiga-limits clamp to a channel pair of (frequency,
+    /// target_frequency). No-op when `enabled` is false.
+    ///
+    /// Both fields are clamped because tone portamento (G/L) and the
+    /// continuous pitch slides (E/F) rebase off `target_frequency`; if
+    /// only `frequency` were clamped, the next vibrato or porta step
+    /// would silently push the audible pitch outside the legal range
+    /// the moment the clamp stopped being applied.
+    ///
+    /// Argument is passed explicitly rather than through `&self` so the
+    /// helper can be called inside the `for ch in &mut self.channels`
+    /// loops without aliasing `self`.
+    fn clamp_amiga(ch: &mut Channel, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        let lo = (AMIGA_CLOCK_HZ as f32) / (AMIGA_LIMIT_PERIOD_MAX as f32);
+        let hi = (AMIGA_CLOCK_HZ as f32) / (AMIGA_LIMIT_PERIOD_MIN as f32);
+        if ch.frequency > 0.0 {
+            ch.frequency = ch.frequency.clamp(lo, hi);
+        }
+        if ch.target_frequency > 0.0 {
+            ch.target_frequency = ch.target_frequency.clamp(lo, hi);
         }
     }
 
@@ -594,9 +696,11 @@ impl PlayerState {
                             ch.command == cmd::G_TONE_PORTA || ch.command == cmd::L_PORT_VOL;
                         if porta && ch.frequency > 0.0 {
                             ch.target_frequency = freq;
+                            Self::clamp_amiga(ch, self.amiga_limits);
                         } else {
                             ch.frequency = freq;
                             ch.target_frequency = freq;
+                            Self::clamp_amiga(ch, self.amiga_limits);
                             // Re-apply Oxx sample offset if present.
                             if ch.command == cmd::O_SAMPLE_OFFSET {
                                 let off = (ch.info as u64) * 256;
@@ -685,6 +789,15 @@ impl PlayerState {
                     } else if y == 0xF && x != 0 {
                         // DxF: fine up by x.
                         ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
+                    } else if self.fast_slides {
+                        // Header flag bit 6 (or CwtV == 0x1300): the
+                        // continuous Dx0 / D0x / Dxy nibble forms ALSO
+                        // fire at tick 0, on top of the per-tick path's
+                        // nonzero-tick steps. The doc lists this as the
+                        // "fast slides" behaviour on the multimedia.cx
+                        // §Dxy "Also slide on tick 0, if fast slides
+                        // are enabled" lines.
+                        Self::apply_dxy_tick0_fast_slide(ch, x, y);
                     }
                 }
                 cmd::E_SLIDE_DOWN if ch.info >= 0xE0 => {
@@ -695,6 +808,7 @@ impl PlayerState {
                     let f = 2.0f32.powf(-amount * scale / 768.0);
                     ch.frequency *= f;
                     ch.target_frequency *= f;
+                    Self::clamp_amiga(ch, self.amiga_limits);
                 }
                 cmd::F_SLIDE_UP if ch.info >= 0xE0 => {
                     // FFx: fine up. FEx: extra-fine up. Tick-0 only.
@@ -703,6 +817,7 @@ impl PlayerState {
                     let f = 2.0f32.powf(amount * scale / 768.0);
                     ch.frequency *= f;
                     ch.target_frequency *= f;
+                    Self::clamp_amiga(ch, self.amiga_limits);
                 }
                 cmd::Q_RETRIGGER => {
                     // Qxy is processed on every tick *including tick 0*,
@@ -737,6 +852,7 @@ impl PlayerState {
                                 let new_freq = note_to_frequency(ch.last_note, new_c5);
                                 ch.frequency = new_freq;
                                 ch.target_frequency = new_freq;
+                                Self::clamp_amiga(ch, self.amiga_limits);
                             }
                         }
                         // S3x — vibrato waveform. Bit 2 (mask 0x04) is the
@@ -881,6 +997,9 @@ impl PlayerState {
             .iter()
             .map(|s| (s.c5_speed.max(1), s.volume))
             .collect();
+        // Snapshot the header-derived flag so the channel loop can clamp
+        // each frequency-mutating effect without re-borrowing `self`.
+        let amiga_limits = self.amiga_limits;
         for ch in &mut self.channels {
             let x = ch.info >> 4;
             let y = ch.info & 0x0F;
@@ -906,6 +1025,7 @@ impl PlayerState {
                             let freq = note_to_frequency(pd.note, c5);
                             ch.frequency = freq;
                             ch.target_frequency = freq;
+                            Self::clamp_amiga(ch, amiga_limits);
                             ch.sample_pos = 0.0;
                             ch.active = true;
                             // SDx-deferred trigger thaws SCx freeze.
@@ -951,6 +1071,7 @@ impl PlayerState {
                     };
                     let mult = 2.0f32.powf(semis as f32 / 12.0);
                     ch.frequency = ch.target_frequency * mult;
+                    Self::clamp_amiga(ch, amiga_limits);
                 }
                 // Kxy = "H00 + Dxy" (multimedia.cx §Kxy). The vibrato leg is
                 // H00 — it *continues the vibrato already running* on the
@@ -965,6 +1086,7 @@ impl PlayerState {
                 cmd::K_VIB_VOL if !Self::is_fine_volslide(x, y) => {
                     let (h_speed, h_depth) = Self::vibrato_memory(ch);
                     Self::apply_vibrato(ch, h_speed, h_depth, /* fine: */ false);
+                    Self::clamp_amiga(ch, amiga_limits);
                     Self::apply_dxy(ch, x, y);
                 }
                 // Lxy = "G00 + Dxy" (multimedia.cx §Lxy). The porta leg is G00
@@ -975,6 +1097,7 @@ impl PlayerState {
                 cmd::L_PORT_VOL if !Self::is_fine_volslide(x, y) => {
                     let g_rate = ch.effect_memory[cmd::G_TONE_PORTA as usize];
                     Self::apply_tone_porta(ch, g_rate);
+                    Self::clamp_amiga(ch, amiga_limits);
                     Self::apply_dxy(ch, x, y);
                 }
                 // Qxy: retrigger note every y ticks with volume modifier x.
@@ -1002,19 +1125,23 @@ impl PlayerState {
                     let f = 2.0f32.powf(-(ch.info as f32) / 768.0);
                     ch.frequency *= f;
                     ch.target_frequency *= f;
+                    Self::clamp_amiga(ch, amiga_limits);
                 }
                 cmd::F_SLIDE_UP if ch.info != 0 && ch.info < 0xE0 => {
                     let f = 2.0f32.powf((ch.info as f32) / 768.0);
                     ch.frequency *= f;
                     ch.target_frequency *= f;
+                    Self::clamp_amiga(ch, amiga_limits);
                 }
                 // Gxx: slide toward target at rate info/per tick.
                 cmd::G_TONE_PORTA if ch.info != 0 && ch.target_frequency > 0.0 => {
                     Self::apply_tone_porta(ch, ch.info);
+                    Self::clamp_amiga(ch, amiga_limits);
                 }
                 cmd::H_VIBRATO => {
                     // Hxy: vibrato. x = speed, y = depth.
                     Self::apply_vibrato(ch, x, y, /* fine: */ false);
+                    Self::clamp_amiga(ch, amiga_limits);
                 }
                 // Ixy: tremor — flip the note on/off in (x+1)-on /
                 // (y+1)-off cycles. Spec lets x=y=0 mean "always on" /
@@ -1040,6 +1167,7 @@ impl PlayerState {
                 // Uxy: fine vibrato — four times more accurate than Hxy.
                 cmd::U_FINE_VIBRATO => {
                     Self::apply_vibrato(ch, x, y, /* fine: */ true);
+                    Self::clamp_amiga(ch, amiga_limits);
                 }
                 _ => {}
             }
@@ -1148,6 +1276,33 @@ impl PlayerState {
             // Dxy with both nibbles 1..=E: ST3 quirk — slide DOWN by y.
             ch.volume = ch.volume.saturating_sub(y);
         }
+    }
+
+    /// Tick-0 leg of `Dx0` / `D0x` (continuous-slide nibbles) when the
+    /// header's fast-slides flag is on.
+    ///
+    /// Per the multimedia.cx behavioural reference (§Dxy):
+    /// "D0x, 1 <= x <= 0xE: slide down by x on all nonzero ticks. **Also
+    /// slide on tick 0, if fast slides are enabled.**"  Same wording for
+    /// `Dx0` (slide up). The fine forms (`DFy`, `DxF`, `DFF`) are not
+    /// affected by the flag — those are handled by the existing tick-0
+    /// table in `enter_row` regardless. `D0F` / `DF0` are already
+    /// slide-on-all-ticks unconditionally; they also live in the existing
+    /// tick-0 table, so this helper deliberately skips them.
+    fn apply_dxy_tick0_fast_slide(ch: &mut Channel, x: u8, y: u8) {
+        if x != 0 && y == 0 && x != 0xF {
+            // Dx0 — slide up by x.
+            ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
+        } else if y != 0 && x == 0 && y != 0xF {
+            // D0y — slide down by y.
+            ch.volume = ch.volume.saturating_sub(y);
+        } else if x != 0 && y != 0 && x != 0xF && y != 0xF {
+            // ST3 quirk Dxy (both 1..=E): treat as D0y on the fast-slides
+            // tick-0 leg too, so the behaviour matches the per-tick path.
+            ch.volume = ch.volume.saturating_sub(y);
+        }
+        // Fine forms / D0F / DF0 / D00 fall through unchanged — they're
+        // already covered by the row-entry table.
     }
 
     /// Qxy retrigger step (runs on EVERY tick, including tick 0).
@@ -1832,6 +1987,289 @@ pub mod tests {
         assert_eq!(frozen.volume, 64);
         assert!(frozen.active);
         assert_eq!(frozen.frequency, 8363.0);
+    }
+
+    /// Build a minimal-but-valid S3mHeader purely in-memory so the
+    /// `PlayerState::new` flag-derivation logic can be exercised
+    /// without round-tripping a full byte fixture for every variation.
+    /// All array fields are zeroed; only the four fields the test cares
+    /// about (flags, tracker_version, initial_speed, initial_tempo) are
+    /// expected to be overridden by the caller.
+    fn synth_header() -> S3mHeader {
+        S3mHeader {
+            song_name: String::new(),
+            ord_num: 0,
+            ins_num: 0,
+            pat_num: 0,
+            flags: 0,
+            tracker_version: 0x1320,
+            ffi: 2,
+            global_volume: 64,
+            initial_speed: 6,
+            initial_tempo: 125,
+            master_volume: 0x30,
+            stereo: true,
+            default_pan_flag: 0,
+            channels: [0xFFu8; 32],
+            pans: [8u8; 32],
+            muted: [true; 32],
+            order: vec![0xFF],
+            instruments: Vec::new(),
+            pattern_offsets: Vec::new(),
+            enabled_channels: 1,
+        }
+    }
+
+    #[test]
+    fn header_flag_bit_6_enables_fast_slides() {
+        // Per `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+        // §Flags bit 6: "ST3.00 volume slides (automatically enabled if
+        // tracker version is == 0x1300) — if enabled, all volume slides
+        // occur every tick." Explicit bit 6 set with a modern CwtV
+        // (0x1320) must arm `fast_slides`.
+        let mut h = synth_header();
+        h.flags = 1 << 6;
+        h.tracker_version = 0x1320;
+        let player = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert!(player.fast_slides);
+        assert!(!player.amiga_limits);
+    }
+
+    #[test]
+    fn header_tracker_version_0x1300_enables_fast_slides_automatically() {
+        // Same source: the bit is "automatically enabled if tracker
+        // version is == 0x1300". So a file with bit 6 *clear* but
+        // CwtV == 0x1300 still gets fast slides.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1300;
+        let player = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert!(player.fast_slides, "CwtV 0x1300 must auto-arm fast slides");
+        // A neighbouring version (0x1301) must NOT auto-arm.
+        let mut h2 = synth_header();
+        h2.flags = 0;
+        h2.tracker_version = 0x1301;
+        let p2 = PlayerState::new(&h2, Vec::new(), Vec::new(), 44_100);
+        assert!(!p2.fast_slides, "CwtV != 0x1300 must leave the flag off");
+    }
+
+    #[test]
+    fn header_flag_bit_4_enables_amiga_limits() {
+        // Same source §Flags bit 4: "Amiga limits (limit periods to
+        // confine to 113 <= x <= 856)".
+        let mut h = synth_header();
+        h.flags = 1 << 4;
+        let player = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert!(player.amiga_limits);
+        assert!(!player.fast_slides);
+    }
+
+    #[test]
+    fn initial_speed_0xff_falls_back_to_default() {
+        // multimedia.cx "Initial speed ... if 0 *or 255*, it is ignored
+        // and the previous value used when you loaded the song is used
+        // instead." A fresh-load player has no previous song, so the
+        // built-in DEFAULT_SPEED stands in.
+        let mut h = synth_header();
+        h.initial_speed = 0xFF;
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p.speed, DEFAULT_SPEED);
+        // The existing speed==0 path also still falls back.
+        let mut h2 = synth_header();
+        h2.initial_speed = 0;
+        let p2 = PlayerState::new(&h2, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p2.speed, DEFAULT_SPEED);
+        // Any value in 1..=254 (other than 0/255) is taken as-is.
+        let mut h3 = synth_header();
+        h3.initial_speed = 9;
+        let p3 = PlayerState::new(&h3, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p3.speed, 9);
+    }
+
+    #[test]
+    fn initial_tempo_below_33_falls_back_to_default() {
+        // multimedia.cx "Initial tempo - if less than 33, it is ignored
+        // and the previous value used when you loaded the song is used
+        // instead." Mirrors the Txx tick-0 guard (`ch.info >= 0x20`).
+        for bad in [0u8, 1, 16, 32] {
+            let mut h = synth_header();
+            h.initial_tempo = bad;
+            let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+            assert_eq!(
+                p.bpm, DEFAULT_BPM,
+                "tempo {bad} (< 33) must fall back to default"
+            );
+        }
+        // 33 itself is the first accepted value.
+        let mut h = synth_header();
+        h.initial_tempo = 33;
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p.bpm, 33);
+    }
+
+    #[test]
+    fn fast_slides_dx0_fires_on_tick_0() {
+        // When fast slides are on, `Dx0` (continuous up by x) must add
+        // x at tick 0 too — that's the multimedia.cx "Also slide on
+        // tick 0, if fast slides are enabled" rule applied to Dx0.
+        // The helper covers the tick-0 leg in isolation.
+        let mut ch = Channel {
+            volume: 30,
+            ..Channel::default()
+        };
+        // D40 — x=4, y=0.
+        PlayerState::apply_dxy_tick0_fast_slide(&mut ch, 0x4, 0x0);
+        assert_eq!(ch.volume, 34);
+    }
+
+    #[test]
+    fn fast_slides_d0y_fires_on_tick_0() {
+        // Mirror of the above for `D0y`: continuous slide *down* by y
+        // on every nonzero tick (the standard path) PLUS tick 0 when
+        // fast slides are on. D03 → -3 at tick 0.
+        let mut ch = Channel {
+            volume: 30,
+            ..Channel::default()
+        };
+        PlayerState::apply_dxy_tick0_fast_slide(&mut ch, 0x0, 0x3);
+        assert_eq!(ch.volume, 27);
+    }
+
+    #[test]
+    fn fast_slides_tick0_leg_skips_fine_forms_and_d0f_df0() {
+        // The fast-slides tick-0 leg must NOT touch DFx / DxF / DFF
+        // (those are fine, tick-0-only, handled in the row-entry
+        // table) and must NOT double-fire D0F / DF0 (those are
+        // already unconditional slide-on-all-ticks). The wiki §Dxy:
+        // "unless we're doing a fineslide, we slide on all ticks."
+        // and "D0F slides down 15 on all ticks ... DF0 slides up 15
+        // on all ticks. Not affected at all by the fast slides flag."
+        for (x, y) in [
+            (0xF, 0x3), // DF3 — fine down
+            (0x3, 0xF), // D3F — fine up
+            (0xF, 0xF), // DFF — fine up by 15
+            (0x0, 0xF), // D0F — already slide-all-ticks, no fast-slide leg
+            (0xF, 0x0), // DF0 — same
+            (0x0, 0x0), // D00 — memory lookup, no slide
+        ] {
+            let mut ch = Channel {
+                volume: 30,
+                ..Channel::default()
+            };
+            PlayerState::apply_dxy_tick0_fast_slide(&mut ch, x, y);
+            assert_eq!(
+                ch.volume, 30,
+                "fast-slides tick-0 leg must not act on D{x:X}{y:X}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_slides_st3_quirk_dxy_treats_as_down() {
+        // Dxy with both nibbles in 1..=E: ST3 treats it as D0y (slide
+        // down by y) on the standard per-tick path. The fast-slides
+        // tick-0 leg must mirror that so the row-cycle effect is
+        // consistent. D34 → -4 at tick 0.
+        let mut ch = Channel {
+            volume: 30,
+            ..Channel::default()
+        };
+        PlayerState::apply_dxy_tick0_fast_slide(&mut ch, 0x3, 0x4);
+        assert_eq!(ch.volume, 26);
+    }
+
+    #[test]
+    fn amiga_clamp_low_floor_is_a4_period_856() {
+        // Period 856 → frequency AMIGA_CLOCK_HZ / 856 ≈ 16725 Hz.
+        // A note carrying a sub-floor frequency must be lifted to the
+        // floor and the target tracked.
+        let mut ch = Channel {
+            frequency: 8000.0,
+            target_frequency: 8000.0,
+            ..Channel::default()
+        };
+        PlayerState::clamp_amiga(&mut ch, true);
+        let expected = (AMIGA_CLOCK_HZ as f32) / (AMIGA_LIMIT_PERIOD_MAX as f32);
+        assert!(
+            (ch.frequency - expected).abs() < 0.01,
+            "frequency {:?} must be clamped up to {expected}",
+            ch.frequency
+        );
+        assert!(
+            (ch.target_frequency - expected).abs() < 0.01,
+            "target_frequency {:?} must be clamped up to {expected}",
+            ch.target_frequency
+        );
+    }
+
+    #[test]
+    fn amiga_clamp_high_ceiling_is_period_113() {
+        // Period 113 → ≈126703 Hz. A super-bright sample (250k Hz)
+        // must be brought down to the ceiling, with the target
+        // tracked the same way.
+        let mut ch = Channel {
+            frequency: 250_000.0,
+            target_frequency: 250_000.0,
+            ..Channel::default()
+        };
+        PlayerState::clamp_amiga(&mut ch, true);
+        let expected = (AMIGA_CLOCK_HZ as f32) / (AMIGA_LIMIT_PERIOD_MIN as f32);
+        assert!(
+            (ch.frequency - expected).abs() < 0.5,
+            "frequency {:?} must be clamped down to {expected}",
+            ch.frequency
+        );
+        assert!(
+            (ch.target_frequency - expected).abs() < 0.5,
+            "target_frequency {:?} must be clamped down to {expected}",
+            ch.target_frequency
+        );
+    }
+
+    #[test]
+    fn amiga_clamp_is_a_noop_when_disabled() {
+        // The flag must gate the clamp completely — modules that
+        // don't ask for Amiga limits keep their full pitch range.
+        let mut ch = Channel {
+            frequency: 8000.0,
+            target_frequency: 8000.0,
+            ..Channel::default()
+        };
+        PlayerState::clamp_amiga(&mut ch, false);
+        assert_eq!(ch.frequency, 8000.0);
+        assert_eq!(ch.target_frequency, 8000.0);
+    }
+
+    #[test]
+    fn amiga_clamp_preserves_legal_frequencies() {
+        // A frequency already in the legal window must pass through
+        // unchanged so the clamp can't introduce inaudible drift on
+        // modules that fit naturally inside the Amiga range.
+        let mid = ((AMIGA_CLOCK_HZ as f32) / (AMIGA_LIMIT_PERIOD_MAX as f32)
+            + (AMIGA_CLOCK_HZ as f32) / (AMIGA_LIMIT_PERIOD_MIN as f32))
+            / 2.0;
+        let mut ch = Channel {
+            frequency: mid,
+            target_frequency: mid,
+            ..Channel::default()
+        };
+        PlayerState::clamp_amiga(&mut ch, true);
+        assert_eq!(ch.frequency, mid);
+        assert_eq!(ch.target_frequency, mid);
+    }
+
+    #[test]
+    fn amiga_clamp_skips_zero_frequencies() {
+        // A silent / inactive channel (`frequency == 0.0`) must NOT
+        // be lifted to the floor — that would create phantom audio.
+        let mut ch = Channel {
+            frequency: 0.0,
+            target_frequency: 0.0,
+            ..Channel::default()
+        };
+        PlayerState::clamp_amiga(&mut ch, true);
+        assert_eq!(ch.frequency, 0.0);
+        assert_eq!(ch.target_frequency, 0.0);
     }
 
     #[test]
