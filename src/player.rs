@@ -430,6 +430,14 @@ pub struct PlayerState {
     /// `enter_row` call should skip cell application. Reset every time
     /// the row is fully advanced.
     replaying_for_pattern_delay: bool,
+    /// Vxx (set global volume) is "actually processed on tick 1 (that is the
+    /// second tick) of the row" per
+    /// `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html` §Vxx.
+    /// Tick 0 stashes the validated value here; tick 1 drains it. If `speed`
+    /// is `1`, tick 1 never fires before the row advances and the stash is
+    /// cleared on the next `enter_row` — matching the spec's "doesn't do
+    /// anything if the current speed is 1".
+    pending_global_vol: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -511,6 +519,7 @@ impl PlayerState {
             loop_count: None,
             pattern_delay_remaining: 0,
             replaying_for_pattern_delay: false,
+            pending_global_vol: None,
         }
     }
 
@@ -593,6 +602,16 @@ impl PlayerState {
         }
         let row_cells: Vec<Cell> = self.patterns[pat_idx].rows[self.row as usize].clone();
 
+        // Drop any Vxx stash left over from the previous row. A speed-1
+        // row never reaches tick 1, so the per-tick drain misses it; we
+        // discard it here so the spec rule "doesn't do anything if the
+        // current speed is 1" holds across the row boundary.
+        // `pending_global_vol = None` is also the right reset for the
+        // common case (previous row carried a Vxx and the tick-1 drain
+        // already ran) — `take()` left it `None`, so this assignment is
+        // a no-op there.
+        self.pending_global_vol = None;
+
         // SEx pattern delay: when we're in the middle of a held row, the
         // notes are *not* re-triggered, but the row's tick-0 effects are
         // also not re-armed (per-tick effects keep firing because the
@@ -602,7 +621,6 @@ impl PlayerState {
 
         let mut row_speed: Option<u8> = None;
         let mut row_tempo: Option<u8> = None;
-        let mut row_global_vol: Option<u8> = None;
         let mut row_jump: Option<Jump> = None;
 
         let mut row_loop_request: Option<u8> = None;
@@ -829,8 +847,30 @@ impl PlayerState {
                 cmd::T_SET_TEMPO if ch.info >= 0x20 => {
                     row_tempo = Some(ch.info);
                 }
-                cmd::V_GLOBAL_VOL => {
-                    row_global_vol = Some(ch.info.min(64));
+                // Vxx (set global volume). Per
+                // `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+                // §Vxx:
+                //   * "values higher than 0x40 are ignored" — the whole
+                //     effect is dropped, not clamped, so a stray V41..VFF
+                //     on row N leaves the prior global volume untouched.
+                //   * "actually processed on tick 1 (that is the second
+                //     tick) of the row" — so we *stash* the validated value
+                //     here. The per-tick path drains it on tick 1
+                //     (`apply_per_tick`), which:
+                //       - leaves same-row notes (triggered at tick 0)
+                //         observing the OLD global volume, matching "does
+                //         not affect events on the same row";
+                //       - lets SDx-delayed notes (fire_tick >= 1) and the
+                //         per-tick Dxx volume slide see the NEW value
+                //         implicitly because the mixer reads
+                //         `self.global_volume` live;
+                //       - skips the effect entirely when speed == 1 (the
+                //         row advances before tick 1 ever fires).
+                // The arm guards on `ch.info <= 0x40` because the spec rule
+                // is *ignore*, not *clamp* — invalid values must not even
+                // stash a sentinel.
+                cmd::V_GLOBAL_VOL if ch.info <= 0x40 => {
+                    self.pending_global_vol = Some(ch.info);
                 }
                 cmd::S_EXTENDED => {
                     // Sxy: extended commands. Subcommand in high nibble.
@@ -973,9 +1013,6 @@ impl PlayerState {
         if let Some(t) = row_tempo {
             self.bpm = t;
         }
-        if let Some(g) = row_global_vol {
-            self.global_volume = g;
-        }
         if let Some(p) = row_pattern_delay {
             // SEx arms the counter only on the first play of this row;
             // the row plays once at full effect, then `p` extra repeats
@@ -990,6 +1027,23 @@ impl PlayerState {
 
     fn apply_per_tick(&mut self) {
         let tick = self.tick;
+        // Vxx is "actually processed on tick 1" per
+        // `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+        // §Vxx. The row stashed the validated value in
+        // `pending_global_vol` at tick 0; drain it here. Same-row notes
+        // (triggered at tick 0) have already been mixed against the old
+        // global volume, satisfying the "does not affect events on the
+        // same row" rule. Channels mixing from tick 1 onward (and SDx-
+        // deferred triggers with fire_tick >= 1) read the new value
+        // implicitly because the mixer consults `self.global_volume`
+        // live. When `speed == 1`, tick 1 never fires before the row
+        // advances and the stash is cleared by `enter_row` — matching
+        // the spec's "doesn't do anything if the current speed is 1".
+        if tick == 1 {
+            if let Some(g) = self.pending_global_vol.take() {
+                self.global_volume = g;
+            }
+        }
         // Clone sample metadata we need for deferred SDx triggers. Can't
         // borrow `&self.samples` inside the mutable-channel loop.
         let samples_snapshot: Vec<(u32, u8)> = self
@@ -2314,5 +2368,168 @@ pub mod tests {
                 "command {c} must NOT thaw a frozen channel"
             );
         }
+    }
+
+    /// Build a 1-channel, 1-pattern player whose row 0 carries a Vxx with
+    /// the supplied parameter byte and whose row 1 is empty. Speed is
+    /// caller-controlled so the speed-1 branch of §Vxx can be exercised
+    /// alongside the standard speed-6 case.
+    ///
+    /// Used by the §Vxx tests below to drive `enter_row` / `apply_per_tick`
+    /// without standing up a full byte fixture for each scenario.
+    fn vxx_test_player(vxx_param: u8, speed: u8) -> PlayerState {
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.initial_speed = speed;
+        h.initial_tempo = 125;
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(1);
+        pat.rows[0][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::V_GLOBAL_VOL,
+            info: vxx_param,
+        };
+        // Row 1 carries no command so the per-row clear path is exercised.
+        pat.rows[1][0] = Cell::EMPTY;
+        PlayerState::new(&h, Vec::new(), vec![pat], 44_100)
+    }
+
+    #[test]
+    fn vxx_param_above_0x40_is_ignored() {
+        // multimedia.cx §Vxx: "Vxx with parameter values higher than 0x40
+        // are ignored." The whole effect is dropped — neither tick 0 nor
+        // tick 1 may touch `global_volume`, and the prior value (64) must
+        // remain intact.
+        let mut p = vxx_test_player(0x41, 6);
+        assert_eq!(p.global_volume, 64);
+        p.enter_row();
+        // Tick-0 stash MUST stay empty for an out-of-range parameter.
+        assert!(p.pending_global_vol.is_none());
+        for t in 1..p.speed {
+            p.tick = t;
+            p.apply_per_tick();
+        }
+        assert_eq!(
+            p.global_volume, 64,
+            "V41 must be ignored — global volume must not move"
+        );
+    }
+
+    #[test]
+    fn vxx_param_0xff_is_ignored() {
+        // Boundary check for the > 0x40 rule: a V-effect with infobyte
+        // 0xFF (the highest 8-bit value) must also be dropped completely.
+        let mut p = vxx_test_player(0xFF, 6);
+        p.enter_row();
+        assert!(p.pending_global_vol.is_none());
+        for t in 1..p.speed {
+            p.tick = t;
+            p.apply_per_tick();
+        }
+        assert_eq!(p.global_volume, 64);
+    }
+
+    #[test]
+    fn vxx_param_0x40_is_the_upper_boundary() {
+        // §Vxx says values *higher* than 0x40 are ignored, so V40 itself
+        // is accepted — it sets the global volume to the documented
+        // maximum (64). This is the row-line boundary; V41 (test above)
+        // must be the first dropped value.
+        let mut p = vxx_test_player(0x40, 6);
+        p.global_volume = 30; // visibly different from 0x40 so we can see the assignment
+        p.enter_row();
+        assert_eq!(p.pending_global_vol, Some(0x40));
+        // Tick 1 drains the stash.
+        p.tick = 1;
+        p.apply_per_tick();
+        assert_eq!(p.global_volume, 0x40);
+        assert!(p.pending_global_vol.is_none());
+    }
+
+    #[test]
+    fn vxx_applies_on_tick_1_not_tick_0() {
+        // §Vxx: "actually processed on tick 1". After `enter_row`
+        // (tick 0), the player's `global_volume` MUST still hold the
+        // previous value, but the stash MUST carry the new value. The
+        // first per-tick call (tick 1) drains the stash and updates
+        // `global_volume`.
+        let mut p = vxx_test_player(0x20, 6);
+        p.global_volume = 64;
+        p.enter_row();
+        assert_eq!(
+            p.global_volume, 64,
+            "Vxx must NOT affect tick 0 — same-row notes see the old value"
+        );
+        assert_eq!(p.pending_global_vol, Some(0x20));
+        p.tick = 1;
+        p.apply_per_tick();
+        assert_eq!(p.global_volume, 0x20, "Vxx must take effect on tick 1");
+        assert!(
+            p.pending_global_vol.is_none(),
+            "pending stash must be drained after tick 1"
+        );
+    }
+
+    #[test]
+    fn vxx_does_nothing_when_speed_is_1() {
+        // §Vxx: "The effect doesn't do anything, if the current speed
+        // is 1." With speed 1, tick 1 never fires before the row
+        // advances; the stash must be discarded on the next row entry
+        // so a later Vxx-free row doesn't silently inherit it.
+        let mut p = vxx_test_player(0x20, 1);
+        p.global_volume = 64;
+        // Row 0: stash set on tick 0.
+        p.enter_row();
+        assert_eq!(p.pending_global_vol, Some(0x20));
+        // Speed == 1: the row immediately advances to row 1 without
+        // running per-tick. The mixer's row dispatcher would call
+        // `enter_row` for row 1 here, which drops the stash.
+        p.row = 1;
+        p.enter_row();
+        assert!(
+            p.pending_global_vol.is_none(),
+            "speed-1 row must drop the stash without applying"
+        );
+        assert_eq!(
+            p.global_volume, 64,
+            "speed-1 row must NOT update global_volume"
+        );
+    }
+
+    #[test]
+    fn vxx_stash_cleared_on_next_row_entry() {
+        // Defence in depth: if a row carried a Vxx with speed >= 2 and
+        // the per-tick drain ran normally, the next row's `enter_row`
+        // must still find the stash empty (because `take()` left it
+        // None on tick 1). And a brand-new row without a Vxx command
+        // must not somehow resurrect the previous row's value.
+        let mut p = vxx_test_player(0x30, 6);
+        p.enter_row();
+        p.tick = 1;
+        p.apply_per_tick();
+        assert_eq!(p.global_volume, 0x30);
+        // Row 1 (empty cell) entry — stash must be None throughout.
+        p.row = 1;
+        p.enter_row();
+        assert!(p.pending_global_vol.is_none());
+        for t in 1..p.speed {
+            p.tick = t;
+            p.apply_per_tick();
+        }
+        assert_eq!(
+            p.global_volume, 0x30,
+            "row 1's empty cell must NOT touch the global volume"
+        );
     }
 }

@@ -108,6 +108,23 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   tempo" byte is ignored when below `33` (matching the same
   `Txx >= 0x20` guard the per-row tempo command honours). Both fall
   back to the spec defaults (`speed = 6`, `bpm = 125`) when ignored.
+- **`Vxx` (set global volume) — spec-compliant timing + value range**.
+  Per the multimedia.cx behavioural reference §Vxx, the command has
+  three quirks the decoder now honours:
+  1. **Parameter range** — values higher than `0x40` are *ignored*
+     (not clamped). A stray `V41`..`VFF` on a row leaves the previous
+     global volume untouched.
+  2. **Tick-1 application** — the effect is "actually processed on
+     tick 1 (that is the second tick) of the row", so same-row notes
+     triggered at tick 0 still see the *old* global volume. The new
+     value lands one tick later and is then read live by every
+     subsequent mixer step, so per-tick `Dxx` slides and any
+     `SDx`-deferred note triggers with `x >= 1` automatically pick up
+     the new value.
+  3. **Speed-1 skip** — when the current row speed is `1`, tick 1
+     never fires before the row advances and the stash is dropped on
+     the next row entry. This matches the spec's "doesn't do anything
+     if the current speed is 1" rule.
 
 **Decode-only** — no S3M encoder is provided, by design. S3M is a tracker
 *source* format; re-emitting one is out of scope.

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`Vxx` (set global volume) now honours the multimedia.cx behavioural
+  reference §Vxx in three places where the previous implementation
+  was off-spec**
+  (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`):
+  1. **Parameter range** — values higher than `0x40` are now
+     *ignored* per "Vxx with parameter values higher than 0x40 are
+     ignored". The earlier path silently `min`-clamped to `64`,
+     which masked the rule and produced a spurious update for any
+     `V41`..`VFF` infobyte; the new path leaves the prior global
+     volume untouched.
+  2. **Tick-1 application** — Vxx is now deferred to tick 1 per
+     "This effect is actually processed on tick 1 (that is the
+     second tick) of the row". Tick 0 stashes the validated value
+     in a new `PlayerState::pending_global_vol`; the per-tick path
+     drains it when `tick == 1`. This makes same-row notes
+     triggered at tick 0 observe the *old* global volume — matching
+     the wiki's "does not affect events on the same row" rule —
+     while letting later ticks (including SDx-delayed triggers and
+     the per-tick Dxx volume slide) read the new value live.
+  3. **Speed-1 skip** — when the current row speed is `1`, tick 1
+     never fires before the row advances, so the stash is dropped
+     on the next `enter_row`. This satisfies "doesn't do anything,
+     if the current speed is 1" without a separate guard. Six new
+     unit tests (`vxx_param_above_0x40_is_ignored`,
+     `vxx_param_0xff_is_ignored`, `vxx_param_0x40_is_the_upper_boundary`,
+     `vxx_applies_on_tick_1_not_tick_0`,
+     `vxx_does_nothing_when_speed_is_1`,
+     `vxx_stash_cleared_on_next_row_entry`) drive `enter_row` /
+     `apply_per_tick` directly through a single-channel synthetic
+     player to lock in every branch of the new behaviour.
+
 ### Added
 
 - **Header flag bit 6 — fast slides / "ST3.00 volume slides"** wired
