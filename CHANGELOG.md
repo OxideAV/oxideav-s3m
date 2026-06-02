@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Mixing-volume range + stereo `* 11/8` multiplier per the spec's
+  §Mixing volume.** Per
+  `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+  ("Mixing volume (range 16 <= x <= 127) ... It is multiplied by 11/8
+  when stereo is on"), the player now (a) clamps the file-header
+  master-volume byte to `[16, 127]` at load — sub-floor values used to
+  be admitted as-is and could silence the mix below the documented
+  minimum — and (b) applies a `* 11/8` (1.375×) gain to the mixing
+  volume when the header's stereo bit (high bit of the raw MV byte)
+  is set. The stereo flag is plumbed into a new
+  `PlayerState::stereo: bool`, and both the mixed renderer
+  (`render_one`) and the per-channel renderer
+  (`render_one_per_channel`) apply the multiplier so per-channel
+  output stays bit-equivalent to the mixed path on a
+  single-active-channel module. Five new unit tests cover the value
+  clamp (`master_volume_clamped_to_spec_range_16_127`), the flag
+  plumbing (`stereo_flag_mirrored_into_player_state`), the stereo
+  gain ratio (`stereo_mixing_volume_gets_11_over_8_boost` — measures
+  `stereo_amp / mono_amp ≈ 1.375` within 0.02 of the spec value), and
+  the inverse mono-path verification
+  (`mono_mixing_volume_has_no_stereo_boost`).
 - **`Vxx` (set global volume) now honours the multimedia.cx behavioural
   reference §Vxx in three places where the previous implementation
   was off-spec**

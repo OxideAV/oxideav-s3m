@@ -382,9 +382,23 @@ pub struct PlayerState {
     pub speed: u8,
     pub bpm: u8,
     pub global_volume: u8,
-    /// Master volume from the file header (0..=127). Applied as a global
-    /// gain on top of `global_volume`.
+    /// Master volume from the file header. Per the multimedia.cx behavioural
+    /// reference (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+    /// §Mixing volume): "Mixing volume (range 16 <= x <= 127) which is only
+    /// used for Sound Blaster. It is multiplied by 11/8 when stereo is on."
+    /// The constructor clamps to `[16, 127]` so out-of-range values from
+    /// hand-edited headers don't pull the mixer below the nominal floor or
+    /// above the documented ceiling. Applied as a global gain on top of
+    /// `global_volume`; the `* 11/8` stereo multiplier lives in the mixer
+    /// step rather than the stored value so the unprocessed file-header
+    /// number remains inspectable for round-trip tooling.
     pub master_volume: u8,
+    /// Stereo flag mirrored from the file header (bit 7 of the raw master-
+    /// volume byte). Drives the multimedia.cx `* 11/8` mixing-volume
+    /// multiplier in the mixer step: stereo modules get a documented +2.78 dB
+    /// boost over mono modules at the same numerical master-volume setting,
+    /// matching what ST3 itself did on Sound Blaster output.
+    pub stereo: bool,
     /// Number of channels actually carrying PCM/AdLib in the file.
     /// Used as the mixer's normalisation divisor — dividing by all 32
     /// slots makes typical 4–8 channel modules far too quiet.
@@ -504,7 +518,15 @@ impl PlayerState {
             speed,
             bpm,
             global_volume: header.global_volume.min(64),
-            master_volume: header.master_volume.min(127),
+            // Mixing-volume range is `[16, 127]` per the multimedia.cx wiki
+            // §Mixing volume ("range 16 <= x <= 127"); clamp at load time so
+            // hand-edited or truncated headers don't push the mixer outside
+            // the spec window. Values below 16 would silence the file below
+            // the documented floor; values above 127 occupy the bit-7 stereo
+            // flag and are physically unreachable through the byte but the
+            // explicit ceiling keeps the intent obvious.
+            master_volume: header.master_volume.clamp(16, 127),
+            stereo: header.stereo,
             active_channels: header.enabled_channels.max(1),
             fast_slides,
             amiga_limits,
@@ -1543,7 +1565,19 @@ impl PlayerState {
         // simultaneously, so dividing by N (instead of √N) crushes the
         // perceived loudness by ~6-12 dB on big modules. Final clamp
         // catches the rare actual peak.
-        let mv = (self.master_volume.max(1) as f32) / 48.0;
+        //
+        // Stereo `* 11/8` boost per the multimedia.cx behavioural reference
+        // (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+        // §Mixing volume): "Mixing volume ... is multiplied by 11/8 when
+        // stereo is on." The factor sits at the mixer step (rather than
+        // baked into `self.master_volume`) so the stored value still matches
+        // the raw header byte for tooling.
+        let mv_raw = (self.master_volume.max(1) as f32) / 48.0;
+        let mv = if self.stereo {
+            mv_raw * (11.0 / 8.0)
+        } else {
+            mv_raw
+        };
         let gv = (self.global_volume as f32) / 64.0;
         let norm = (self.active_channels as f32).max(1.0).sqrt();
         let scale = mv * gv / norm;
@@ -1563,7 +1597,17 @@ impl PlayerState {
     /// channel's signal, so there's nothing to compensate for.
     fn render_one_per_channel(&mut self, out: &mut [i16]) {
         let out_rate = self.sample_rate as f32;
-        let mv = (self.master_volume.max(1) as f32) / 48.0;
+        // Same `* 11/8` stereo mixing-volume multiplier the mixed path
+        // applies — keep per-channel output bit-equivalent for a
+        // single-active-channel module, so visualizer / DAW consumers see
+        // exactly what the mixed path would emit before the sqrt(active)
+        // normalisation step.
+        let mv_raw = (self.master_volume.max(1) as f32) / 48.0;
+        let mv = if self.stereo {
+            mv_raw * (11.0 / 8.0)
+        } else {
+            mv_raw
+        };
         let gv = (self.global_volume as f32) / 64.0;
         let scale = mv * gv;
         for (i, ch) in self.channels.iter_mut().enumerate() {
@@ -2504,6 +2548,141 @@ pub mod tests {
         assert_eq!(
             p.global_volume, 64,
             "speed-1 row must NOT update global_volume"
+        );
+    }
+
+    #[test]
+    fn master_volume_clamped_to_spec_range_16_127() {
+        // multimedia.cx §Mixing volume: "Mixing volume (range 16 <= x <=
+        // 127)". The constructor must lift sub-16 values to 16 (the
+        // documented floor) and ceiling-clamp anything above 127.
+        let mut h = synth_header();
+        // Below-floor: anything in 0..=15 maps to 16.
+        h.master_volume = 0;
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p.master_volume, 16, "MV=0 must clamp up to spec floor 16");
+
+        h.master_volume = 15;
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p.master_volume, 16, "MV=15 must clamp up to spec floor 16");
+
+        // In-range values pass through.
+        h.master_volume = 16;
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p.master_volume, 16);
+
+        h.master_volume = 48; // ST3 SOUNDCFG default
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p.master_volume, 48);
+
+        h.master_volume = 127;
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert_eq!(p.master_volume, 127);
+    }
+
+    #[test]
+    fn stereo_flag_mirrored_into_player_state() {
+        // The stereo flag (bit 7 of the raw master-volume byte) must reach
+        // the player so the mixer can apply the §Mixing volume `* 11/8`
+        // multiplier. Both polarities must round-trip.
+        let mut h = synth_header();
+        h.stereo = true;
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert!(p.stereo, "stereo header flag must reach PlayerState");
+
+        h.stereo = false;
+        let p = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert!(!p.stereo, "mono header flag must reach PlayerState");
+    }
+
+    /// Render one mixer step on a player whose only audible state is a
+    /// single full-volume mono sample at centre pan. The amplitude
+    /// returned is the sum of `|L|` and `|R|` of the produced i16 frame,
+    /// i.e. a scalar proxy for "how loud was the master/global mixing
+    /// stage." Used by the §Mixing volume tests to compare stereo vs
+    /// mono `* 11/8` scaling.
+    fn render_master_volume_amplitude(stereo: bool, master_volume: u8) -> i32 {
+        let mut h = synth_header();
+        h.stereo = stereo;
+        h.master_volume = master_volume;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [7u8; 32]; // centre pan
+        h.global_volume = 64;
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        // Build one mono sample: a constant +0x4000 i16 PCM block long
+        // enough that mix_channel won't run off the end during the
+        // single step we exercise.
+        let pcm = vec![0x4000i16; 1024];
+        let sample = SampleBody {
+            pcm,
+            pcm_right: None,
+            loop_start: 0,
+            loop_end: 0,
+            looped: false,
+            volume: 64,
+            c5_speed: 8363,
+        };
+
+        let mut p = PlayerState::new(&h, vec![sample], vec![Pattern::empty(1)], 44_100);
+        // Wire a live channel straight into the mixer — the row-state path
+        // is not under test here.
+        p.channels[0].instrument = 1;
+        p.channels[0].volume = 64;
+        p.channels[0].pan = 7;
+        p.channels[0].active = true;
+        p.channels[0].frequency = 8363.0;
+        p.channels[0].sample_pos = 0.0;
+
+        let mut buf = [0i16; 2];
+        p.render_one(&mut buf);
+        (buf[0] as i32).abs() + (buf[1] as i32).abs()
+    }
+
+    #[test]
+    fn stereo_mixing_volume_gets_11_over_8_boost() {
+        // multimedia.cx §Mixing volume: "Mixing volume ... is multiplied
+        // by 11/8 when stereo is on." With the same numerical MV (48,
+        // the ST3 SOUNDCFG default), a stereo file must produce a
+        // measurably louder mix than the mono variant. We need the ratio
+        // to be ~1.375× (= 11/8) — pre-clamp, since post-clamp peaks
+        // would compress the boost.
+        //
+        // Use a low MV (16, the spec floor) so even after the boost the
+        // resulting amplitude is well below the i16 ceiling and the
+        // 11/8 ratio survives intact.
+        let mono = render_master_volume_amplitude(false, 16);
+        let stereo = render_master_volume_amplitude(true, 16);
+        assert!(mono > 0, "mono baseline must be non-zero");
+        assert!(
+            stereo > mono,
+            "stereo MV must exceed mono MV at same setting"
+        );
+        let ratio = stereo as f64 / mono as f64;
+        // The mixer applies `* 11/8` = 1.375 exactly; allow a small
+        // tolerance for the i16 quantisation step.
+        assert!(
+            (ratio - 1.375).abs() < 0.02,
+            "stereo/mono ratio {ratio} must be 11/8 (= 1.375) within 0.02"
+        );
+    }
+
+    #[test]
+    fn mono_mixing_volume_has_no_stereo_boost() {
+        // Inverse check: with the stereo flag clear, two different MVs
+        // must scale linearly (16 → 32 doubles the output) and there
+        // must be no hidden 11/8 multiplier anywhere in the mono path.
+        let lo = render_master_volume_amplitude(false, 16);
+        let hi = render_master_volume_amplitude(false, 32);
+        assert!(lo > 0);
+        let ratio = hi as f64 / lo as f64;
+        assert!(
+            (ratio - 2.0).abs() < 0.05,
+            "doubling MV must double the mono amplitude, got ratio {ratio}"
         );
     }
 

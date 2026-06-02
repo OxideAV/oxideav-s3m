@@ -125,6 +125,16 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
      never fires before the row advances and the stash is dropped on
      the next row entry. This matches the spec's "doesn't do anything
      if the current speed is 1" rule.
+- **Mixing volume range + stereo `* 11/8` multiplier**. Per the
+  multimedia.cx wiki §Mixing volume ("range 16 <= x <= 127 ... It is
+  multiplied by 11/8 when stereo is on"), the file-header master-
+  volume byte is now clamped to `[16, 127]` at load — values below
+  the documented floor used to silence the mix below the legal
+  minimum — and the mixer applies a `* 11/8` (1.375×) gain whenever
+  the header's stereo flag (bit 7 of the raw MV byte) is set. The
+  flag is plumbed into `PlayerState::stereo`; both the mixed and
+  per-channel renderers apply the multiplier so a one-channel module
+  produces bit-equivalent output across both APIs.
 
 **Decode-only** — no S3M encoder is provided, by design. S3M is a tracker
 *source* format; re-emitting one is out of scope.
