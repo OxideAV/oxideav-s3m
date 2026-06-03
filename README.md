@@ -135,6 +135,23 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   flag is plumbed into `PlayerState::stereo`; both the mixed and
   per-channel renderers apply the multiplier so a one-channel module
   produces bit-equivalent output across both APIs.
+- **PCM active-volume peaks at 63 (not 64)**. Per the multimedia.cx
+  behavioural reference §Playback Notes ("Volumes actually peak at 63,
+  and not 64. Setting the volume to 64 will actually make it go to 63.
+  However, on Adlib channels, if the default volume is 64, it will use
+  64. Any further operations on the volume will clip it to within the
+  0-63 range."), every active-volume write on the PCM path — instrument
+  default load, volume column, per-tick / fine `Dxy` slide, `Qxy`
+  retrigger modifier, `Ixy` tremor restore, `Rxy` tremolo delta, and
+  the fast-slides tick-0 leg — now funnels through a single
+  `clamp_pcm_volume(u16) -> u8` helper that pins the result to the new
+  `PCM_VOLUME_PEAK = 63` constant. The mixer also caps on read so an
+  externally-constructed `Channel` literal (test scaffolding, FFI
+  handoff) can't sneak a 64 past the spec ceiling. Adlib channels are
+  out of scope for this crate (`AdLib FM synth` line below).
+  Decoder-side header parsing keeps the file-byte representation intact
+  so round-trip tooling can still inspect the raw value; only the
+  active mixer chain is capped.
 
 **Decode-only** — no S3M encoder is provided, by design. S3M is a tracker
 *source* format; re-emitting one is out of scope.

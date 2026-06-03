@@ -1104,7 +1104,9 @@ fn effect_s2x_finetune_changes_playback_rate() {
 }
 
 /// DFy fine vol slide down (DF4): at tick 0 the volume drops by 4 once
-/// and then stays put. Volume should be 64-4=60 after the row settles.
+/// and then stays put. The synth instrument's default volume is 64 in
+/// the file but the multimedia.cx §Playback Notes "peak at 63" rule
+/// pins it to 63 on load, so after DF4 the channel sits at 63-4=59.
 #[test]
 fn effect_dfy_fine_vol_slide_down() {
     use oxideav_s3m::header::parse_header;
@@ -1114,7 +1116,7 @@ fn effect_dfy_fine_vol_slide_down() {
 
     // Row 0: note + DF4. D=4, info=0xF4.
     let pat_body: Vec<u8> = vec![
-        0xA0, 0x50, 1, // note + inst (resets vol to inst default 64)
+        0xA0, 0x50, 1, // note + inst (resets vol to inst default 64 → clamp 63)
         4, 0xF4, // cmd D info 0xF4 → DF4 fine down by 4
         0,
     ];
@@ -1127,8 +1129,8 @@ fn effect_dfy_fine_vol_slide_down() {
     let mut buf = vec![0i16; 2 * 64];
     player.render(&mut buf); // drive past tick 0
     assert_eq!(
-        player.channels[0].volume, 60,
-        "DF4 should subtract 4 from vol=64 at tick 0"
+        player.channels[0].volume, 59,
+        "DF4 should subtract 4 from the PCM-clamped vol 63 at tick 0"
     );
 
     // Subsequent ticks must not slide further (fine = tick-0 only).
@@ -1137,7 +1139,7 @@ fn effect_dfy_fine_vol_slide_down() {
         player.render(&mut more);
     }
     assert_eq!(
-        player.channels[0].volume, 60,
+        player.channels[0].volume, 59,
         "DF4 should not slide on later ticks"
     );
 }
@@ -1373,8 +1375,12 @@ fn effect_dff_is_fine_slide_up_by_fifteen() {
     use oxideav_s3m::player::PlayerState;
     use oxideav_s3m::samples::extract_samples;
 
-    // Row 0: note + DFF (D=4, info=0xFF). Initial inst volume = 64.
-    // Expected: 64 + 15 clamped to 64.
+    // Row 0: note + DFF (D=4, info=0xFF). Initial inst volume = 64 in
+    // the file, which the instrument-load path clamps to the PCM peak
+    // of 63 per the multimedia.cx behavioural reference §Playback Notes
+    // ("Volumes actually peak at 63, and not 64"). DFF tries to add 15 —
+    // the clamp keeps the result at 63, so we assert the post-effect
+    // peak rather than a naive 64.
     let pat_body: Vec<u8> = vec![
         0xA0, 0x50, 1, 4, 0xFF, // row 0: trigger + DFF
         0x00,
@@ -1388,8 +1394,9 @@ fn effect_dff_is_fine_slide_up_by_fifteen() {
     let mut buf = vec![0i16; 2 * 64];
     player.render(&mut buf);
     assert_eq!(
-        player.channels[0].volume, 64,
-        "DFF must add 15 (clamped) at tick 0, not subtract"
+        player.channels[0].volume,
+        oxideav_s3m::player::PCM_VOLUME_PEAK,
+        "DFF must add 15 (clamped to the PCM peak of 63) at tick 0, not subtract"
     );
 }
 
@@ -1431,7 +1438,10 @@ fn effect_cxx_out_of_range_is_ignored() {
 /// Dxy with both nibbles in 1..=E is a Scream Tracker quirk: per the
 /// multimedia.cx behavioural reference, ST3 treats it as D0y (slide
 /// *down* by y), not as a combined up+down. Sample D54 starting from
-/// volume 64 with speed 6 (5 nonzero ticks) → 64 - (5 * 4) = 44.
+/// the PCM-peak volume (63 — the synth instrument's stored default is
+/// 64, which the multimedia.cx §Playback Notes "peak at 63" rule pins
+/// to 63 on the PCM path) with speed 6 (5 nonzero ticks) →
+/// 63 - (5 * 4) = 43.
 #[test]
 fn effect_dxy_both_nibbles_nonzero_slides_down_by_y() {
     use oxideav_s3m::header::parse_header;
@@ -1454,9 +1464,9 @@ fn effect_dxy_both_nibbles_nonzero_slides_down_by_y() {
     // a -y=4 slide; tick 0 is the trigger/no-op for non-fine cases.
     let mut buf = vec![0i16; 2 * 6 * 882];
     player.render(&mut buf);
-    // 64 - 4 * 5 = 44.
+    // 63 - 4 * 5 = 43.
     assert_eq!(
-        player.channels[0].volume, 44,
+        player.channels[0].volume, 43,
         "Dxy with both nibbles nonzero must slide DOWN by y per ST3"
     );
 }
@@ -2104,4 +2114,145 @@ fn effect_sax_full_nibble_swap_mapping() {
             "SA{x:X} must map to pan {expected_pan} (FireLight §6.23 XOR 0x8 swap)"
         );
     }
+}
+
+/// PCM volume peak rule (multimedia.cx §Playback Notes):
+/// "Volumes actually peak at 63, and not 64. Setting the volume to 64 will
+/// actually make it go to 63."
+///
+/// Each path that writes a fresh value into the channel's active volume
+/// must funnel through the [`clamp_pcm_volume`](
+/// oxideav_s3m::player::clamp_pcm_volume) helper. This test exercises the
+/// three independent entry points — instrument default load (via a note
+/// trigger), explicit volume column (via a row carrying `..|V40|..`), and
+/// the `DF0` (slide-up-by-15 on all ticks) effect — and asserts none of
+/// them ever leave the channel above the documented 63 ceiling.
+#[test]
+fn pcm_volume_peak_is_63_not_64() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::{PlayerState, PCM_VOLUME_PEAK};
+    use oxideav_s3m::samples::extract_samples;
+
+    assert_eq!(
+        PCM_VOLUME_PEAK, 63,
+        "the multimedia.cx-referenced PCM peak is 63"
+    );
+
+    // (a) Instrument default load — synth inst stores volume=64 in the
+    // file; the load path must clamp to 63 on the active channel.
+    {
+        let pat_body: Vec<u8> = vec![
+            0x20, 0x50, 1, // note + inst (no volume column, no effect)
+            0,
+        ];
+        let bytes = build_synth_with_pattern(pat_body);
+        let h = parse_header(&bytes).unwrap();
+        let samples = extract_samples(&h, &bytes);
+        let patterns = unpack_all(&h, &bytes);
+        let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+        // Drive tick 0 only — the instrument default volume is loaded
+        // there.
+        let mut buf = vec![0i16; 2 * 64];
+        player.render(&mut buf);
+        assert_eq!(
+            player.channels[0].volume, PCM_VOLUME_PEAK,
+            "instrument default of 64 must clamp to PCM_VOLUME_PEAK on trigger"
+        );
+    }
+
+    // (b) Explicit volume column V40 (decimal 64 in ST3 storage) on a row
+    // that does NOT also retrigger the instrument — must still clamp to 63.
+    {
+        // Row 0: trigger note with inst (no volume column on this row, so
+        // the inst default 64 lands → clamped to 63).
+        // Row 1: ch0 + explicit volume 64 (V40 in tracker UI = 64 in raw
+        // pattern byte), no command. flags = 0x40 (volume only).
+        let pat_body: Vec<u8> = vec![
+            0x20, 0x50, 1, 0, // row 0 terminator
+            0x40, 64, 0, // row 1: volume=64 + terminator
+        ];
+        let bytes = build_synth_with_pattern(pat_body);
+        let h = parse_header(&bytes).unwrap();
+        let samples = extract_samples(&h, &bytes);
+        let patterns = unpack_all(&h, &bytes);
+        let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+        // Drive two full rows (2 * speed * spt).
+        let mut buf = vec![0i16; 2 * 12 * 882];
+        player.render(&mut buf);
+        assert_eq!(
+            player.channels[0].volume, PCM_VOLUME_PEAK,
+            "explicit volume column 64 must clamp to PCM_VOLUME_PEAK"
+        );
+    }
+
+    // (c) DF0 (slide-up-by-15-on-all-ticks). Starting from the clamped
+    // default 63, any add-leg of the volume-slide ladder must stay
+    // pinned at 63 — never overshoot to 78 or wrap to 64. We exercise
+    // the per-tick `apply_dxy` add path by letting DF0 fire across a
+    // full row at speed 6 (tick 0 row entry + 5 per-tick steps).
+    {
+        let pat_body: Vec<u8> = vec![
+            0xA0, 0x50, 1, // row 0: note + inst (default vol → 63)
+            4, 0xF0, // command D, info 0xF0 → DF0 slide-up-15-all-ticks
+            0,
+        ];
+        let bytes = build_synth_with_pattern(pat_body);
+        let h = parse_header(&bytes).unwrap();
+        let samples = extract_samples(&h, &bytes);
+        let patterns = unpack_all(&h, &bytes);
+        let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+        let mut buf = vec![0i16; 2 * 6 * 882];
+        player.render(&mut buf);
+        assert_eq!(
+            player.channels[0].volume, PCM_VOLUME_PEAK,
+            "DF0 must keep the active volume pinned at the PCM peak (no overflow above 63)"
+        );
+    }
+}
+
+/// Mixer-side defensive read: an externally-constructed `Channel`
+/// literal with `volume = 64` (e.g. test scaffolding, FFI handoff) must
+/// not produce a louder mix than the documented PCM peak. The mixer
+/// caps the value on read so a stray 64 sounds the same as a 63.
+#[test]
+fn mixer_caps_externally_supplied_volume_64_to_pcm_peak() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::{PlayerState, PCM_VOLUME_PEAK};
+    use oxideav_s3m::samples::extract_samples;
+
+    // Build a one-row module just to construct a valid PlayerState; we
+    // then poke channels[0] directly to test the mixer cap in isolation.
+    let pat_body: Vec<u8> = vec![0x20, 0x50, 1, 0];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut p64 = PlayerState::new(&h, samples.clone(), patterns.clone(), OUTPUT_SAMPLE_RATE);
+    let mut p63 = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Drive both players to the same point: render one tick at the start
+    // so the channel is active with frequency / sample_pos / instrument
+    // set up by the row-0 trigger.
+    let mut warm = vec![0i16; 2 * 64];
+    p64.render(&mut warm);
+    p63.render(&mut warm);
+    // Force one volume to 64 (over-the-spec), the other to 63 (peak).
+    p64.channels[0].volume = 64;
+    p63.channels[0].volume = PCM_VOLUME_PEAK;
+
+    // Render the rest of the tick — both must produce bit-identical
+    // output because the mixer reads `volume.min(PCM_VOLUME_PEAK)`.
+    let mut buf64 = vec![0i16; 2 * 882];
+    let mut buf63 = vec![0i16; 2 * 882];
+    p64.render(&mut buf64);
+    p63.render(&mut buf63);
+    assert_eq!(
+        buf64, buf63,
+        "external volume=64 must mix identically to volume=63 (mixer caps on read)"
+    );
 }

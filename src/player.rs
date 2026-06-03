@@ -22,6 +22,36 @@ use crate::samples::SampleBody;
 pub const DEFAULT_SPEED: u8 = 6;
 pub const DEFAULT_BPM: u8 = 125;
 
+/// Peak active-volume value for ST3 PCM channels.
+///
+/// Per the multimedia.cx behavioural reference
+/// (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+/// §Playback Notes): "Volumes actually peak at 63, and not 64. Setting
+/// the volume to 64 will actually make it go to 63. However, on Adlib
+/// channels, if the default volume is 64, it will use 64. Any further
+/// operations on the volume will clip it to within the 0-63 range."
+///
+/// This crate decodes only the PCM path (Adlib FM synth is out of scope),
+/// so every active-volume write — instrument default load, volume-column,
+/// per-tick D/Dxy slide, retrigger modifier, tremor restore, tremolo
+/// delta — saturates to 63 rather than 64. The file-header *global*
+/// volume keeps the full 0..=64 range (it is not a per-channel active
+/// volume; multimedia.cx §Header: "Global volume (range 0 &lt;= x &lt;=
+/// 64)").
+pub const PCM_VOLUME_PEAK: u8 = 63;
+
+/// Cap a candidate active-volume value to [`PCM_VOLUME_PEAK`].
+///
+/// Accepts a `u16` so callers that compute `current + delta` can hand the
+/// pre-truncated sum directly; the helper takes care of the cast back to
+/// `u8`. Used at every PCM volume-write site to enforce the "peak at 63"
+/// rule from the multimedia.cx behavioural reference (see
+/// [`PCM_VOLUME_PEAK`]).
+#[inline]
+pub fn clamp_pcm_volume(v: u16) -> u8 {
+    v.min(PCM_VOLUME_PEAK as u16) as u8
+}
+
 /// Command letters from the ST3 spec.
 /// Stored as 1..=26 in the pattern data; translating A=1, B=2, ... Z=26.
 pub mod cmd {
@@ -69,29 +99,33 @@ pub const Q_TWO_THIRDS: [u8; 64] = [
 ];
 
 /// Apply the Qxy volume modifier `x` to a current active volume `vol`,
-/// returning the new clamped (0..=64) volume.
+/// returning the new clamped-to-[`PCM_VOLUME_PEAK`] volume.
 ///
 /// Table from `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
 /// §Qxy ("Values for x"). `x == 0` and `x == 8` are documented no-ops
 /// ("0" and "?" respectively). `x == 6` uses the [`Q_TWO_THIRDS`] table
 /// rather than an exact `vol*2/3`.
+///
+/// The add / multiply legs cap at [`PCM_VOLUME_PEAK`] (= 63) rather than
+/// 64 per the multimedia.cx §Playback Notes "volumes peak at 63" rule —
+/// see [`PCM_VOLUME_PEAK`].
 fn retrigger_volume(vol: u8, x: u8) -> u8 {
-    let v = vol.min(64);
+    let v = vol.min(PCM_VOLUME_PEAK);
     match x {
         0x1 => v.saturating_sub(1),
         0x2 => v.saturating_sub(2),
         0x3 => v.saturating_sub(4),
         0x4 => v.saturating_sub(8),
         0x5 => v.saturating_sub(16),
-        0x6 => Q_TWO_THIRDS[v.min(63) as usize],
+        0x6 => Q_TWO_THIRDS[v as usize],
         0x7 => v / 2,
-        0x9 => (v as u16 + 1).min(64) as u8,
-        0xA => (v as u16 + 2).min(64) as u8,
-        0xB => (v as u16 + 4).min(64) as u8,
-        0xC => (v as u16 + 8).min(64) as u8,
-        0xD => (v as u16 + 16).min(64) as u8,
-        0xE => ((v as u16) * 3 / 2).min(64) as u8,
-        0xF => (v as u16 * 2).min(64) as u8,
+        0x9 => clamp_pcm_volume(v as u16 + 1),
+        0xA => clamp_pcm_volume(v as u16 + 2),
+        0xB => clamp_pcm_volume(v as u16 + 4),
+        0xC => clamp_pcm_volume(v as u16 + 8),
+        0xD => clamp_pcm_volume(v as u16 + 16),
+        0xE => clamp_pcm_volume((v as u16) * 3 / 2),
+        0xF => clamp_pcm_volume(v as u16 * 2),
         // 0x0 (no slide) and 0x8 ("?") are no-ops.
         _ => v,
     }
@@ -167,7 +201,15 @@ pub struct Channel {
     pub frequency: f32,
     /// Fractional read cursor into the sample body.
     pub sample_pos: f64,
-    /// Current per-channel volume 0..=64.
+    /// Current per-channel active volume.
+    ///
+    /// Range is `0..=`[`PCM_VOLUME_PEAK`] (i.e. `0..=63`) per the
+    /// multimedia.cx behavioural reference: "Volumes actually peak at 63,
+    /// and not 64. Setting the volume to 64 will actually make it go to
+    /// 63." All effect-side writes funnel through
+    /// [`clamp_pcm_volume`], and the mixer reads it back through
+    /// `volume.min(PCM_VOLUME_PEAK)` so externally-constructed `Channel`
+    /// literals can't produce a gain above the documented ceiling either.
     pub volume: u8,
     /// Pan value 0..=15 (0 = hard left, 15 = hard right).
     pub pan: u8,
@@ -716,7 +758,11 @@ impl PlayerState {
                 if cell.instrument != 0 {
                     ch.instrument = cell.instrument;
                     if let Some(s) = self.samples.get(cell.instrument as usize - 1) {
-                        ch.volume = s.volume;
+                        // multimedia.cx §Playback Notes: "Volumes actually
+                        // peak at 63" — so a sample default of 64 lands as
+                        // 63 on the PCM path. (Adlib instruments are out
+                        // of scope and don't reach this branch.)
+                        ch.volume = clamp_pcm_volume(s.volume as u16);
                     }
                 }
 
@@ -770,7 +816,12 @@ impl PlayerState {
 
                 // Explicit volume column.
                 if cell.volume != 0xFF {
-                    ch.volume = cell.volume.min(64);
+                    // Volumes peak at 63 on the PCM path — see
+                    // [`PCM_VOLUME_PEAK`]. A row carrying `..|V40|..` lands
+                    // as 63, matching the documented multimedia.cx
+                    // behaviour ("Setting the volume to 64 will actually
+                    // make it go to 63").
+                    ch.volume = clamp_pcm_volume(cell.volume as u16);
                 }
             }
 
@@ -814,12 +865,13 @@ impl PlayerState {
                     if x == 0xF && y == 0xF {
                         // DFF: slide up by 15 on tick 0 — multimedia.cx
                         // contradicts an earlier reading of the v3.20
-                        // manual that treated it as DFy=down-by-F.
-                        ch.volume = (ch.volume as u16 + 15).min(64) as u8;
+                        // manual that treated it as DFy=down-by-F. Cap at
+                        // [`PCM_VOLUME_PEAK`] per §Playback Notes.
+                        ch.volume = clamp_pcm_volume(ch.volume as u16 + 15);
                     } else if x == 0xF && y == 0 {
                         // DF0: slide up by 15 on tick 0 (also fires on all
                         // subsequent ticks via apply_dxy).
-                        ch.volume = (ch.volume as u16 + 15).min(64) as u8;
+                        ch.volume = clamp_pcm_volume(ch.volume as u16 + 15);
                     } else if x == 0 && y == 0xF {
                         // D0F: slide down by 15 on tick 0.
                         ch.volume = ch.volume.saturating_sub(15);
@@ -828,7 +880,7 @@ impl PlayerState {
                         ch.volume = ch.volume.saturating_sub(y);
                     } else if y == 0xF && x != 0 {
                         // DxF: fine up by x.
-                        ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
+                        ch.volume = clamp_pcm_volume(ch.volume as u16 + x as u16);
                     } else if self.fast_slides {
                         // Header flag bit 6 (or CwtV == 0x1300): the
                         // continuous Dx0 / D0x / Dxy nibble forms ALSO
@@ -1088,7 +1140,8 @@ impl PlayerState {
                         ch.instrument = pd.instrument;
                         let idx = pd.instrument as usize;
                         if idx > 0 && idx <= samples_snapshot.len() {
-                            ch.volume = samples_snapshot[idx - 1].1;
+                            // PCM volumes peak at 63 — see [`PCM_VOLUME_PEAK`].
+                            ch.volume = clamp_pcm_volume(samples_snapshot[idx - 1].1 as u16);
                         }
                     }
                     if pd.note == 0xFE {
@@ -1116,7 +1169,8 @@ impl PlayerState {
                         }
                     }
                     if pd.volume != 0xFF {
-                        ch.volume = pd.volume.min(64);
+                        // PCM volumes peak at 63 — see [`PCM_VOLUME_PEAK`].
+                        ch.volume = clamp_pcm_volume(pd.volume as u16);
                     }
                     ch.pending_delay = None;
                 }
@@ -1181,7 +1235,9 @@ impl PlayerState {
                 // `enter_row`) lives in `apply_retrigger`.
                 cmd::Q_RETRIGGER => Self::apply_retrigger(ch),
                 cmd::R_TREMOLO => {
-                    // Rxy: like vibrato but applied to volume.
+                    // Rxy: like vibrato but applied to volume. Upper bound
+                    // is [`PCM_VOLUME_PEAK`] per the multimedia.cx
+                    // §Playback Notes "peak at 63" rule.
                     let speed = x;
                     let depth = y;
                     if speed != 0 || depth != 0 {
@@ -1189,7 +1245,7 @@ impl PlayerState {
                         let wf = ch.tremolo_waveform;
                         let s = waveform_sample(wf, ch.tremolo_pos, &mut ch.random_state);
                         let delta = (s * depth as i32) / 64;
-                        let v = (ch.volume as i32 + delta).clamp(0, 64);
+                        let v = (ch.volume as i32 + delta).clamp(0, PCM_VOLUME_PEAK as i32);
                         ch.volume = v as u8;
                     }
                 }
@@ -1235,7 +1291,11 @@ impl PlayerState {
                     let period = (on_ticks + off_ticks).max(1);
                     let pos = (tick as u16) % period;
                     if pos < on_ticks {
-                        ch.volume = ch.tremor_base_volume.min(64);
+                        // Tremor on-phase restores the row's starting
+                        // volume — re-cap to [`PCM_VOLUME_PEAK`] so a
+                        // 64 captured before this round's PCM-peak fix
+                        // can't slip through.
+                        ch.volume = ch.tremor_base_volume.min(PCM_VOLUME_PEAK);
                     } else {
                         ch.volume = 0;
                     }
@@ -1338,13 +1398,13 @@ impl PlayerState {
             // via row-entry — both legs add up to the spec'd amount).
             ch.volume = ch.volume.saturating_sub(15);
         } else if x == 0xF && y == 0 {
-            // DF0: slide up by 15 on all ticks.
-            ch.volume = (ch.volume as u16 + 15).min(64) as u8;
+            // DF0: slide up by 15 on all ticks. Cap at [`PCM_VOLUME_PEAK`].
+            ch.volume = clamp_pcm_volume(ch.volume as u16 + 15);
         } else if x == 0xF || y == 0xF {
             // DFy / DxF / DFF — fine, tick-0 only.
         } else if x != 0 && y == 0 {
             // Dx0: slide up.
-            ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
+            ch.volume = clamp_pcm_volume(ch.volume as u16 + x as u16);
         } else if y != 0 && x == 0 {
             // D0y: slide down.
             ch.volume = ch.volume.saturating_sub(y);
@@ -1367,8 +1427,8 @@ impl PlayerState {
     /// tick-0 table, so this helper deliberately skips them.
     fn apply_dxy_tick0_fast_slide(ch: &mut Channel, x: u8, y: u8) {
         if x != 0 && y == 0 && x != 0xF {
-            // Dx0 — slide up by x.
-            ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
+            // Dx0 — slide up by x. Cap at [`PCM_VOLUME_PEAK`].
+            ch.volume = clamp_pcm_volume(ch.volume as u16 + x as u16);
         } else if y != 0 && x == 0 && y != 0xF {
             // D0y — slide down by y.
             ch.volume = ch.volume.saturating_sub(y);
@@ -1531,7 +1591,15 @@ impl PlayerState {
             (m, m)
         };
 
-        let v = (ch.volume as f32) / 64.0;
+        // PCM volumes peak at 63 per [`PCM_VOLUME_PEAK`] — every effect-
+        // side writer funnels through [`clamp_pcm_volume`], and this
+        // defensive read-side `min` keeps externally-constructed `Channel`
+        // literals (test scaffolding, FFI handoff) from sneaking a 64
+        // through. The divisor stays 64 so the resulting gain ratio
+        // tracks ST3's `vol / 64` mixer math: max is 63/64 ≈ 0.984, a
+        // ~0.14 dB drop from the naive 64/64 = 1.0, matching the audible
+        // ceiling of an unmodified ST3 PCM channel.
+        let v = (ch.volume.min(PCM_VOLUME_PEAK) as f32) / 64.0;
 
         // Advance position.
         let step = (ch.frequency as f64) / (out_rate as f64);
@@ -1808,10 +1876,11 @@ pub mod tests {
         assert_eq!(retrigger_volume(32, 0xC), 40); // +8
         assert_eq!(retrigger_volume(32, 0xD), 48); // +16
         assert_eq!(retrigger_volume(32, 0xE), 48); // *3/2
-        assert_eq!(retrigger_volume(32, 0xF), 64); // *2
-                                                   // Clamping: subtract saturates at 0, add/multiply clamp to 64.
+        assert_eq!(retrigger_volume(32, 0xF), PCM_VOLUME_PEAK); // *2 clamped to 63
+                                                                // Clamping: subtract saturates at 0; add/multiply cap at the
+                                                                // PCM peak (63 per multimedia.cx §Playback Notes), NOT 64.
         assert_eq!(retrigger_volume(4, 0x5), 0);
-        assert_eq!(retrigger_volume(60, 0xF), 64);
+        assert_eq!(retrigger_volume(60, 0xF), PCM_VOLUME_PEAK);
     }
 
     #[test]

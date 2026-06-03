@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PCM active-volume peaks at 63 (not 64) per multimedia.cx
+  §Playback Notes** (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`):
+  "Volumes actually peak at 63, and not 64. Setting the volume to 64 will
+  actually make it go to 63. However, on Adlib channels, if the default
+  volume is 64, it will use 64. Any further operations on the volume
+  will clip it to within the 0-63 range." The crate decodes only the
+  PCM path (Adlib FM synth is out of scope), so every active-volume
+  write — instrument default load (a sample stored at 64 lands at 63),
+  explicit volume column (a row's `V40` lands at 63), per-tick `Dxy`
+  add legs (`DF0` / `Dx0` / fast-slides tick-0 leg / fine `DxF` and
+  `DFF`), `Qxy` retrigger volume modifier (`Q?F` doubles cap at 63),
+  `Rxy` tremolo delta (`clamp(0, 63)`), and `Ixy` tremor on-phase
+  restore — now funnels through a single
+  `clamp_pcm_volume(u16) -> u8` helper that caps the result to the
+  new public `PCM_VOLUME_PEAK = 63` constant. The mixer additionally
+  reads the field through `volume.min(PCM_VOLUME_PEAK)` so an
+  externally-constructed `Channel` literal (test scaffolding, FFI
+  handoff) can't slip a 64 past the spec ceiling either. The naive
+  `vol / 64` gain stays unchanged — the maximum 63/64 ≈ 0.984 matches
+  the audible ceiling of an unmodified ST3 PCM channel (~0.14 dB drop
+  from the previous 64/64 = 1.0). Decoder-side header parsing keeps
+  the file-byte representation intact (instrument default volume
+  field, header global-volume field) so round-trip tooling still
+  inspects the raw values; only the active mixer chain is capped.
+  Two new integration tests (`pcm_volume_peak_is_63_not_64` driving
+  the three independent entry points, and
+  `mixer_caps_externally_supplied_volume_64_to_pcm_peak` showing
+  bit-identical output for an external 64 vs the clamped 63) lock the
+  new behaviour in; existing `effect_dff_is_fine_slide_up_by_fifteen`,
+  `effect_dfy_fine_vol_slide_down`,
+  `effect_dxy_both_nibbles_nonzero_slides_down_by_y`, and
+  `retrigger_volume_modifiers_match_spec_table` were updated to expect
+  the spec-compliant 63 ceiling.
 - **Mixing-volume range + stereo `* 11/8` multiplier per the spec's
   §Mixing volume.** Per
   `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
