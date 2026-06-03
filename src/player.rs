@@ -395,6 +395,48 @@ fn snap_to_semitone(freq: f32, c5_speed: u32) -> f32 {
     c5 * 2.0f32.powf(n / 12.0)
 }
 
+/// Resolve an `Oxy` sample-offset byte (in samples) against a sample's
+/// loop metadata.
+///
+/// Per the Scream Tracker 3.20 effects listing
+/// (`docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt` §Oxy):
+///
+/// > If the sample offset is used in a looped sample and the offset given
+/// > exceeds the loop end value, the loop is taken into consideration
+/// > and the offset will be calculated as if the sample had looped.
+///
+/// In other words: for an unlooped sample the raw offset is returned
+/// (the mixer will mark the channel inactive on its own when the read
+/// cursor walks past `len`). For a looped sample whose `[loop_start,
+/// loop_end)` window is well-formed and where the requested offset has
+/// walked past `loop_end`, fold the overage back through the loop
+/// length so the channel starts inside the loop window.
+fn resolve_sample_offset(
+    offset_samples: u64,
+    loop_start: u32,
+    loop_end: u32,
+    pcm_len: usize,
+    looped: bool,
+) -> f64 {
+    let off = offset_samples as f64;
+    if !looped {
+        return off;
+    }
+    let ls = loop_start as f64;
+    let le = loop_end as f64;
+    // Defensive: a malformed loop window (end <= start, or end past pcm)
+    // can't be folded — fall back to the raw offset and let the mixer's
+    // bounds check handle it.
+    if le <= ls || le as usize > pcm_len {
+        return off;
+    }
+    if off < le {
+        return off;
+    }
+    let span = le - ls;
+    ls + (off - ls).rem_euclid(span)
+}
+
 /// Lower / upper period bound for the header's "Amiga limits" flag
 /// (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html` §Flags
 /// bit 4: "Amiga limits (limit periods to confine to 113 <= x <= 856)").
@@ -787,10 +829,26 @@ impl PlayerState {
                             ch.frequency = freq;
                             ch.target_frequency = freq;
                             Self::clamp_amiga(ch, self.amiga_limits);
-                            // Re-apply Oxx sample offset if present.
+                            // Re-apply Oxx sample offset if present. For
+                            // looped samples whose offset overshoots
+                            // `loop_end`, fold the overage back into the
+                            // loop window per
+                            // `docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt`
+                            // §Oxy ("If the sample offset is used in a
+                            // looped sample and the offset given exceeds
+                            // the loop end value, the loop is taken into
+                            // consideration and the offset will be
+                            // calculated as if the sample had looped").
                             if ch.command == cmd::O_SAMPLE_OFFSET {
                                 let off = (ch.info as u64) * 256;
-                                ch.sample_pos = off as f64;
+                                let body = &self.samples[inst_idx - 1];
+                                ch.sample_pos = resolve_sample_offset(
+                                    off,
+                                    body.loop_start,
+                                    body.loop_end,
+                                    body.pcm.len(),
+                                    body.is_looped(),
+                                );
                             } else {
                                 ch.sample_pos = 0.0;
                             }
@@ -2778,6 +2836,140 @@ pub mod tests {
         assert_eq!(
             p.global_volume, 0x30,
             "row 1's empty cell must NOT touch the global volume"
+        );
+    }
+
+    // ----- Oxy loop-aware sample-offset helper ------------------------
+
+    #[test]
+    fn oxy_offset_unlooped_is_raw_value() {
+        // Per `docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt`
+        // §Oxy the loop-wrap rule only kicks in for *looped* samples; an
+        // unlooped sample takes the requested byte offset verbatim and
+        // the mixer's own bounds check deactivates the channel when the
+        // cursor walks past `pcm_len`. Confirm offsets both inside and
+        // past `pcm_len` pass through untouched.
+        assert_eq!(resolve_sample_offset(1024, 0, 0, 8192, false), 1024.0);
+        // Past pcm_len: still returned raw — caller / mixer handles it.
+        assert_eq!(resolve_sample_offset(20_000, 0, 0, 8192, false), 20_000.0);
+    }
+
+    #[test]
+    fn oxy_offset_inside_loop_window_is_unchanged() {
+        // Looped sample, offset within `[loop_start, loop_end)` — no
+        // folding, the cursor lands exactly where requested. Same goes
+        // for an offset *before* the loop window (the spec only calls
+        // out the `> loop_end` overflow case).
+        // Loop: [256, 1024); offset 512 lands mid-loop.
+        assert_eq!(
+            resolve_sample_offset(512, 256, 1024, 4096, true),
+            512.0,
+            "offset inside the loop window must not be folded"
+        );
+        // Offset 100 < loop_start: pre-loop region, no fold either.
+        assert_eq!(
+            resolve_sample_offset(100, 256, 1024, 4096, true),
+            100.0,
+            "offset before the loop window must not be folded"
+        );
+    }
+
+    #[test]
+    fn oxy_offset_exceeding_loop_end_wraps_into_loop_window() {
+        // Spec quote: "If the sample offset is used in a looped sample
+        // and the offset given exceeds the loop end value, the loop is
+        // taken into consideration and the offset will be calculated as
+        // if the sample had looped." Concretely: loop window
+        // `[loop_start, loop_end)` of length `span`; for an offset of
+        // `loop_end + k`, the effective position is `loop_start + k
+        // mod span`.
+        // Loop [200, 1000), span = 800. Offset 1500 → overshoots by 500
+        // → 200 + (1500 - 200) % 800 = 200 + 500 = 700.
+        assert_eq!(
+            resolve_sample_offset(1500, 200, 1000, 4096, true),
+            700.0,
+            "1500 with loop [200,1000) must fold to 700"
+        );
+        // Offset exactly at loop_end: span lands us back at loop_start.
+        assert_eq!(
+            resolve_sample_offset(1000, 200, 1000, 4096, true),
+            200.0,
+            "an offset exactly at loop_end must fold to loop_start"
+        );
+        // Two full loops past the end:
+        // loop_start + (2*span + 50) % span = loop_start + 50.
+        assert_eq!(
+            resolve_sample_offset(200 + 2 * 800 + 50, 200, 1000, 4096, true),
+            250.0,
+            "multi-loop overshoot must fold to (loop_start + remainder)"
+        );
+    }
+
+    #[test]
+    fn oxy_offset_malformed_loop_falls_back_to_raw() {
+        // Defensive: a corrupt instrument header whose loop_end <=
+        // loop_start (or whose loop_end overshoots pcm_len) can't be
+        // folded mathematically. The helper returns the raw offset so
+        // the mixer's own bounds check decides what to do; never panic,
+        // never divide by a zero / negative span.
+        // Degenerate: loop_end == loop_start (zero span).
+        assert_eq!(
+            resolve_sample_offset(2000, 500, 500, 4096, true),
+            2000.0,
+            "zero-span loop must fall back to raw offset"
+        );
+        // loop_end past pcm_len.
+        assert_eq!(
+            resolve_sample_offset(2000, 100, 9000, 4096, true),
+            2000.0,
+            "loop_end past pcm_len must fall back to raw offset"
+        );
+    }
+
+    #[test]
+    fn oxy_trigger_inside_looped_sample_lands_in_loop_window() {
+        // End-to-end: an Oxy trigger of `O40` (offset = 0x40 * 256 =
+        // 16384 samples) on a looped sample whose loop window is
+        // `[1024, 8192)` (span = 7168) must land at `1024 + (16384 -
+        // 1024) mod 7168 = 1024 + 1024 = 2048`, not at 16384 (past the
+        // sample-data end). Wire up a one-row pattern with the trigger
+        // and confirm the player's channel sample_pos resolves to 2048.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let sample = SampleBody {
+            pcm: vec![0i16; 8192],
+            pcm_right: None,
+            loop_start: 1024,
+            loop_end: 8192,
+            looped: true,
+            volume: 64,
+            c5_speed: 8363,
+        };
+
+        let mut pat = Pattern::empty(1);
+        pat.rows[0][0] = Cell {
+            note: 0x50, // C-5 by S3M's nibble-octave encoding
+            instrument: 1,
+            volume: 0xFF,
+            command: cmd::O_SAMPLE_OFFSET,
+            info: 0x40, // 0x40 * 256 = 16384 samples — past loop_end.
+        };
+        let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
+        p.enter_row();
+        // Loop window is [1024, 8192) so 16384 folds to 2048.
+        assert!(
+            (p.channels[0].sample_pos - 2048.0).abs() < 1e-6,
+            "Oxy on a looped sample must wrap into the loop window; got {}",
+            p.channels[0].sample_pos
         );
     }
 }

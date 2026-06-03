@@ -135,6 +135,20 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   flag is plumbed into `PlayerState::stereo`; both the mixed and
   per-channel renderers apply the multiplier so a one-channel module
   produces bit-equivalent output across both APIs.
+- **`Oxy` sample-offset honours the loop window on looped samples**.
+  Per the Scream Tracker 3.20 effects listing (`Oxy`: "If the sample
+  offset is used in a looped sample and the offset given exceeds the
+  loop end value, the loop is taken into consideration and the offset
+  will be calculated as if the sample had looped"), a fresh trigger
+  whose Oxy byte resolves to a sample offset past `loop_end` now
+  folds back through the loop window via
+  `loop_start + (off − loop_start) mod (loop_end − loop_start)` so
+  the channel keeps playing inside the loop instead of being marked
+  inactive on the first mix step. Unlooped samples pass the raw
+  offset through unchanged (the mixer's own bounds check handles
+  cursors past `pcm_len`); a malformed loop window — zero / negative
+  span or `loop_end > pcm_len` — also passes the raw offset through
+  rather than divide by a degenerate span.
 - **PCM active-volume peaks at 63 (not 64)**. Per the multimedia.cx
   behavioural reference §Playback Notes ("Volumes actually peak at 63,
   and not 64. Setting the volume to 64 will actually make it go to 63.

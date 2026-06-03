@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Oxy` sample-offset honours the loop window on looped samples**
+  (`docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt` §Oxy:
+  "If the sample offset is used in a looped sample and the offset
+  given exceeds the loop end value, the loop is taken into
+  consideration and the offset will be calculated as if the sample
+  had looped"). Previously the player set `sample_pos = info * 256`
+  unconditionally — for a looped sample whose `[loop_start,
+  loop_end)` window started below the requested offset, this landed
+  the read cursor *past* the addressable sample data, leaving the
+  mixer to immediately mark the channel inactive instead of playing
+  the intended loop region. The fix introduces a single helper,
+  `resolve_sample_offset(off, loop_start, loop_end, pcm_len,
+  looped)`, that folds an over-`loop_end` offset back through the
+  loop span via `loop_start + (off − loop_start) mod (loop_end −
+  loop_start)`; an unlooped sample returns the raw offset
+  (the mixer's bounds check still deactivates a cursor past
+  `pcm_len`), and a malformed loop window (zero / negative span or
+  `loop_end > pcm_len`) also returns the raw offset rather than
+  panic on a degenerate modulo. Used by the Oxy branch in
+  `enter_row` so a fresh `O40` (`0x40 * 256 = 16384` samples) on a
+  sample with loop `[1024, 8192)` lands at `2048` instead of
+  silently dropping the channel. Five new tests
+  (`oxy_offset_unlooped_is_raw_value`,
+  `oxy_offset_inside_loop_window_is_unchanged`,
+  `oxy_offset_exceeding_loop_end_wraps_into_loop_window`,
+  `oxy_offset_malformed_loop_falls_back_to_raw`, and an end-to-end
+  `oxy_trigger_inside_looped_sample_lands_in_loop_window`) cover
+  the fold formula, the no-fold branches, the defensive fall-back,
+  and the through-player trigger.
 - **PCM active-volume peaks at 63 (not 64) per multimedia.cx
   §Playback Notes** (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`):
   "Volumes actually peak at 63, and not 64. Setting the volume to 64 will
