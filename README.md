@@ -149,6 +149,35 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   cursors past `pcm_len`); a malformed loop window — zero / negative
   span or `loop_end > pcm_len` — also passes the raw offset through
   rather than divide by a degenerate span.
+- **`Ixy` tremor: persistent decrementing counters + tick-0 firing +
+  separate "stored" volume**. Per the multimedia.cx behavioural reference
+  (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html` §Ixy),
+  the effect is "Implemented with two decrementing counters per channel
+  — the 'on' counter and the 'off' counter", is "updated on every tick"
+  (so tick 0 also steps the cycle), and the counters are "**never
+  reset**, except in the tremor update procedure described above.
+  Scream Tracker doesn't even reset them on playback start." The new
+  implementation tracks `tremor_on_counter` / `tremor_off_counter` on
+  `Channel`; they persist across rows that don't carry Ixy, so a cycle
+  in mid-on-phase at the end of row N resumes correctly at the next
+  Ixy row. The restore branch reads a new `stored_volume` field —
+  written by instrument-default loads, explicit volume-column entries,
+  and the SDx-deferred forms of both — so the "the stored volume
+  isn't modified by this effect" rule holds even when a Dxy slide
+  has dragged the *active* volume away from the row's starting
+  value. The "If the current volume was 0 at the end of the effect
+  and there is no tremor effect on the next row, the current volume
+  stays 0" edge case also holds: a row without Ixy does not touch
+  the counters or the active volume on its own. The previous
+  `tremor_phase: u8` (a per-row `tick % period` modulus) and
+  `tremor_base_volume: u8` (captured-on-first-Ixy-tick) fields are
+  removed; the modulus form fired the wrong volume at tick 0, lost
+  cycle state on a non-Ixy row, and could capture a Dxy-mutated value
+  as "stored". Eleven new unit tests under `src/player.rs` drive the
+  helper, the row-entry path, and the cross-row persistence directly;
+  the existing integration test `effect_ixy_tremor_alternates_volume`
+  continues to pass (its 3-on / 3-off cadence is unchanged for the
+  common first-row case).
 - **PCM active-volume peaks at 63 (not 64)**. Per the multimedia.cx
   behavioural reference §Playback Notes ("Volumes actually peak at 63,
   and not 64. Setting the volume to 64 will actually make it go to 63.

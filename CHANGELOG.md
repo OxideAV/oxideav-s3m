@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Ixy` tremor rebuilt to the multimedia.cx behavioural reference §Ixy
+  (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`).** Three
+  spec gaps in the previous implementation now resolved:
+  1. **Persistent decrementing counters across rows.** The wiki specifies
+     the effect "Implemented with two decrementing counters per channel —
+     the 'on' counter and the 'off' counter" and that they are "**never
+     reset**, except in the tremor update procedure described above.
+     Scream Tracker doesn't even reset them on playback start." The
+     previous code reset `tremor_phase = 0` every `enter_row` so a
+     channel in the middle of an off-phase at end-of-row would restart
+     the audible on-phase at the top of the next row even when the spec
+     would keep it silent for several more ticks. The new state lives in
+     two `u8` fields (`tremor_on_counter` / `tremor_off_counter`) on
+     `Channel`; row entry no longer touches them.
+  2. **Tick-0 firing.** The wiki says "This effect is updated on **every
+     tick**" — including tick 0. The previous code only fired Ixy in
+     `apply_per_tick` (ticks 1..speed-1), so a cold-counter cycle stayed
+     in the wrong state for the first tick of every row. The new
+     dispatch site mirrors the existing Qxy tick-0 wiring: a dedicated
+     arm in the `enter_row` tick-0 match calls the shared
+     `apply_tremor_step` helper.
+  3. **Restore reads "stored" volume, not active.** The wiki §Ixy says
+     "**the stored volume isn't modified by this effect**" and that the
+     off→on transition sets the current volume "to the stored volume" —
+     not the value the channel happens to hold mid-Dxy-slide. The
+     previous code captured `ch.volume` on the first Ixy tick of a row
+     and treated that as the restore target, which fired the wrong
+     value when an upstream Dxy slide had already pulled the active
+     volume to 0. The new code adds a `stored_volume: u8` field
+     populated by the four documented stored-volume sources (instrument
+     default load, explicit volume column, and the SDx-deferred forms of
+     both); Ixy's restore reads this field and clamps to `PCM_VOLUME_PEAK`.
+  Public-API impact: the `tremor_phase` and `tremor_base_volume` fields
+  on `Channel` are gone (replaced by `tremor_on_counter`,
+  `tremor_off_counter`, `stored_volume`). The crate is at 0.0.x so this
+  is a non-breaking-by-policy refactor; no other crate in the workspace
+  reads these fields. The existing integration test
+  `effect_ixy_tremor_alternates_volume` keeps its assertions (the
+  ticks-1/2 audible, ticks-3/4/5 silent pattern continues to hold for
+  the standard I22 case). Eleven new unit tests under
+  `src/player.rs` cover: cold-counter on/off-transition,
+  on-phase decrement, off-phase restore, restore-reads-stored (not
+  active), restore caps to PCM peak, cross-row persistence,
+  vol-stays-zero-without-Ixy edge case, x=y=0 callsite-guard
+  contract, stored-volume tracking on instrument load and on
+  explicit volume column, and the new tick-0 firing path.
+
 - **`Oxy` sample-offset honours the loop window on looped samples**
   (`docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt` §Oxy:
   "If the sample offset is used in a looped sample and the offset

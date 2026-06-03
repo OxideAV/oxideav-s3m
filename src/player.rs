@@ -248,12 +248,33 @@ pub struct Channel {
     /// across rows* — a new note with Qxy does NOT reset it; only a row
     /// without the Qxy effect (or song start) clears it back to 0.
     pub retrig_counter: u8,
-    /// Ixy tremor: counts ticks within the on/off cycle. Bit 7 = "in off
-    /// phase"; low 7 bits = ticks remaining in the current half-cycle.
-    pub tremor_phase: u8,
-    /// Volume captured when a row's Ixy command first fires, so we can
-    /// restore it after an off-phase. 0xFF = "no captured value yet".
-    pub tremor_base_volume: u8,
+    /// Ixy tremor "on" counter. Per the multimedia.cx behavioural
+    /// reference (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+    /// §Ixy): "Implemented with two decrementing counters per channel —
+    /// the 'on' counter and the 'off' counter. On each tick, if the 'on'
+    /// counter is greater than zero, it is decremented and if it reaches
+    /// zero, the current volume is set to 0 and the 'off' counter is set
+    /// to the 'off' time (y + 1). If the 'on' counter was zero in the
+    /// beginning of the update procedure, then the 'off' counter is
+    /// decremented and if it reached zero (or became less than zero),
+    /// the current volume is set to the stored volume and the 'on'
+    /// counter is set to the 'on' time (x + 1)." The counters are
+    /// "**never reset**, except in the tremor update procedure described
+    /// above. Scream Tracker doesn't even reset them on playback start.
+    /// Only on tracker startup are they reset." — so this field
+    /// persists across rows without an Ixy command.
+    pub tremor_on_counter: u8,
+    /// Ixy tremor "off" counter — see [`Channel::tremor_on_counter`].
+    pub tremor_off_counter: u8,
+    /// Channel's "stored" volume — the value most recently written by a
+    /// stored-volume source (instrument default load, explicit volume
+    /// column, or the SDx-deferred equivalents). Per the multimedia.cx
+    /// behavioural reference §Ixy / §Rxy, effects that modulate the
+    /// *active* volume — Dxy slides, Qxy retrigger modifier, Rxy
+    /// tremolo delta, Ixy tremor — must not touch this value. Ixy uses
+    /// it as the restore target on an on-phase transition, matching
+    /// "the current volume is set to the stored volume" from §Ixy.
+    pub stored_volume: u8,
     /// When `true`, a new note must not reset `vibrato_pos` / `tremolo_pos`.
     /// Set by `S3x`/`S4x` when bit 2 of the parameter is high (e.g. `S34`,
     /// `S3E` per the multimedia.cx clean-room behavioural reference).
@@ -317,8 +338,9 @@ impl Default for Channel {
             tremolo_waveform: Waveform::Sine,
             random_state: 0x1234_5678,
             retrig_counter: 0,
-            tremor_phase: 0,
-            tremor_base_volume: 0xFF,
+            tremor_on_counter: 0,
+            tremor_off_counter: 0,
+            stored_volume: 0,
             keep_vibrato_pos_on_new_note: false,
             keep_tremolo_pos_on_new_note: false,
             effect_memory: [0; 27],
@@ -769,10 +791,12 @@ impl PlayerState {
             }
             // Clear any leftover delayed trigger from a prior row.
             ch.pending_delay = None;
-            // Reset Ixy tremor each row (matches the spec: each Ixy event
-            // starts the on-cycle fresh from the channel's current vol).
-            ch.tremor_phase = 0;
-            ch.tremor_base_volume = 0xFF;
+            // Note: Ixy tremor on/off counters are **never reset per row**.
+            // Per the multimedia.cx behavioural reference §Ixy: "The 'on'
+            // and 'off' counters are never reset, except in the tremor
+            // update procedure described above. Scream Tracker doesn't
+            // even reset them on playback start." Channels carrying Ixy
+            // across rows keep the running cycle.
             // Qxy retrigger counter: per the multimedia.cx behavioural
             // reference (§Qxy), the counter is reset *only* when a row
             // without the Qxy effect is encountered (or at song start).
@@ -804,7 +828,14 @@ impl PlayerState {
                         // peak at 63" — so a sample default of 64 lands as
                         // 63 on the PCM path. (Adlib instruments are out
                         // of scope and don't reach this branch.)
-                        ch.volume = clamp_pcm_volume(s.volume as u16);
+                        // Instrument-default load is a stored-volume
+                        // write per the multimedia.cx §Ixy / §Rxy
+                        // "stored volume isn't modified by this effect"
+                        // distinction — Ixy's restore target is updated
+                        // here.
+                        let v = clamp_pcm_volume(s.volume as u16);
+                        ch.volume = v;
+                        ch.stored_volume = v;
                     }
                 }
 
@@ -879,7 +910,12 @@ impl PlayerState {
                     // as 63, matching the documented multimedia.cx
                     // behaviour ("Setting the volume to 64 will actually
                     // make it go to 63").
-                    ch.volume = clamp_pcm_volume(cell.volume as u16);
+                    // The volume column is a stored-volume write per the
+                    // multimedia.cx §Ixy / §Rxy stored-vs-active
+                    // distinction; Ixy's restore target is updated.
+                    let v = clamp_pcm_volume(cell.volume as u16);
+                    ch.volume = v;
+                    ch.stored_volume = v;
                 }
             }
 
@@ -975,6 +1011,16 @@ impl PlayerState {
                     // can fire immediately after the new note (per the
                     // multimedia.cx §Qxy "retrig on tick 0" note).
                     Self::apply_retrigger(ch);
+                }
+                cmd::I_TREMOR if (x | y) != 0 => {
+                    // Ixy: "This effect is updated on every tick" per
+                    // `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+                    // §Ixy — so tick 0 also advances the decrementing
+                    // counter pair. The persistent counters
+                    // (`tremor_on_counter` / `tremor_off_counter`) live
+                    // on `Channel` and are never reset on row entry;
+                    // see [`apply_tremor_step`] for the procedure.
+                    Self::apply_tremor_step(ch, x, y);
                 }
                 cmd::T_SET_TEMPO if ch.info >= 0x20 => {
                     row_tempo = Some(ch.info);
@@ -1199,7 +1245,12 @@ impl PlayerState {
                         let idx = pd.instrument as usize;
                         if idx > 0 && idx <= samples_snapshot.len() {
                             // PCM volumes peak at 63 — see [`PCM_VOLUME_PEAK`].
-                            ch.volume = clamp_pcm_volume(samples_snapshot[idx - 1].1 as u16);
+                            // SDx-deferred instrument load is still a
+                            // stored-volume write — Ixy's restore target
+                            // tracks it just like the immediate trigger.
+                            let v = clamp_pcm_volume(samples_snapshot[idx - 1].1 as u16);
+                            ch.volume = v;
+                            ch.stored_volume = v;
                         }
                     }
                     if pd.note == 0xFE {
@@ -1228,7 +1279,12 @@ impl PlayerState {
                     }
                     if pd.volume != 0xFF {
                         // PCM volumes peak at 63 — see [`PCM_VOLUME_PEAK`].
-                        ch.volume = clamp_pcm_volume(pd.volume as u16);
+                        // SDx-deferred volume-column write is a
+                        // stored-volume write, same as the immediate
+                        // form — Ixy's restore target tracks it.
+                        let v = clamp_pcm_volume(pd.volume as u16);
+                        ch.volume = v;
+                        ch.stored_volume = v;
                     }
                     ch.pending_delay = None;
                 }
@@ -1333,30 +1389,17 @@ impl PlayerState {
                     Self::apply_vibrato(ch, x, y, /* fine: */ false);
                     Self::clamp_amiga(ch, amiga_limits);
                 }
-                // Ixy: tremor — flip the note on/off in (x+1)-on /
-                // (y+1)-off cycles. Spec lets x=y=0 mean "always on" /
-                // ineffective so the guard mirrors that.
+                // Ixy: tremor. The per-tick step (decrementing-counter
+                // procedure with persistent counters across rows) lives
+                // in [`apply_tremor_step`] so it can be reused from the
+                // tick-0 path in `enter_row` as well — §Ixy says the
+                // effect "is updated on every tick" including tick 0.
+                // The else-branch here handles ticks 1..speed-1; the
+                // tick-0 step is fired from `enter_row` after the
+                // stored-volume sources (cell.instrument / cell.volume)
+                // have been applied.
                 cmd::I_TREMOR if (x | y) != 0 => {
-                    // Capture the row's starting volume the first time
-                    // tremor fires, so we can restore it during on-phases.
-                    if ch.tremor_base_volume == 0xFF {
-                        ch.tremor_base_volume = ch.volume;
-                    }
-                    // tremor_phase counter resets each row in enter_row;
-                    // every tick we step through the on→off→on cycle.
-                    let on_ticks = x as u16 + 1;
-                    let off_ticks = y as u16 + 1;
-                    let period = (on_ticks + off_ticks).max(1);
-                    let pos = (tick as u16) % period;
-                    if pos < on_ticks {
-                        // Tremor on-phase restores the row's starting
-                        // volume — re-cap to [`PCM_VOLUME_PEAK`] so a
-                        // 64 captured before this round's PCM-peak fix
-                        // can't slip through.
-                        ch.volume = ch.tremor_base_volume.min(PCM_VOLUME_PEAK);
-                    } else {
-                        ch.volume = 0;
-                    }
+                    Self::apply_tremor_step(ch, x, y);
                 }
                 // Uxy: fine vibrato — four times more accurate than Hxy.
                 cmd::U_FINE_VIBRATO => {
@@ -1521,6 +1564,53 @@ impl PlayerState {
             ch.sample_pos = 0.0;
             ch.volume = retrigger_volume(ch.volume, x);
             ch.retrig_counter = 0;
+        }
+    }
+
+    /// Ixy tremor step — applied on **every** tick (including tick 0)
+    /// per the multimedia.cx behavioural reference §Ixy.
+    ///
+    /// Implements the two-decrementing-counter procedure verbatim from
+    /// `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`:
+    ///
+    /// > Implemented with two decrementing counters per channel — the "on"
+    /// > counter and the "off" counter. On each tick, if the "on" counter
+    /// > is greater than zero, it is decremented and if it reaches zero,
+    /// > the current volume is set to 0 and the "off" counter is set to
+    /// > the "off" time (y + 1). If the "on" counter was zero in the
+    /// > beginning of the update procedure, then the "off" counter is
+    /// > decremented and if it reached zero (or became less than zero),
+    /// > the current volume is set to the stored volume and the "on"
+    /// > counter is set to the "on" time (x + 1).
+    ///
+    /// The counters live on [`Channel`] (`tremor_on_counter` /
+    /// `tremor_off_counter`) and are never reset on row entry — the
+    /// "playback start" / "no reset" rule from the same source — so a
+    /// channel that ends a row mid-cycle continues from the same phase
+    /// on the next row that carries Ixy.
+    ///
+    /// "The stored volume isn't modified by this effect" — restoration
+    /// reads [`Channel::stored_volume`] (capped to [`PCM_VOLUME_PEAK`]).
+    fn apply_tremor_step(ch: &mut Channel, x: u8, y: u8) {
+        // Snapshot "on counter was zero in the beginning of the update
+        // procedure" before any mutation, per the spec's wording.
+        let was_on_zero = ch.tremor_on_counter == 0;
+        if !was_on_zero {
+            ch.tremor_on_counter -= 1;
+            if ch.tremor_on_counter == 0 {
+                ch.volume = 0;
+                ch.tremor_off_counter = y.saturating_add(1);
+            }
+        } else {
+            // off-counter decrement is saturating so the "reached zero
+            // or became less than zero" branch fires when the counter was
+            // already 0 (initial / cold-start state).
+            let next_off = ch.tremor_off_counter.saturating_sub(1);
+            ch.tremor_off_counter = next_off;
+            if next_off == 0 {
+                ch.volume = ch.stored_volume.min(PCM_VOLUME_PEAK);
+                ch.tremor_on_counter = x.saturating_add(1);
+            }
         }
     }
 
@@ -2924,6 +3014,356 @@ pub mod tests {
             2000.0,
             "loop_end past pcm_len must fall back to raw offset"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Ixy tremor — persistent decrementing-counter coverage. The
+    // multimedia.cx behavioural reference §Ixy specifies a two-counter
+    // procedure with cross-row persistence ("counters are never reset")
+    // that fires on **every** tick, including tick 0. The unit tests
+    // below drive [`PlayerState::apply_tremor_step`] / `enter_row` /
+    // `apply_per_tick` directly so each branch of the spec is locked
+    // in without standing up a full byte fixture.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tremor_step_initial_state_restores_volume_and_arms_on_counter() {
+        // Spec § Ixy "If the 'on' counter was zero in the beginning of
+        // the update procedure, then the 'off' counter is decremented
+        // and if it reached zero (or became less than zero), the current
+        // volume is set to the stored volume and the 'on' counter is
+        // set to the 'on' time (x + 1)."
+        // Cold start: both counters 0 → the off-decrement underflows,
+        // volume restores from `stored_volume`, on_counter = x+1.
+        let mut ch = Channel {
+            stored_volume: 50,
+            volume: 0,
+            tremor_on_counter: 0,
+            tremor_off_counter: 0,
+            ..Channel::default()
+        };
+        PlayerState::apply_tremor_step(&mut ch, /*x*/ 2, /*y*/ 2);
+        assert_eq!(ch.volume, 50, "cold-start tick restores stored volume");
+        assert_eq!(ch.tremor_on_counter, 3, "on_counter armed to x+1 = 3");
+        assert_eq!(ch.tremor_off_counter, 0);
+    }
+
+    #[test]
+    fn tremor_step_on_phase_decrements_until_off_transition() {
+        // Walk a 3-on / 3-off cycle from an armed state and verify the
+        // spec's "decrement on_counter; when it reaches zero, set
+        // volume=0 and load off_counter=y+1" branch fires exactly once,
+        // at the on→off transition.
+        let mut ch = Channel {
+            stored_volume: 50,
+            volume: 50,
+            tremor_on_counter: 3, // armed at x+1
+            tremor_off_counter: 0,
+            ..Channel::default()
+        };
+        // First two on-steps: decrement but stay audible.
+        PlayerState::apply_tremor_step(&mut ch, 2, 2);
+        assert_eq!(ch.tremor_on_counter, 2);
+        assert_eq!(ch.volume, 50);
+        PlayerState::apply_tremor_step(&mut ch, 2, 2);
+        assert_eq!(ch.tremor_on_counter, 1);
+        assert_eq!(ch.volume, 50);
+        // Third on-step: counter hits 0 → silence + off_counter = y+1.
+        PlayerState::apply_tremor_step(&mut ch, 2, 2);
+        assert_eq!(ch.tremor_on_counter, 0);
+        assert_eq!(ch.volume, 0);
+        assert_eq!(ch.tremor_off_counter, 3, "off_counter armed to y+1 = 3");
+    }
+
+    #[test]
+    fn tremor_step_off_phase_returns_to_stored_volume() {
+        // After the on→off transition the next ticks drain the
+        // off_counter without touching volume; once it underflows the
+        // restore branch fires and on_counter re-arms.
+        let mut ch = Channel {
+            stored_volume: 50,
+            volume: 0,
+            tremor_on_counter: 0,
+            tremor_off_counter: 3,
+            ..Channel::default()
+        };
+        PlayerState::apply_tremor_step(&mut ch, 2, 2);
+        assert_eq!(ch.tremor_off_counter, 2);
+        assert_eq!(ch.volume, 0);
+        PlayerState::apply_tremor_step(&mut ch, 2, 2);
+        assert_eq!(ch.tremor_off_counter, 1);
+        assert_eq!(ch.volume, 0);
+        PlayerState::apply_tremor_step(&mut ch, 2, 2);
+        // Off_counter saturating-subs from 1 → 0; "reached zero" branch
+        // fires: vol restores from stored, on_counter rearms.
+        assert_eq!(ch.tremor_off_counter, 0);
+        assert_eq!(ch.volume, 50, "restore reads stored_volume");
+        assert_eq!(ch.tremor_on_counter, 3);
+    }
+
+    #[test]
+    fn tremor_step_restore_reads_stored_volume_not_active() {
+        // Spec § Ixy "The stored volume isn't modified by this effect"
+        // — so a Dxy slide that pulled the *active* volume to 0 before
+        // Ixy's restore must NOT be the value Ixy restores to. We model
+        // this by pre-loading `stored_volume = 50` and `volume = 0`;
+        // an off→on transition must lift volume to 50, not stay at 0.
+        let mut ch = Channel {
+            stored_volume: 50,
+            volume: 0,
+            tremor_on_counter: 0,
+            tremor_off_counter: 1, // one tick away from underflow.
+            ..Channel::default()
+        };
+        PlayerState::apply_tremor_step(&mut ch, 2, 2);
+        assert_eq!(
+            ch.volume, 50,
+            "stored_volume drives the restore, not active volume"
+        );
+    }
+
+    #[test]
+    fn tremor_step_caps_restore_to_pcm_volume_peak() {
+        // Defensive: an externally constructed `Channel` literal could
+        // sneak a `stored_volume > PCM_VOLUME_PEAK` past the helper. The
+        // restore branch must still cap the active volume to the spec
+        // ceiling (63), matching the documented "volumes peak at 63".
+        let mut ch = Channel {
+            stored_volume: 200,
+            volume: 0,
+            tremor_on_counter: 0,
+            tremor_off_counter: 0,
+            ..Channel::default()
+        };
+        PlayerState::apply_tremor_step(&mut ch, 2, 2);
+        assert_eq!(ch.volume, PCM_VOLUME_PEAK);
+    }
+
+    #[test]
+    fn tremor_counters_persist_across_rows_without_ixy() {
+        // Spec § Ixy "The 'on' and 'off' counters are never reset,
+        // except in the tremor update procedure described above." So a
+        // row carrying Ixy followed by a row without Ixy must leave the
+        // counters intact — the next Ixy row resumes the same cycle.
+        // Drive `enter_row` directly to confirm.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(2);
+        // Row 1 has no Ixy — bare empty cell.
+        pat.rows[1][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: 0,
+            info: 0,
+        };
+        let mut p = PlayerState::new(&h, vec![], vec![pat], 44_100);
+        // Manually arm tremor state mid-cycle, simulating a previous
+        // row's Ixy step having mutated the counters.
+        p.channels[0].stored_volume = 40;
+        p.channels[0].tremor_on_counter = 2;
+        p.channels[0].tremor_off_counter = 0;
+        p.channels[0].volume = 40;
+        // Advance to row 1 (no Ixy command). `enter_row` MUST NOT
+        // touch the tremor counters.
+        p.row = 1;
+        p.enter_row();
+        assert_eq!(
+            p.channels[0].tremor_on_counter, 2,
+            "row without Ixy must not reset on_counter"
+        );
+        assert_eq!(
+            p.channels[0].tremor_off_counter, 0,
+            "row without Ixy must not reset off_counter"
+        );
+    }
+
+    #[test]
+    fn tremor_volume_stays_zero_when_no_ixy_on_next_row() {
+        // Spec § Ixy "If the current volume was 0 at the end of the
+        // effect and there is no tremor effect on the next row, the
+        // current volume stays 0. It isn't reset back to the stored
+        // volume or its previous value from before the tremor effect."
+        // Set up a row 1 with no Ixy, no note, no volume column; confirm
+        // a row-0-induced 0 volume is preserved.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(2);
+        pat.rows[1][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: 0,
+            info: 0,
+        };
+        let mut p = PlayerState::new(&h, vec![], vec![pat], 44_100);
+        p.channels[0].volume = 0;
+        p.channels[0].stored_volume = 40;
+        p.row = 1;
+        p.enter_row();
+        assert_eq!(
+            p.channels[0].volume, 0,
+            "row without Ixy must not restore from stored_volume"
+        );
+        assert_eq!(p.channels[0].stored_volume, 40, "stored_volume untouched");
+    }
+
+    #[test]
+    fn tremor_step_with_zero_params_is_guarded_at_callsite() {
+        // The §Ixy guard `(x | y) != 0` lives at the dispatch site
+        // (enter_row / apply_per_tick). The helper itself, when called
+        // with x = 0 and y = 0 from a cold-counter state, fires the
+        // off-underflow branch — that's correct given the guard upstream
+        // and documents the helper's contract: it is the *caller's*
+        // job to gate "no-op tremor". (Confirmed by the dispatch site
+        // matching `cmd::I_TREMOR if (x | y) != 0`.)
+        let mut ch = Channel {
+            stored_volume: 50,
+            volume: 0,
+            tremor_on_counter: 0,
+            tremor_off_counter: 0,
+            ..Channel::default()
+        };
+        // Calling with x=y=0 underflows the off-counter branch — vol
+        // restores and on_counter arms to 1.
+        PlayerState::apply_tremor_step(&mut ch, 0, 0);
+        assert_eq!(ch.volume, 50);
+        assert_eq!(ch.tremor_on_counter, 1);
+    }
+
+    #[test]
+    fn stored_volume_tracks_instrument_default_load() {
+        // Loading a fresh instrument on a row is a stored-volume write
+        // per the §Ixy / §Rxy stored-vs-active distinction. Drive
+        // `enter_row` with `cell.instrument = 1` and confirm both
+        // `volume` and `stored_volume` land at the instrument default
+        // (clamped to PCM_VOLUME_PEAK).
+        let mut h = synth_header();
+        h.flags = 0;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let sample = SampleBody {
+            pcm: vec![0i16; 16],
+            pcm_right: None,
+            loop_start: 0,
+            loop_end: 16,
+            looped: true,
+            // Instrument default volume = 64 — clamps to PCM_VOLUME_PEAK
+            // (63) on the PCM path per §Playback Notes.
+            volume: 64,
+            c5_speed: 8363,
+        };
+
+        let mut pat = Pattern::empty(1);
+        pat.rows[0][0] = Cell {
+            note: 0x50,
+            instrument: 1,
+            volume: 0xFF,
+            command: 0,
+            info: 0,
+        };
+        let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
+        p.enter_row();
+        assert_eq!(p.channels[0].volume, PCM_VOLUME_PEAK);
+        assert_eq!(p.channels[0].stored_volume, PCM_VOLUME_PEAK);
+    }
+
+    #[test]
+    fn stored_volume_tracks_explicit_volume_column() {
+        // An explicit volume-column write (cell.volume != 0xFF) is also
+        // a stored-volume source. Drive `enter_row` with `cell.volume =
+        // 0x20` and confirm both fields move together.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(1);
+        pat.rows[0][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0x20,
+            command: 0,
+            info: 0,
+        };
+        let mut p = PlayerState::new(&h, vec![], vec![pat], 44_100);
+        p.enter_row();
+        assert_eq!(p.channels[0].volume, 0x20);
+        assert_eq!(p.channels[0].stored_volume, 0x20);
+    }
+
+    #[test]
+    fn ixy_fires_on_tick_zero_too() {
+        // Spec § Ixy "This effect is updated on every tick" — including
+        // tick 0. Set up a row that fires Ixy at tick 0 from a cold
+        // counter state: the off-underflow branch must lift `volume`
+        // from 0 → `stored_volume` before any per-tick work happens.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let sample = SampleBody {
+            pcm: vec![0i16; 16],
+            pcm_right: None,
+            loop_start: 0,
+            loop_end: 16,
+            looped: true,
+            volume: 40,
+            c5_speed: 8363,
+        };
+
+        let mut pat = Pattern::empty(1);
+        pat.rows[0][0] = Cell {
+            note: 0x50,
+            instrument: 1,
+            volume: 0xFF,
+            command: cmd::I_TREMOR,
+            info: 0x22, // x=2, y=2 → on=3, off=3.
+        };
+        let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
+        // Pre-arm the tremor counters to the cold state so the tick-0
+        // step exercises the off-underflow branch (was-zero side).
+        p.channels[0].tremor_on_counter = 0;
+        p.channels[0].tremor_off_counter = 0;
+        p.enter_row();
+        // After tick 0 of an Ixy row from the cold state: vol restored
+        // to stored_volume (40), on_counter armed to x+1 = 3.
+        assert_eq!(p.channels[0].volume, 40);
+        assert_eq!(p.channels[0].stored_volume, 40);
+        assert_eq!(p.channels[0].tremor_on_counter, 3);
     }
 
     #[test]
