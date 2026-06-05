@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`S00` repeating an `SDx` now double-triggers** per the multimedia.cx
+  behavioural reference (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`)
+  §S0x: "When `S00` is repeating a note delay (`SDx`), the note is triggered
+  twice: once on tick 0 (as if there's no note delay) and again on tick x
+  (as with a normal note delay)." The previous code applied effect-memory
+  recall first and then treated the resolved `SDx` byte identically to a
+  freshly-written `SDx`, so the immediate tick-0 leg was lost. The
+  row-application path now captures the row's *raw* infobyte and detects
+  the "S-command recalled into SDx" case before the note-delay branch.
+  When the case fires, the trigger is performed at tick 0 *and* the
+  deferred copy is also armed in `pending_delay` so the SDx tick-x path
+  re-triggers the note. A freshly-written `SDx` (nonzero raw infobyte)
+  keeps the single-trigger contract and its dedicated unit test confirms
+  no regression.
+
 - **`Ixy` tremor rebuilt to the multimedia.cx behavioural reference §Ixy
   (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`).** Three
   spec gaps in the previous implementation now resolved:

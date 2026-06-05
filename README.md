@@ -71,6 +71,16 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
   when a row carries the same command with parameter 0. `H` / `U` and
   the entire `Sxy` family share their slots per the multimedia.cx
   behavioural reference.
+- **`S00` repeating `SDx` double-trigger**: per the multimedia.cx
+  behavioural reference Â§S0x ("When `S00` is repeating a note delay
+  (`SDx`), the note is triggered twice: once on tick 0 (as if there's
+  no note delay) and again on tick x (as with a normal note delay)"),
+  a row carrying `S00` whose effect-memory recall resolves to `SDx`
+  (`x > 0`) now triggers the note immediately AND arms the deferred
+  copy in `pending_delay` so the same note re-triggers at tick `x`.
+  Detected by capturing the row's *raw* infobyte before the memory
+  substitution; freshly-written `SDx` (nonzero raw infobyte) keeps the
+  single-trigger semantics unchanged.
 - **Per-channel default pan resolution**: the pan byte's bit 5 selects
   between an explicit low-nibble value and the spec defaults. When a
   channel's bit 5 is clear (or no `d.p == 0xFC` pan block is present)

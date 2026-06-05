@@ -766,6 +766,13 @@ impl PlayerState {
             }
             ch.command = cell.command;
             ch.info = cell.info;
+            // Capture the *raw* row infobyte before effect-memory recall.
+            // Needed below to disambiguate a true S00 (raw 0, resolved by
+            // memory) from a freshly-written Sxy of the same resolved value
+            // — the multimedia.cx §S0x rule "When S00 is repeating a note
+            // delay (SDx), the note is triggered twice: once on tick 0 ...
+            // and again on tick x" only applies to the recalled form.
+            let raw_info = cell.info;
             // SCx freeze resume: per multimedia.cx §SCx, any of Exx, Fxx,
             // Gxx, Hxx, Jxx, Kxx, Lxx, Uxx thaws a frozen channel. This
             // happens on the *row* the command appears, irrespective of
@@ -812,7 +819,18 @@ impl PlayerState {
             let is_note_delay =
                 ch.command == cmd::S_EXTENDED && (ch.info >> 4) == 0xD && (ch.info & 0x0F) != 0;
 
-            if is_note_delay {
+            // S00 → SDx double-trigger per
+            // `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+            // §S0x: "When S00 is repeating a note delay (SDx), the note is
+            // triggered twice: once on tick 0 (as if there's no note delay)
+            // and again on tick x (as with a normal note delay)." This
+            // applies only when the row's *raw* infobyte was 0 and effect-
+            // memory recall produced an SDx with x > 0 — a freshly-written
+            // SDx still defers cleanly (single trigger at tick x).
+            let is_s00_repeat_sdx =
+                is_note_delay && raw_info == 0 && cell.command == cmd::S_EXTENDED;
+
+            if is_note_delay && !is_s00_repeat_sdx {
                 ch.pending_delay = Some(PendingTrigger {
                     fire_tick: ch.info & 0x0F,
                     note: cell.note,
@@ -820,6 +838,18 @@ impl PlayerState {
                     volume: cell.volume,
                 });
             } else {
+                // Either: (a) no note delay at all (normal row), or
+                // (b) S00 recalled an SDx — in case (b) we fall through to
+                // the immediate-trigger block AND also stash the deferred
+                // trigger so the note fires on tick x as well.
+                if is_s00_repeat_sdx {
+                    ch.pending_delay = Some(PendingTrigger {
+                        fire_tick: ch.info & 0x0F,
+                        note: cell.note,
+                        instrument: cell.instrument,
+                        volume: cell.volume,
+                    });
+                }
                 // Instrument change reloads volume.
                 if cell.instrument != 0 {
                     ch.instrument = cell.instrument;
@@ -3410,6 +3440,167 @@ pub mod tests {
             (p.channels[0].sample_pos - 2048.0).abs() < 1e-6,
             "Oxy on a looped sample must wrap into the loop window; got {}",
             p.channels[0].sample_pos
+        );
+    }
+
+    /// Build a minimal one-channel, two-row pattern carrying the given
+    /// effect commands so the §S0x double-trigger test can drive
+    /// `enter_row` directly without spinning up a full module.
+    fn s00_double_trigger_pattern(row0: Cell, row1: Cell) -> (S3mHeader, SampleBody, Pattern) {
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let sample = SampleBody {
+            pcm: vec![0i16; 4096],
+            pcm_right: None,
+            loop_start: 0,
+            loop_end: 0,
+            looped: false,
+            volume: 32,
+            c5_speed: 8363,
+        };
+
+        let mut pat = Pattern::empty(2);
+        pat.rows[0][0] = row0;
+        pat.rows[1][0] = row1;
+        (h, sample, pat)
+    }
+
+    #[test]
+    fn s00_repeating_sdx_double_triggers_at_tick_0_and_tick_x() {
+        // Per the multimedia.cx behavioural reference
+        // (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`)
+        // §S0x: "When S00 is repeating a note delay (SDx), the note is
+        // triggered twice: once on tick 0 (as if there's no note delay)
+        // and again on tick x (as with a normal note delay)."
+        //
+        // Row 0: SD3 with a fresh note. ST3 stashes the trigger; no
+        // tick-0 trigger fires. After this row the S effect-memory slot
+        // holds 0xD3.
+        //
+        // Row 1: S00 with a fresh note. The infobyte resolves via the S
+        // memory slot to 0xD3, so the row turns into "SD3 by recall". The
+        // double-trigger rule applies: the new note must trigger at tick 0
+        // AND the deferred copy must fire at tick 3.
+        let row0 = Cell {
+            note: 0x50,
+            instrument: 1,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xD3,
+        };
+        let row1 = Cell {
+            note: 0x53, // distinct from row 0 so we can tell triggers apart
+            instrument: 1,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0x00, // raw infobyte 0 — must recall 0xD3 from memory
+        };
+        let (h, sample, pat) = s00_double_trigger_pattern(row0, row1);
+        let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
+
+        // Row 0 (SD3): stash only — channel must NOT be triggered at tick 0.
+        p.enter_row();
+        assert!(
+            !p.channels[0].active,
+            "row-0 SD3 must defer; channel must not be active at tick 0"
+        );
+        assert_eq!(
+            p.channels[0].pending_delay.map(|pd| pd.fire_tick),
+            Some(3),
+            "row-0 SD3 must stash fire_tick=3"
+        );
+        assert_eq!(p.channels[0].effect_memory[cmd::S_EXTENDED as usize], 0xD3);
+
+        // Drive ticks 1..speed so the SD3 fires at tick 3, ending row 0
+        // with the row-0 note as the last triggered note.
+        for t in 1..p.speed {
+            p.tick = t;
+            p.apply_per_tick();
+        }
+        assert_eq!(
+            p.channels[0].last_note, 0x50,
+            "SD3 must fire at tick 3 — row-0 note must be the last trigger"
+        );
+
+        // Advance to row 1 — S00 by raw bytes, but effect memory recalls
+        // 0xD3. The double-trigger rule says: trigger NOW (tick 0) and
+        // also stash the deferred copy for tick 3.
+        p.row = 1;
+        p.enter_row();
+        assert!(
+            p.channels[0].active,
+            "S00→SDx tick-0 leg must trigger immediately (channel active)"
+        );
+        assert_eq!(
+            p.channels[0].last_note, 0x53,
+            "S00→SDx must trigger row-1's note at tick 0"
+        );
+        // The deferred copy must also be armed for tick 3.
+        assert_eq!(
+            p.channels[0].pending_delay.map(|pd| pd.fire_tick),
+            Some(3),
+            "S00→SDx must ALSO stash a deferred trigger for tick x"
+        );
+        assert_eq!(
+            p.channels[0].pending_delay.map(|pd| pd.note),
+            Some(0x53),
+            "deferred trigger must carry the same row's note"
+        );
+
+        // Walk to tick 3 — the stashed trigger fires again, resetting
+        // sample_pos to 0 and re-driving the note. To observe the second
+        // trigger distinctly, advance the cursor away from zero first.
+        p.channels[0].sample_pos = 1234.0;
+        for t in 1..=3u8 {
+            p.tick = t;
+            p.apply_per_tick();
+        }
+        assert!(
+            p.channels[0].pending_delay.is_none(),
+            "deferred trigger must be cleared after firing"
+        );
+        assert_eq!(
+            p.channels[0].sample_pos, 0.0,
+            "tick-3 SDx fire must retrigger the sample (sample_pos reset)"
+        );
+    }
+
+    #[test]
+    fn freshly_written_sdx_keeps_single_trigger() {
+        // Negative control for the S00 double-trigger rule: a row that
+        // carries an SDx with a *nonzero raw infobyte* (i.e. a regular
+        // SDx, not an S00 memory recall) must still defer the trigger
+        // *only* — no double-fire. Confirms `is_s00_repeat_sdx` is not
+        // matching the generic SDx path.
+        let row0 = Cell {
+            note: 0x50,
+            instrument: 1,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xD3, // raw SD3, not recalled
+        };
+        let row1 = Cell::EMPTY;
+        let (h, sample, pat) = s00_double_trigger_pattern(row0, row1);
+        let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
+
+        p.enter_row();
+        assert!(
+            !p.channels[0].active,
+            "raw SD3 must NOT trigger at tick 0 (the single-trigger contract)"
+        );
+        assert_eq!(
+            p.channels[0].pending_delay.map(|pd| pd.fire_tick),
+            Some(3),
+            "raw SD3 must stash the deferred trigger for tick 3"
         );
     }
 }
