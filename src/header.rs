@@ -43,6 +43,103 @@ pub const PATTERN_ROWS: usize = 64;
 pub const CHANNEL_COUNT: usize = 32;
 pub const INSTRUMENT_HEADER_SIZE: usize = 80;
 
+/// Tracker IDs encoded in the high nibble of the `Cwt/v` field.
+///
+/// Per the multimedia.cx behavioural reference
+/// (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html` §"Tracker
+/// version") and the FireLight / ST3 archive-team format references
+/// (`docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt`:
+/// `Cwt/v   = Created with tracker / version: &0xfff=version, >>12=tracker`),
+/// the 16-bit `Cwt/v` word splits into a 4-bit tracker ID (top nibble) and
+/// a 12-bit version number (low 12 bits). Known tracker IDs:
+///
+/// * `0x1xyy` — Scream Tracker x.yy (the original ST3 family;
+///   ST3.00 = 0x1300, ST3.01 = 0x1301, ST3.03 = 0x1303, ST3.20 = 0x1320,
+///   ST3.21 = 0x1321).
+/// * `0x2xyy` — Imago Orpheus x.yy.
+/// * `0x3xyy` — Impulse Tracker x.yy.
+/// * `0x4xyy` — Schism Tracker (its own version numbering scheme).
+/// * `0x5xyy` — OpenMPT.
+///
+/// Anything outside these documented prefixes lands in
+/// [`Tracker::Other`] with the raw nibble preserved for diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Tracker {
+    /// `0x1xyy` — Scream Tracker family (the canonical writer).
+    ScreamTracker,
+    /// `0x2xyy` — Imago Orpheus.
+    ImagoOrpheus,
+    /// `0x3xyy` — Impulse Tracker.
+    ImpulseTracker,
+    /// `0x4xyy` — Schism Tracker (versioning scheme differs from the
+    /// Scream Tracker family — only the tracker ID nibble is documented).
+    SchismTracker,
+    /// `0x5xyy` — OpenMPT.
+    OpenMpt,
+    /// Any tracker whose top nibble is not documented above. Carries
+    /// the raw nibble (`0`, `6..=15`) so callers can still inspect it.
+    Other(u8),
+}
+
+impl Tracker {
+    /// Decode the tracker ID from the raw `Cwt/v` word's top nibble.
+    ///
+    /// Equivalent to `cwt_v >> 12`, mapped onto the documented IDs.
+    pub fn from_cwt_v(cwt_v: u16) -> Tracker {
+        match (cwt_v >> 12) as u8 {
+            0x1 => Tracker::ScreamTracker,
+            0x2 => Tracker::ImagoOrpheus,
+            0x3 => Tracker::ImpulseTracker,
+            0x4 => Tracker::SchismTracker,
+            0x5 => Tracker::OpenMpt,
+            other => Tracker::Other(other),
+        }
+    }
+}
+
+/// Decomposed `Cwt/v` field: a 4-bit tracker ID plus a 12-bit version
+/// number, paired with the original raw word.
+///
+/// `Cwt/v` is the file header's "Created with tracker / version" word.
+/// The split semantics (`>>12` = tracker, `&0xfff` = version) are
+/// quoted verbatim from `ScreamTracker-v3.20-s3m.txt` and corroborated
+/// by `multimedia-cx-scream-tracker-3.html` §"Tracker version".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreatedWithTracker {
+    /// Raw 16-bit `Cwt/v` word as stored in the file.
+    pub raw: u16,
+    /// Typed tracker ID (top nibble).
+    pub tracker: Tracker,
+    /// Low 12 bits — the tracker's own version number. For the Scream
+    /// Tracker family this is BCD-shaped (`0x300` = 3.00, `0x320` =
+    /// 3.20); for Schism Tracker the spec notes the numbering scheme
+    /// differs, so the field is exposed as-is and the caller decides
+    /// how to interpret it.
+    pub version: u16,
+}
+
+impl CreatedWithTracker {
+    /// Decompose a raw `Cwt/v` word.
+    pub fn from_raw(raw: u16) -> Self {
+        Self {
+            raw,
+            tracker: Tracker::from_cwt_v(raw),
+            version: raw & 0x0FFF,
+        }
+    }
+
+    /// True iff this file was written by the original Scream Tracker 3.00
+    /// release (`Cwt/v == 0x1300`).
+    ///
+    /// Per `multimedia-cx-scream-tracker-3.html` §Flags (bit 6): "ST3.00
+    /// volume slides ... **automatically enabled if tracker version is
+    /// == 0x1300**". The fast-slides arming inside the player consults
+    /// exactly this predicate.
+    pub fn is_st3_00(&self) -> bool {
+        self.raw == 0x1300
+    }
+}
+
 /// Sample type codes in the instrument header.
 pub const INST_TYPE_EMPTY: u8 = 0;
 pub const INST_TYPE_PCM: u8 = 1;
@@ -152,6 +249,15 @@ pub struct S3mHeader {
     pub pattern_offsets: Vec<u32>,
     /// Number of enabled (non-0xFF) channels used by the module.
     pub enabled_channels: u8,
+}
+
+impl S3mHeader {
+    /// Decomposed view of the `Cwt/v` ("Created with tracker / version")
+    /// field. See [`CreatedWithTracker`] for the bit layout and the
+    /// documented tracker IDs.
+    pub fn created_with_tracker(&self) -> CreatedWithTracker {
+        CreatedWithTracker::from_raw(self.tracker_version)
+    }
 }
 
 fn read_u16_le(b: &[u8], off: usize) -> u16 {
@@ -485,6 +591,81 @@ mod tests {
         // enabled_channels counts unmuted PCM channels only (used as the
         // mixer normalisation divisor) — must report 2, not 4.
         assert_eq!(h.enabled_channels, 2);
+    }
+
+    #[test]
+    fn tracker_from_cwt_v_documented_prefixes() {
+        // Per the multimedia.cx behavioural reference §"Tracker version"
+        // (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`)
+        // and `docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt`
+        // (`Cwt/v ... >>12=tracker`). The four documented Scream Tracker
+        // versions all share the `0x1xyy` prefix.
+        assert_eq!(Tracker::from_cwt_v(0x1300), Tracker::ScreamTracker);
+        assert_eq!(Tracker::from_cwt_v(0x1301), Tracker::ScreamTracker);
+        assert_eq!(Tracker::from_cwt_v(0x1303), Tracker::ScreamTracker);
+        assert_eq!(Tracker::from_cwt_v(0x1320), Tracker::ScreamTracker);
+        assert_eq!(Tracker::from_cwt_v(0x1321), Tracker::ScreamTracker);
+        // Other documented writers.
+        assert_eq!(Tracker::from_cwt_v(0x2000), Tracker::ImagoOrpheus);
+        assert_eq!(Tracker::from_cwt_v(0x3215), Tracker::ImpulseTracker);
+        assert_eq!(Tracker::from_cwt_v(0x4050), Tracker::SchismTracker);
+        assert_eq!(Tracker::from_cwt_v(0x5104), Tracker::OpenMpt);
+    }
+
+    #[test]
+    fn tracker_from_cwt_v_undocumented_nibbles_preserve_id() {
+        // Any prefix outside the documented set is exposed via
+        // `Tracker::Other(nibble)` so a forensic inspector can still
+        // see the raw value rather than misclassify as a known writer.
+        assert_eq!(Tracker::from_cwt_v(0x0123), Tracker::Other(0));
+        assert_eq!(Tracker::from_cwt_v(0x6abc), Tracker::Other(6));
+        assert_eq!(Tracker::from_cwt_v(0xF000), Tracker::Other(0xF));
+    }
+
+    #[test]
+    fn created_with_tracker_splits_top_nibble_and_low_12_bits() {
+        // ST3.20: 0x1320 = (tracker=1, version=0x320).
+        let st320 = CreatedWithTracker::from_raw(0x1320);
+        assert_eq!(st320.raw, 0x1320);
+        assert_eq!(st320.tracker, Tracker::ScreamTracker);
+        assert_eq!(st320.version, 0x320);
+        assert!(
+            !st320.is_st3_00(),
+            "0x1320 must NOT trigger the 0x1300 fast-slides auto-arm"
+        );
+
+        // ST3.00 sentinel: the multimedia.cx wiki specifically calls out
+        // `Cwt/v == 0x1300` as the value that auto-arms fast slides
+        // regardless of header flag bit 6.
+        let st300 = CreatedWithTracker::from_raw(0x1300);
+        assert_eq!(st300.tracker, Tracker::ScreamTracker);
+        assert_eq!(st300.version, 0x300);
+        assert!(st300.is_st3_00());
+
+        // OpenMPT-shaped writer: high nibble routes to Tracker::OpenMpt,
+        // the low 12 bits remain available verbatim.
+        let mpt = CreatedWithTracker::from_raw(0x51AB);
+        assert_eq!(mpt.tracker, Tracker::OpenMpt);
+        assert_eq!(mpt.version, 0x1AB);
+        assert!(!mpt.is_st3_00());
+    }
+
+    #[test]
+    fn header_created_with_tracker_round_trips_raw_word() {
+        // The accessor on `S3mHeader` must decompose whatever raw word the
+        // parser stored — so it stays in lock-step with `tracker_version`.
+        let mut settings = [0xFFu8; CHANNEL_COUNT];
+        settings[0] = 0x00;
+        let mut bytes = build_min_header(settings);
+        // Patch the on-disk Cwt/v to ST3.01.
+        bytes[0x28..0x2A].copy_from_slice(&0x1301u16.to_le_bytes());
+        let h = parse_header(&bytes).unwrap();
+        assert_eq!(h.tracker_version, 0x1301);
+        let cwt = h.created_with_tracker();
+        assert_eq!(cwt.raw, 0x1301);
+        assert_eq!(cwt.tracker, Tracker::ScreamTracker);
+        assert_eq!(cwt.version, 0x301);
+        assert!(!cwt.is_st3_00(), "0x1301 is past the ST3.00 sentinel");
     }
 
     #[test]

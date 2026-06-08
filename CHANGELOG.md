@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Tracker` enum + `CreatedWithTracker` typed decomposition of the `Cwt/v`
+  field** on `S3mHeader` (`docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt`
+  `Cwt/v   = Created with tracker / version: &0xfff=version, >>12=tracker` +
+  `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html` §"Tracker
+  version"). The 16-bit "Created with tracker / version" header word splits
+  into a 4-bit tracker ID (top nibble) plus a 12-bit version number. The new
+  `S3mHeader::created_with_tracker()` accessor returns a `CreatedWithTracker
+  { raw, tracker, version }` triple, where `tracker` is a `Tracker` enum with
+  arms for every documented writer (`ScreamTracker` = 0x1, `ImagoOrpheus` =
+  0x2, `ImpulseTracker` = 0x3, `SchismTracker` = 0x4, `OpenMpt` = 0x5) plus
+  an `Other(u8)` arm that preserves any undocumented top nibble so forensic
+  callers can still inspect a raw value rather than misclassify as a known
+  writer. The accessor also exposes `is_st3_00()`, which returns true iff
+  the raw word is exactly `0x1300` — the sentinel multimedia.cx §Flags bit 6
+  calls out as auto-arming "ST3.00 volume slides ... regardless of the flag
+  byte". The player's fast-slides arming now consults
+  `header.created_with_tracker().is_st3_00()` instead of inlining the
+  `header.tracker_version == 0x1300` literal, so the behavioural rule has
+  one place to evolve from. Four new unit tests under `src/header.rs`
+  cover the documented-prefix mapping, the `Other(nibble)` preservation,
+  the raw / tracker / version split for ST3.00 / ST3.20 / OpenMPT-shaped
+  words, and a round-trip from a parsed `S3mHeader` whose on-disk Cwt/v
+  is patched to ST3.01 — all without changing the existing `tracker_version:
+  u16` field, so no downstream caller breaks.
+
 ### Changed
 
 - **`S00` repeating an `SDx` now double-triggers** per the multimedia.cx

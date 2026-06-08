@@ -612,7 +612,8 @@ impl PlayerState {
         // original ST3.00 release (CwtV == 0x1300) always ran the fast-slides
         // path regardless of the flag byte; later versions only do so when
         // bit 6 is explicitly set.
-        let fast_slides = (header.flags & (1 << 6)) != 0 || header.tracker_version == 0x1300;
+        let fast_slides =
+            (header.flags & (1 << 6)) != 0 || header.created_with_tracker().is_st3_00();
         let amiga_limits = (header.flags & (1 << 4)) != 0;
 
         PlayerState {
