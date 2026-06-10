@@ -223,7 +223,11 @@ pub struct Channel {
     pub info: u8,
     /// Vibrato phase in table units (0..=63).
     pub vibrato_pos: u8,
-    /// Tremolo phase in table units (0..=63).
+    /// Tremolo phase as the full 0..=255 cycle position. Per the
+    /// multimedia.cx §Playback Notes ("Vibrato and tremolo have a full
+    /// cycle length of 256, though Hxy and Rxy use x*4 and y*4 as their
+    /// parameters"), `Rxy` steps this by `speed * 4` per nonzero tick and
+    /// samples the 64-entry waveform table at `phase / 4`.
     pub tremolo_pos: u8,
     /// Last note byte triggered on this channel — needed for arpeggio
     /// and retrigger to recompute the base frequency.
@@ -1384,21 +1388,7 @@ impl PlayerState {
                 // The full per-tick counter logic (incl. tick 0, run from
                 // `enter_row`) lives in `apply_retrigger`.
                 cmd::Q_RETRIGGER => Self::apply_retrigger(ch),
-                cmd::R_TREMOLO => {
-                    // Rxy: like vibrato but applied to volume. Upper bound
-                    // is [`PCM_VOLUME_PEAK`] per the multimedia.cx
-                    // §Playback Notes "peak at 63" rule.
-                    let speed = x;
-                    let depth = y;
-                    if speed != 0 || depth != 0 {
-                        ch.tremolo_pos = (ch.tremolo_pos.wrapping_add(speed * 4)) & 0x3F;
-                        let wf = ch.tremolo_waveform;
-                        let s = waveform_sample(wf, ch.tremolo_pos, &mut ch.random_state);
-                        let delta = (s * depth as i32) / 64;
-                        let v = (ch.volume as i32 + delta).clamp(0, PCM_VOLUME_PEAK as i32);
-                        ch.volume = v as u8;
-                    }
-                }
+                cmd::R_TREMOLO => Self::apply_tremolo(ch, x, y),
                 cmd::D_VOL_SLIDE => Self::apply_dxy(ch, x, y),
                 // Exx: portamento down. Each tick: freq *= 2^(-param/768).
                 // Fine / extra-fine slides (0xEy / 0xFy) are tick-0 only
@@ -1483,6 +1473,56 @@ impl PlayerState {
         let delta = (s * depth as i32) / div;
         let mult = 2.0f32.powf(delta as f32 / 48.0);
         ch.frequency = ch.target_frequency * mult;
+    }
+
+    /// Rxy tremolo per-tick kernel, per the multimedia.cx behavioural
+    /// reference (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+    /// §Rxy):
+    ///
+    /// > On tick 1 (the second tick of the row) set the active volume to
+    /// > the stored volume plus (depth * value) / (max_amplitude * 2)
+    /// > (Rxy peaks at 32 in each direction), and for each nonzero tick
+    /// > increase the tremolo position by the speed. The stored volume is
+    /// > untouched. ... Tremolo will not work if the stored volume is 0.
+    ///
+    /// Key consequences encoded here:
+    ///
+    /// - The active volume is **recomputed from the stored volume** every
+    ///   tick (`stored + delta`), never accumulated onto the previous
+    ///   active value — so the modulation cannot drift.
+    /// - §Playback Notes gives the phase convention: "Vibrato and tremolo
+    ///   have a full cycle length of 256, though Hxy and Rxy use x*4 and
+    ///   y*4 as their parameters." `tremolo_pos` therefore holds the full
+    ///   0..=255 phase, stepped by `speed * 4` per nonzero tick (period =
+    ///   256 / (4·x) ticks); the 64-entry waveform table is sampled at
+    ///   `phase / 4`.
+    /// - The depth parameter is likewise `y * 4`; with our waveform
+    ///   amplitude of ±64 the §Rxy formula reduces to
+    ///   `delta = (4·y · value) / 128`, peaking at ±30 for `y = 0xF`
+    ///   (the documented "peaks at 32" is the formula's theoretical bound).
+    /// - A zero **stored** volume disables the effect entirely.
+    /// - The "song speed 1 leaves the active volume untouched" rule is
+    ///   structural: this kernel only runs from the per-tick path
+    ///   (ticks >= 1), and a speed-1 row never reaches tick 1.
+    ///
+    /// The result is capped to [`PCM_VOLUME_PEAK`] per the §Playback
+    /// Notes "volumes actually peak at 63" rule.
+    fn apply_tremolo(ch: &mut Channel, speed: u8, depth: u8) {
+        if speed == 0 && depth == 0 {
+            return;
+        }
+        // §Rxy: "Tremolo will not work if the stored volume is 0."
+        if ch.stored_volume == 0 {
+            return;
+        }
+        ch.tremolo_pos = ch.tremolo_pos.wrapping_add(speed * 4);
+        let wf = ch.tremolo_waveform;
+        let s = waveform_sample(wf, ch.tremolo_pos >> 2, &mut ch.random_state);
+        // delta = (depth * value) / (max_amplitude * 2) with depth = y*4
+        // and max_amplitude = 64 (our waveform_sample range).
+        let delta = (depth as i32 * 4 * s) / 128;
+        let v = (ch.stored_volume as i32 + delta).clamp(0, PCM_VOLUME_PEAK as i32);
+        ch.volume = v as u8;
     }
 
     /// Gxx / Lxy tone-portamento kernel. `step` is the info byte (units
@@ -3311,6 +3351,153 @@ pub mod tests {
         PlayerState::apply_tremor_step(&mut ch, 0, 0);
         assert_eq!(ch.volume, 50);
         assert_eq!(ch.tremor_on_counter, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Rxy tremolo — multimedia.cx behavioural reference §Rxy. The tests
+    // below drive [`PlayerState::apply_tremolo`] / `enter_row` /
+    // `apply_per_tick` directly so each documented rule is locked in.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tremolo_recomputes_from_stored_volume_not_accumulating() {
+        // §Rxy: "set the active volume to the stored volume plus
+        // (depth * value) / (max_amplitude * 2) ... The stored volume is
+        // untouched." The active volume is stored + delta, recomputed
+        // every tick — NOT the previous active value + delta, which would
+        // accumulate drift. With a square waveform (deterministic ±64),
+        // R44 gives |delta| = (4·4 · 64) / 128 = 8, so the active volume
+        // must stay pinned to {stored+8, stored-8} for the whole run.
+        let mut ch = Channel {
+            stored_volume: 40,
+            volume: 40,
+            tremolo_waveform: Waveform::Square,
+            ..Channel::default()
+        };
+        for tick in 1..=32 {
+            PlayerState::apply_tremolo(&mut ch, 4, 4);
+            // Phase steps by 4·4 = 16 per tick over the 256 cycle; the
+            // square wave is high for phase < 128 → ticks 1..=7 read +64,
+            // ticks 8..=15 read -64, then the cycle repeats.
+            let expected = if (tick * 16) % 256 < 128 { 48 } else { 32 };
+            assert_eq!(
+                ch.volume, expected,
+                "tick {tick}: active volume must be stored ± 8, never drift"
+            );
+            assert_eq!(ch.stored_volume, 40, "stored volume is untouched");
+        }
+    }
+
+    #[test]
+    fn tremolo_depth_scaling_and_peak_clamp() {
+        // §Rxy depth is y*4 — for y = 0xF the square-wave delta is
+        // (15·4 · 64) / 128 = 30 (the documented "peaks at 32 in each
+        // direction" is the formula's theoretical bound).
+        let mut ch = Channel {
+            stored_volume: 32,
+            volume: 32,
+            tremolo_waveform: Waveform::Square,
+            ..Channel::default()
+        };
+        PlayerState::apply_tremolo(&mut ch, 4, 0xF);
+        assert_eq!(ch.volume, 62, "32 + 30 on the high half-cycle");
+        // Walk the phase into the low half-cycle (phase >= 128).
+        ch.tremolo_pos = 128;
+        PlayerState::apply_tremolo(&mut ch, 4, 0xF);
+        assert_eq!(ch.volume, 2, "32 - 30 on the low half-cycle");
+        // §Playback Notes: volumes peak at 63 — a stored volume high
+        // enough that stored + 30 overflows must clamp.
+        ch.tremolo_pos = 0;
+        ch.stored_volume = 50;
+        PlayerState::apply_tremolo(&mut ch, 4, 0xF);
+        assert_eq!(ch.volume, PCM_VOLUME_PEAK, "50 + 30 caps at 63");
+        // And the negative side floors at 0.
+        ch.tremolo_pos = 128;
+        ch.stored_volume = 10;
+        PlayerState::apply_tremolo(&mut ch, 4, 0xF);
+        assert_eq!(ch.volume, 0, "10 - 30 floors at 0");
+    }
+
+    #[test]
+    fn tremolo_noop_when_stored_volume_is_zero() {
+        // §Rxy: "Tremolo will not work if the stored volume is 0."
+        // Neither the active volume nor the phase may move.
+        let mut ch = Channel {
+            stored_volume: 0,
+            volume: 7,
+            tremolo_pos: 12,
+            tremolo_waveform: Waveform::Square,
+            ..Channel::default()
+        };
+        PlayerState::apply_tremolo(&mut ch, 4, 4);
+        assert_eq!(ch.volume, 7, "zero stored volume disables tremolo");
+        assert_eq!(ch.tremolo_pos, 12, "phase must not advance either");
+    }
+
+    #[test]
+    fn tremolo_phase_steps_speed_times_4_over_256_cycle() {
+        // §Playback Notes: "Vibrato and tremolo have a full cycle length
+        // of 256, though Hxy and Rxy use x*4 and y*4 as their
+        // parameters." Speed 8 → 32 phase units per tick → a full cycle
+        // every 8 ticks (256 / (4·8)).
+        let mut ch = Channel {
+            stored_volume: 40,
+            volume: 40,
+            tremolo_waveform: Waveform::Square,
+            ..Channel::default()
+        };
+        for _ in 0..3 {
+            PlayerState::apply_tremolo(&mut ch, 8, 1);
+        }
+        assert_eq!(ch.tremolo_pos, 96, "3 ticks at speed 8 → phase 96");
+        for _ in 0..5 {
+            PlayerState::apply_tremolo(&mut ch, 8, 1);
+        }
+        assert_eq!(ch.tremolo_pos, 0, "8 ticks wrap the full 256 cycle");
+    }
+
+    #[test]
+    fn tremolo_applies_from_tick_1_not_tick_0() {
+        // §Rxy: "On tick 1 (the second tick of the row) set the active
+        // volume ..." — the row-entry (tick 0) pass must leave the active
+        // volume alone; the first per-tick pass applies the delta. This
+        // also locks the §Rxy speed-1 rule ("the active volume is also
+        // untouched. It is not set to the stored volume!") structurally:
+        // a speed-1 row never reaches tick 1, so `enter_row` alone is the
+        // whole row.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(1);
+        pat.rows[0][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::R_TREMOLO,
+            info: 0x44,
+        };
+        let mut p = PlayerState::new(&h, Vec::new(), vec![pat], 44_100);
+        p.channels[0].stored_volume = 40;
+        p.channels[0].volume = 40;
+        p.channels[0].tremolo_waveform = Waveform::Square;
+        p.enter_row();
+        assert_eq!(
+            p.channels[0].volume, 40,
+            "tick 0 must not apply the tremolo delta (speed-1 rows therefore never do)"
+        );
+        p.tick = 1;
+        p.apply_per_tick();
+        assert_eq!(
+            p.channels[0].volume, 48,
+            "tick 1 applies stored + (4·4 · 64)/128 = 40 + 8"
+        );
     }
 
     #[test]

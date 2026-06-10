@@ -63,6 +63,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Rxy` tremolo rebuilt to the multimedia.cx behavioural reference §Rxy
+  (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`).** Four
+  spec gaps in the previous per-tick handler now resolved:
+  1. **Active volume recomputed from the stored volume, never
+     accumulated.** The wiki says "set the active volume to the stored
+     volume plus (depth * value) / (max_amplitude * 2) ... The stored
+     volume is untouched." The previous code added the delta onto the
+     *previous active* volume (`ch.volume += delta`), so consecutive
+     same-sign waveform samples compounded and the modulation drifted
+     away from the note's volume instead of oscillating around it. The
+     new `apply_tremolo` kernel computes `stored_volume + delta` fresh
+     on every nonzero tick.
+  2. **Documented depth scaling.** §Playback Notes gives "Hxy and Rxy
+     use x*4 and y*4 as their parameters"; with the crate's ±64 waveform
+     amplitude the §Rxy formula reduces to `delta = (4·y · value) / 128`,
+     peaking at ±30 for `y = 0xF` (the wiki's "Rxy peaks at 32 in each
+     direction" is the formula's theoretical bound). The previous
+     `(value · y) / 64` produced half the documented swing (±15 max).
+  3. **256-unit cycle length.** §Playback Notes: "Vibrato and tremolo
+     have a full cycle length of 256". The previous code masked the
+     phase to a 64-entry table while still stepping by `speed * 4`,
+     making the LFO cycle four times faster than documented
+     (period 16/x ticks instead of 256/(4·x) = 64/x). `tremolo_pos` now
+     holds the full 0..=255 phase (natural `u8` wrap) and the 64-entry
+     waveform table is sampled at `phase / 4`.
+  4. **Zero stored volume disables the effect.** §Rxy: "Tremolo will not
+     work if the stored volume is 0." New early-out; neither the active
+     volume nor the phase moves.
+  The §Rxy "song speed 1 leaves the active volume untouched — it is not
+  set to the stored volume!" rule is locked structurally (the kernel only
+  runs from the per-tick path, which a speed-1 row never reaches) and by
+  the `tremolo_applies_from_tick_1_not_tick_0` test. Five new unit tests
+  under `src/player.rs` drive the kernel, the clamp ends (63 ceiling /
+  0 floor), the phase cadence, and the tick-0/tick-1 dispatch split.
+  Follow-up: the `Hxy`/`Uxy` vibrato kernel still uses the legacy
+  64-masked phase convention and should get the same 256-cycle treatment.
+
 - **`S00` repeating an `SDx` now double-triggers** per the multimedia.cx
   behavioural reference (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`)
   §S0x: "When `S00` is repeating a note delay (`SDx`), the note is triggered

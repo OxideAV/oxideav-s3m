@@ -202,6 +202,22 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   the existing integration test `effect_ixy_tremor_alternates_volume`
   continues to pass (its 3-on / 3-off cadence is unchanged for the
   common first-row case).
+- **`Rxy` tremolo: stored-volume-based delta, documented depth/cycle
+  scaling, zero-stored-volume gate**. Per the multimedia.cx behavioural
+  reference (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+  §Rxy), each nonzero tick sets the *active* volume to
+  `stored_volume + (depth × value) / (max_amplitude × 2)` — recomputed
+  fresh, never accumulated onto the previous active value — with the
+  §Playback Notes parameter convention (`x*4` speed step over the full
+  256-unit cycle, `y*4` depth, peaking at ±30 for `y = 0xF`). The
+  stored volume is untouched, a zero stored volume disables the effect
+  entirely ("Tremolo will not work if the stored volume is 0"), the
+  result is capped to the PCM peak of 63, and the "song speed 1 leaves
+  the active volume untouched — it is not set to the stored volume!"
+  rule holds structurally (the kernel runs only on ticks ≥ 1, which a
+  speed-1 row never reaches). The previous handler accumulated the
+  delta onto the active volume (drift), used half the documented depth
+  swing, and ran the LFO cycle four times too fast.
 - **PCM active-volume peaks at 63 (not 64)**. Per the multimedia.cx
   behavioural reference §Playback Notes ("Volumes actually peak at 63,
   and not 64. Setting the volume to 64 will actually make it go to 63.
