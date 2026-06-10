@@ -138,6 +138,35 @@ impl CreatedWithTracker {
     pub fn is_st3_00(&self) -> bool {
         self.raw == 0x1300
     }
+
+    /// True when this writer's version implicitly arms the ST3.00
+    /// "fast slides" volume-slide mode, independent of header flag bit 6.
+    ///
+    /// The multimedia.cx reference states this rule **twice with slightly
+    /// different bounds**, and the player must reconcile them:
+    ///
+    /// * §Flags (bit 6): "automatically enabled if tracker version is
+    ///   **== 0x1300**".
+    /// * §Dxy: "if fast slides are enabled (if they are set as a flag or
+    ///   the version is **<= 0x1300**)".
+    ///
+    /// (`multimedia-cx-scream-tracker-3.html`.) The §Dxy form is the
+    /// broader of the two and is the one the volume-slide kernel actually
+    /// keys off, so it is the authoritative arming bound: every Scream
+    /// Tracker build at or before the 3.00 release (`0x1000..=0x1300`,
+    /// i.e. the ST3.00 release plus the earlier beta builds whose `Cwt/v`
+    /// low 12 bits are below `0x300`) runs the per-tick path.
+    ///
+    /// The `<= 0x1300` comparison is gated on the Scream Tracker family
+    /// ([`Tracker::ScreamTracker`], top nibble `0x1`). A raw `<= 0x1300`
+    /// test alone would falsely match an undocumented writer whose top
+    /// nibble is `0x0` (`Cwt/v` `0x0xyy < 0x1300`); restricting to the
+    /// `0x1xxx` prefix keeps the rule to the writer the spec describes.
+    /// `is_st3_00()` (the strict `== 0x1300` sentinel) remains available
+    /// for callers that need the §Flags-exact form.
+    pub fn auto_fast_slides(&self) -> bool {
+        matches!(self.tracker, Tracker::ScreamTracker) && self.raw <= 0x1300
+    }
 }
 
 /// Sample type codes in the instrument header.
@@ -648,6 +677,39 @@ mod tests {
         assert_eq!(mpt.tracker, Tracker::OpenMpt);
         assert_eq!(mpt.version, 0x1AB);
         assert!(!mpt.is_st3_00());
+    }
+
+    #[test]
+    fn auto_fast_slides_covers_dxy_le_0x1300_bound() {
+        // §Dxy form ("the version is <= 0x1300") is broader than the §Flags
+        // form ("== 0x1300"). Every Scream Tracker family word at or below
+        // 0x1300 arms; everything above does not.
+        assert!(CreatedWithTracker::from_raw(0x1300).auto_fast_slides());
+        assert!(CreatedWithTracker::from_raw(0x12FF).auto_fast_slides());
+        assert!(CreatedWithTracker::from_raw(0x1200).auto_fast_slides());
+        assert!(CreatedWithTracker::from_raw(0x1000).auto_fast_slides());
+        // Just past the boundary — ST3.01 and later do not auto-arm.
+        assert!(!CreatedWithTracker::from_raw(0x1301).auto_fast_slides());
+        assert!(!CreatedWithTracker::from_raw(0x1320).auto_fast_slides());
+
+        // The strict `is_st3_00()` sentinel is the narrower §Flags form and
+        // must NOT widen — only the exact 0x1300 word satisfies it.
+        assert!(CreatedWithTracker::from_raw(0x1300).is_st3_00());
+        assert!(!CreatedWithTracker::from_raw(0x12FF).is_st3_00());
+    }
+
+    #[test]
+    fn auto_fast_slides_gated_on_scream_tracker_family() {
+        // A non-Scream-Tracker writer whose raw word numerically falls below
+        // 0x1300 (top nibble 0x0 → `Tracker::Other(0)`) must not be
+        // misclassified as fast-slides-armed by a bare `<= 0x1300` test.
+        let other = CreatedWithTracker::from_raw(0x0ABC);
+        assert_eq!(other.tracker, Tracker::Other(0));
+        assert!(!other.auto_fast_slides());
+
+        // Imago Orpheus (0x2xyy) is numerically above 0x1300 anyway, but the
+        // family gate is what makes the rule robust regardless of value.
+        assert!(!CreatedWithTracker::from_raw(0x2000).auto_fast_slides());
     }
 
     #[test]

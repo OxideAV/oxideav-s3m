@@ -27,10 +27,13 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   { raw, tracker, version }` triple where `tracker` is a `Tracker` enum
   with arms for every documented writer (Scream Tracker = 0x1, Imago
   Orpheus = 0x2, Impulse Tracker = 0x3, Schism Tracker = 0x4, OpenMPT =
-  0x5) plus `Other(u8)` for any undocumented prefix. `is_st3_00()` covers
-  the multimedia.cx §Flags bit 6 sentinel (raw word `0x1300` auto-arms
-  fast slides regardless of the flag byte); the player's fast-slides
-  derivation now reads that predicate instead of inlining the literal.
+  0x5) plus `Other(u8)` for any undocumented prefix. Two typed fast-slides
+  predicates capture the two bounds the reference states: `is_st3_00()` is
+  the strict §Flags bit 6 sentinel (raw word `== 0x1300`), while
+  `auto_fast_slides()` is the broader §Dxy form (Scream-Tracker-family word
+  `<= 0x1300`, covering the ST3.00 release plus earlier `0x12xx` betas). The
+  player's fast-slides derivation reads `auto_fast_slides()` — the §Dxy bound
+  the volume-slide kernel actually keys off — instead of inlining a literal.
 - PCM instruments (8-bit signed/unsigned, 16-bit, mono and true-stereo).
 - AdLib instrument types are skipped (no OPL synth).
 - **Channel mute flag (`+128` in the header's channel-settings byte)**:

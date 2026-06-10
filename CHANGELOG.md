@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CreatedWithTracker::auto_fast_slides()` — typed §Dxy fast-slides bound**
+  (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`). The
+  reference states the ST3.00 "fast slides" auto-arming rule **twice with
+  different bounds**: §Flags bit 6 says "automatically enabled if tracker
+  version is `== 0x1300`", while §Dxy says "if fast slides are enabled (if
+  they are set as a flag or the version is `<= 0x1300`)". The existing
+  `is_st3_00()` predicate captured only the strict `== 0x1300` sentinel, so
+  the player missed earlier Scream Tracker family builds whose `Cwt/v` falls
+  below `0x1300` (e.g. a `0x12xx` beta) that the §Dxy volume-slide kernel
+  would still run on the per-tick path. The new `auto_fast_slides()`
+  accessor on `CreatedWithTracker` encodes the broader §Dxy form —
+  `matches!(tracker, Tracker::ScreamTracker) && raw <= 0x1300` — gated on
+  the Scream Tracker family (top nibble `0x1`) so a numerically-smaller
+  word from an undocumented `0x0xyy` writer is not misclassified. The
+  player's `fast_slides` derivation in `PlayerState::new` now consults
+  `auto_fast_slides()` (the bound the kernel actually keys off) instead of
+  the strict `is_st3_00()` sentinel; `is_st3_00()` stays available for
+  callers needing the §Flags-exact form. The existing
+  `header_tracker_version_0x1300_enables_fast_slides_automatically` test is
+  unchanged (0x1300 arms, 0x1301 does not). Four new tests:
+  `auto_fast_slides_covers_dxy_le_0x1300_bound` and
+  `auto_fast_slides_gated_on_scream_tracker_family` (header.rs) drive the
+  predicate's boundary + family gate directly;
+  `header_pre_st3_00_version_below_0x1300_auto_arms_fast_slides` (player.rs)
+  confirms a `0x12FF` word arms `fast_slides` while a non-family `0x0ABC`
+  word does not.
+
 - **`Tracker` enum + `CreatedWithTracker` typed decomposition of the `Cwt/v`
   field** on `S3mHeader` (`docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt`
   `Cwt/v   = Created with tracker / version: &0xfff=version, >>12=tracker` +

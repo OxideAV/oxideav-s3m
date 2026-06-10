@@ -607,13 +607,18 @@ impl PlayerState {
 
         // Header flag derivation per `multimedia-cx-scream-tracker-3.html`
         // §Flags ("Bit 4: Amiga limits ...", "Bit 6: ST3.00 volume slides ...
-        // automatically enabled if tracker version is == 0x1300"). The
+        // automatically enabled if tracker version is == 0x1300") and §Dxy
+        // ("if fast slides are enabled ... or the version is <= 0x1300"). The
         // tracker-version coupling matches the documented behaviour that the
-        // original ST3.00 release (CwtV == 0x1300) always ran the fast-slides
-        // path regardless of the flag byte; later versions only do so when
-        // bit 6 is explicitly set.
+        // original ST3.00 release — and the earlier Scream Tracker builds at
+        // or below CwtV 0x1300 — always ran the fast-slides path regardless of
+        // the flag byte; later versions only do so when bit 6 is explicitly
+        // set. The §Dxy `<= 0x1300` bound is the broader of the two forms the
+        // reference states and is the one the volume-slide kernel keys off, so
+        // the player consults `auto_fast_slides()` (Scream-Tracker-family-gated
+        // `<= 0x1300`) rather than the strict `== 0x1300` sentinel.
         let fast_slides =
-            (header.flags & (1 << 6)) != 0 || header.created_with_tracker().is_st3_00();
+            (header.flags & (1 << 6)) != 0 || header.created_with_tracker().auto_fast_slides();
         let amiga_limits = (header.flags & (1 << 4)) != 0;
 
         PlayerState {
@@ -2397,6 +2402,36 @@ pub mod tests {
         h2.tracker_version = 0x1301;
         let p2 = PlayerState::new(&h2, Vec::new(), Vec::new(), 44_100);
         assert!(!p2.fast_slides, "CwtV != 0x1300 must leave the flag off");
+    }
+
+    #[test]
+    fn header_pre_st3_00_version_below_0x1300_auto_arms_fast_slides() {
+        // The §Dxy form of the rule in `multimedia-cx-scream-tracker-3.html`
+        // ("if fast slides are enabled ... or the version is <= 0x1300") is
+        // broader than the §Flags `== 0x1300` form: an earlier Scream Tracker
+        // family build whose CwtV is below 0x1300 (e.g. a 0x12xx beta) also
+        // runs the per-tick path. The previous `is_st3_00()`-only arming
+        // missed these; `auto_fast_slides()` covers them.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x12FF;
+        let player = PlayerState::new(&h, Vec::new(), Vec::new(), 44_100);
+        assert!(
+            player.fast_slides,
+            "Scream Tracker CwtV 0x12FF (<= 0x1300) must auto-arm fast slides"
+        );
+
+        // A non-Scream-Tracker writer whose raw word happens to fall below
+        // 0x1300 (top nibble 0x0) must NOT be misclassified — the bound is
+        // gated on the Scream Tracker family.
+        let mut h2 = synth_header();
+        h2.flags = 0;
+        h2.tracker_version = 0x0ABC;
+        let p2 = PlayerState::new(&h2, Vec::new(), Vec::new(), 44_100);
+        assert!(
+            !p2.fast_slides,
+            "non-Scream-Tracker CwtV 0x0ABC must not auto-arm despite < 0x1300"
+        );
     }
 
     #[test]
