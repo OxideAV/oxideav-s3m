@@ -354,8 +354,72 @@ impl Default for Channel {
     }
 }
 
+/// Canonical Scream Tracker 3 period table — 9 octaves × 12 semitones,
+/// indexed by the linear note number `n = octave * 12 + semitone`
+/// (`n = 0` is the octave-0 C; `n = 48` is the C-5 / `c2spd` reference
+/// note; `n = 107` is the octave-8 B that ST3 stops at).
+///
+/// These are the exact integer periods from the FireLight S3M player
+/// tutorial §4.2 "9 Octaves"
+/// (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt`). They
+/// are *not* a literal equal-tempered table: each octave is exactly half
+/// the previous (e.g. octave-4 C = 1712 ⇒ octave-5 C = 856), and the
+/// within-octave ratios are ST3's own canonical values
+/// (`1712,1616,1524,1440,1356,1280,1208,1140,1076,1016,960,906`), so a
+/// pure `2^(n/12)` approximation drifts from real ST3 pitch by up to
+/// roughly a cent near the octave's top (B = 906 vs the equal-tempered
+/// 905.8; multimedia.cx's base-octave list rounds this to 907, but the
+/// FireLight table's 906 is the value that keeps every octave an exact
+/// halving and is what the playback path uses).
+pub const PERIOD_TABLE: [u32; 108] = [
+    // octave 0
+    27392, 25856, 24384, 23040, 21696, 20480, 19328, 18240, 17216, 16256, 15360, 14496,
+    // octave 1
+    13696, 12928, 12192, 11520, 10848, 10240, 9664, 9120, 8608, 8128, 7680, 7248,
+    // octave 2
+    6848, 6464, 6096, 5760, 5424, 5120, 4832, 4560, 4304, 4064, 3840, 3624, // octave 3
+    3424, 3232, 3048, 2880, 2712, 2560, 2416, 2280, 2152, 2032, 1920, 1812, // octave 4
+    1712, 1616, 1524, 1440, 1356, 1280, 1208, 1140, 1076, 1016, 960, 906, // octave 5
+    856, 808, 762, 720, 678, 640, 604, 570, 538, 508, 480, 453, // octave 6
+    428, 404, 381, 360, 339, 320, 302, 285, 269, 254, 240, 226, // octave 7
+    214, 202, 190, 180, 170, 160, 151, 143, 135, 127, 120, 113, // octave 8
+    107, 101, 95, 90, 85, 80, 75, 71, 67, 63, 60, 56,
+];
+
+/// The C-5 reference note index (`octave 4`, semitone C) into
+/// [`PERIOD_TABLE`]. Note byte `0x40` maps here, and the sample's
+/// `c2spd` ("C-2 speed" — historically misnamed, it is the playback rate
+/// for *this* note) is the frequency at this index.
+pub const C5_NOTE_INDEX: i32 = 48;
+
+/// Resolve a linear note index `n` (octave * 12 + semitone) plus a
+/// sample's `c2spd` into a playback frequency in Hz, via the canonical
+/// [`PERIOD_TABLE`].
+///
+/// Per the FireLight tutorial §4.1 the runtime period is
+/// `period = 8363 * PERIOD_TABLE[n] / c2spd`, and the frequency is
+/// `clock / period`. Substituting back, the C-5 reference note
+/// (`PERIOD_TABLE[48] == 1712`) plays at exactly `c2spd` because
+/// [`AMIGA_CLOCK_HZ`] `== 8363 * 1712`; FireLight's `14317056`
+/// constant in the same section is the documented base-clock typo
+/// (multimedia.cx §Playback Notes: "documentation incorrectly says
+/// 14317056 Hz, correct value is the expected 8363 * 1712").
+///
+/// Indices below 0 or above the table's last entry (`n > 107`, e.g. an
+/// arpeggio that adds semitones past the octave-8 ceiling) are clamped
+/// to the table bounds — ST3 stops at B-8 and has no period to look up
+/// beyond it.
+fn note_index_to_frequency(n: i32, c2spd: u32) -> f32 {
+    let idx = n.clamp(0, PERIOD_TABLE.len() as i32 - 1) as usize;
+    let period = 8363u64 * PERIOD_TABLE[idx] as u64 / (c2spd.max(1) as u64);
+    if period == 0 {
+        return 0.0;
+    }
+    (AMIGA_CLOCK_HZ as f64 / period as f64) as f32
+}
+
 /// Convert an S3M note byte (octave << 4 | semitone) and C5 speed (Hz)
-/// into a playback frequency.
+/// into a playback frequency through the canonical [`PERIOD_TABLE`].
 ///
 /// ST3's note numbering displays octave 0 as "C-1", so the field the
 /// header calls "C-5 speed" is actually the playback rate for note byte
@@ -366,10 +430,7 @@ fn note_to_frequency(note: u8, c5_speed: u32) -> f32 {
     let octave = (note >> 4) as i32;
     let semitone = (note & 0x0F) as i32;
     let n = octave * 12 + semitone;
-    // Byte 0x40 → n = 48 is the c5_speed reference.
-    let c5_n = 4 * 12;
-    let delta = n - c5_n;
-    (c5_speed as f32) * 2.0f32.powf(delta as f32 / 12.0)
+    note_index_to_frequency(n, c5_speed)
 }
 
 /// Sample the selected vibrato/tremolo waveform at table position `pos`
@@ -1347,15 +1408,29 @@ impl PlayerState {
             match ch.command {
                 // Jxy: cycle through note, note+x semitones, note+y
                 // semitones across consecutive ticks (0, 1, 2, 0, 1, 2…).
+                // Per the FireLight tutorial §5.1 step 9 ("Arpeggio …
+                // All we have to do is add the parameter given!") and
+                // §6.10, the semitone offset is added to the *note index*
+                // and the result looked up in the canonical period table
+                // — NOT applied as an equal-tempered frequency multiply.
+                // The arpeggio leg keeps the channel's own `c2spd`
+                // (resolved via the current instrument), so an out-of-tune
+                // sample stays out of tune across the chord.
                 cmd::J_ARPEGGIO if (x | y) != 0 && ch.last_note != 0 => {
                     let semis = match tick % 3 {
                         0 => 0,
                         1 => x as i32,
                         _ => y as i32,
                     };
-                    let mult = 2.0f32.powf(semis as f32 / 12.0);
-                    ch.frequency = ch.target_frequency * mult;
-                    Self::clamp_amiga(ch, amiga_limits);
+                    let octave = (ch.last_note >> 4) as i32;
+                    let semitone = (ch.last_note & 0x0F) as i32;
+                    let n = octave * 12 + semitone + semis;
+                    let inst_idx = ch.instrument as usize;
+                    if inst_idx > 0 && inst_idx <= samples_snapshot.len() {
+                        let c2spd = samples_snapshot[inst_idx - 1].0;
+                        ch.frequency = note_index_to_frequency(n, c2spd);
+                        Self::clamp_amiga(ch, amiga_limits);
+                    }
                 }
                 // Kxy = "H00 + Dxy" (multimedia.cx §Kxy). The vibrato leg is
                 // H00 — it *continues the vibrato already running* on the
@@ -2021,6 +2096,56 @@ pub mod tests {
         let f4 = note_to_frequency(0x40, 8363);
         let f5 = note_to_frequency(0x50, 8363);
         assert!((f5 / f4 - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn period_table_matches_published_corners_and_octave4() {
+        // The table is transcribed verbatim from the FireLight §4.2
+        // "9 Octaves" listing. Spot-check the published corners and the
+        // full octave-4 reference row so a transcription slip is caught.
+        assert_eq!(PERIOD_TABLE[0], 27392); // octave-0 C
+        assert_eq!(PERIOD_TABLE[C5_NOTE_INDEX as usize], 1712); // C-5 ref
+        assert_eq!(PERIOD_TABLE[107], 56); // octave-8 B
+                                           // Octave-4 row (the canonical "1712,1616,…,906" semitone ratios).
+        let oct4 = [
+            1712, 1616, 1524, 1440, 1356, 1280, 1208, 1140, 1076, 1016, 960, 906,
+        ];
+        assert_eq!(&PERIOD_TABLE[48..60], &oct4);
+        // Periods are strictly decreasing from low note to high note.
+        for n in 1..PERIOD_TABLE.len() {
+            assert!(
+                PERIOD_TABLE[n] < PERIOD_TABLE[n - 1],
+                "table not monotonically decreasing at index {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn note_index_freq_uses_integer_period_truncation() {
+        // Note 0x50 (index 60, octave-5 C, period 856) at C2SPD 7895:
+        //   period = 8363 * 856 / 7895 = 906 (integer truncation)
+        //   freq   = 14317456 / 906 ≈ 15803 Hz
+        // The equal-tempered ratio 7895 * 2 = 15790 differs because ST3
+        // truncates the period to an integer (FireLight §4.1).
+        let f = note_index_to_frequency(60, 7895);
+        let period = 8363u64 * 856 / 7895;
+        let expected = AMIGA_CLOCK_HZ as f64 / period as f64;
+        assert!((f as f64 - expected).abs() < 0.5, "got {f}");
+        assert!(
+            (f - 15790.0).abs() > 5.0,
+            "integer truncation should diverge from the equal-tempered \
+             approximation; got {f}"
+        );
+    }
+
+    #[test]
+    fn note_index_freq_clamps_above_b8() {
+        // Adding arpeggio semitones past the octave-8 ceiling (index 107)
+        // must clamp to B-8, not panic / index OOB. ST3 has no period for
+        // notes above B-8.
+        let top = note_index_to_frequency(107, 8363);
+        let over = note_index_to_frequency(130, 8363);
+        assert_eq!(top, over);
     }
 
     #[test]

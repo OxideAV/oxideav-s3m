@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Canonical Scream Tracker 3 period table + period-based pitch**
+  (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt` §4 / §5.1).
+  `note_to_frequency` previously approximated pitch with a pure
+  equal-tempered `2^(delta/12)` multiply. It now resolves through ST3's
+  own 9-octave (108-entry) integer period table from the tutorial's §4.2
+  "9 Octaves" listing, exposed as the public `PERIOD_TABLE` constant plus
+  a `C5_NOTE_INDEX` reference and a `note_index_to_frequency(n, c2spd)`
+  helper. The runtime formula matches §4.1:
+  `period = 8363 * PERIOD_TABLE[n] / c2spd` (integer truncation), then
+  `freq = AMIGA_CLOCK_HZ / period`. The base clock is the
+  multimedia.cx-corrected `8363 * 1712 == 14_317_456` (FireLight's
+  `14317056` is the documented base-clock typo). The C-5 reference note
+  (`PERIOD_TABLE[48] == 1712`) still plays at exactly `c2spd` and octave
+  shifts still double, so the existing pitch tests hold; the integer
+  period truncation now matches real ST3, which makes finetuned /
+  off-`c2spd` notes land on the spec-accurate quantised frequency rather
+  than the idealised ratio (e.g. note `0x50` at `c2spd == 7895` → period
+  `906` → ~15803 Hz, not `15790`). The
+  `effect_s2x_finetune_changes_playback_rate` integration test is updated
+  to assert the period-table value with the correct ±5 Hz window.
+- **`Jxy` arpeggio now uses the period table** (FireLight §5.1 step 9 +
+  §6.10). Each per-tick leg (`tick % 3` → `0`, `+x`, `+y`) adds the
+  semitone offset to the note *index* and looks the result up in
+  `PERIOD_TABLE` with the channel's `c2spd`, instead of multiplying the
+  base frequency by `2^(semis/12)`. Legs above the octave-8 B ceiling
+  clamp to B-8. New unit tests cover the period-table corner values,
+  monotonic decrease, integer-period truncation, and the B-8 clamp; a new
+  `effect_jxy_arpeggio_uses_period_table_note_index` integration test
+  walks the base / `+4` / `+7` legs of a `J47` chord on a C-5 note.
 - **`CreatedWithTracker::auto_fast_slides()` — typed §Dxy fast-slides bound**
   (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`). The
   reference states the ST3.00 "fast slides" auto-arming rule **twice with

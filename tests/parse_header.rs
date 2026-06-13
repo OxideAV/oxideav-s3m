@@ -1094,12 +1094,84 @@ fn effect_s2x_finetune_changes_playback_rate() {
     let mut buf = vec![0i16; 2 * 64];
     player.render(&mut buf);
     let freq = player.channels[0].frequency;
-    // Expected: note 0x50 (one octave above C5) with new C5=7895 Hz.
-    // freq = 7895 * 2^1 = 15790. Allow ±10 Hz.
-    let expected = 7895.0 * 2.0;
+    // Note 0x50 (one octave above C-5) with the S20-selected C2SPD of
+    // 7895 Hz. Per the FireLight tutorial §4.1 the playback path uses the
+    // canonical period table with *integer* period truncation:
+    //   period = 8363 * PERIOD_TABLE[60] / 7895
+    //          = 8363 * 856   / 7895 = 7158728 / 7895 = 906 (truncated)
+    //   freq   = 14317456 / 906 ≈ 15803 Hz
+    // The equal-tempered approximation this test used to assert (15790)
+    // skipped the integer-period truncation that real ST3 performs, so a
+    // real ST3 plays this note ~13 Hz sharp of the idealised ratio. Allow
+    // ±5 Hz around the spec-accurate value.
+    let clock = oxideav_s3m::player::AMIGA_CLOCK_HZ as f64;
+    let period = (8363.0f64 * 856.0 / 7895.0).floor();
+    let expected = (clock / period) as f32;
     assert!(
-        (freq - expected).abs() < 10.0,
+        (freq - expected).abs() < 5.0,
         "S20 finetune should set freq to ~{expected}; got {freq}"
+    );
+}
+
+/// Jxy arpeggio resolves each leg through the canonical period table by
+/// adding the semitone parameter to the note *index* (FireLight §5.1
+/// step 9 + §6.10), not by an equal-tempered frequency multiply. Note
+/// 0x50 (octave-5 C, period table index 60) with J04 should, on the
+/// tick that adds 4 semitones, jump to index 64 (octave-5 E, period
+/// 678) → 14317456 / 678 Hz. C2SPD is 8363, so the period equals the
+/// raw table entry.
+#[test]
+fn effect_jxy_arpeggio_uses_period_table_note_index() {
+    use oxideav_s3m::header::parse_header;
+    use oxideav_s3m::pattern::unpack_all;
+    use oxideav_s3m::player::{PlayerState, AMIGA_CLOCK_HZ, PERIOD_TABLE};
+    use oxideav_s3m::samples::extract_samples;
+
+    // Row 0: note 0x50 + J47 (cmd 10 = J, info 0x47). x = 4, y = 7.
+    // Speed default 6, so the row spans 6 ticks and tick%3 cycles
+    // 0,1,2,0,1,2: the "+x" (=4 semitone) leg lands on tick 1, the
+    // "+y" (=7 semitone) leg on tick 2.
+    let pat_body: Vec<u8> = vec![
+        0xA0, 0x50, 1, 10, 0x47, // row 0: note + J47
+        0x00,
+    ];
+    let bytes = build_synth_with_pattern(pat_body);
+    let h = parse_header(&bytes).unwrap();
+    let samples = extract_samples(&h, &bytes);
+    let patterns = unpack_all(&h, &bytes);
+    let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
+
+    // Render exactly one tick (the engine advances a tick per render
+    // One render call advances exactly one tick (882 frames at 125 bpm,
+    // 44.1 kHz). Walk the first three ticks (0, 1, 2 → base, +4, +7).
+    let frames_per_tick = OUTPUT_SAMPLE_RATE as usize / (125 * 2 / 5);
+    let mut buf = vec![0i16; 2 * frames_per_tick];
+
+    // tick 0: base note (index 60, octave-5 C).
+    player.render(&mut buf);
+    let base = player.channels[0].frequency;
+    let base_expected = AMIGA_CLOCK_HZ as f32 / PERIOD_TABLE[60] as f32;
+    assert!(
+        (base - base_expected).abs() < 1.0,
+        "tick-0 arpeggio leg should be the base note {base_expected}; got {base}"
+    );
+
+    // tick 1: +4 semitones (x) → index 64 (octave-5 E, period 678).
+    player.render(&mut buf);
+    let plus4 = player.channels[0].frequency;
+    let plus4_expected = AMIGA_CLOCK_HZ as f32 / PERIOD_TABLE[64] as f32;
+    assert!(
+        (plus4 - plus4_expected).abs() < 1.0,
+        "tick-1 arpeggio leg should be note+4 = {plus4_expected}; got {plus4}"
+    );
+
+    // tick 2: +7 semitones (y) → index 67 (octave-5 G, period 570).
+    player.render(&mut buf);
+    let plus7 = player.channels[0].frequency;
+    let plus7_expected = AMIGA_CLOCK_HZ as f32 / PERIOD_TABLE[67] as f32;
+    assert!(
+        (plus7 - plus7_expected).abs() < 1.0,
+        "tick-2 arpeggio leg should be note+7 = {plus7_expected}; got {plus7}"
     );
 }
 

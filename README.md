@@ -34,6 +34,30 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `<= 0x1300`, covering the ST3.00 release plus earlier `0x12xx` betas). The
   player's fast-slides derivation reads `auto_fast_slides()` — the §Dxy bound
   the volume-slide kernel actually keys off — instead of inlining a literal.
+- **Canonical period-table pitch (`note_to_frequency` / `PERIOD_TABLE`)**.
+  Per the FireLight S3M player tutorial §4 ("More periods") the playback
+  rate is derived from ST3's own 9-octave (108-entry) integer period
+  table — `period = 8363 * PERIOD_TABLE[note] / c2spd`, then
+  `freq = AMIGA_CLOCK_HZ / period` — *not* a pure equal-tempered
+  `2^(n/12)` approximation. The table is transcribed verbatim from §4.2
+  (octave-4 row `1712,1616,…,906`; octave-0 C `27392` down to octave-8 B
+  `56`), so the within-octave ratios and the **integer period
+  truncation** match real ST3. The base clock is the multimedia.cx-
+  corrected `8363 * 1712 == 14_317_456` (FireLight's `14317056` in the
+  same section is the documented typo). The C-5 reference note
+  (`PERIOD_TABLE[48] == 1712`) plays at exactly `c2spd`; an out-of-tune
+  `c2spd` produces the same per-note quantisation ST3 would, e.g. note
+  byte `0x50` at `c2spd == 7895` lands on period `906` (`8363*856/7895`
+  truncated) ⇒ ~15803 Hz rather than the idealised `7895 * 2 == 15790`.
+- **`Jxy` arpeggio resolves each leg through the period table**. Per the
+  FireLight tutorial §5.1 step 9 ("Arpeggio … All we have to do is add
+  the parameter given!") and §6.10, the per-tick semitone offset is added
+  to the note *index* (`tick % 3` → `0`, `+x`, `+y`) and the result looked
+  up in `PERIOD_TABLE` with the channel's own `c2spd`, rather than scaling
+  the base frequency by `2^(semis/12)`. Legs that climb past the octave-8
+  B ceiling clamp to B-8 (ST3 has no higher period). This inherits the
+  same integer-period quantisation as ordinary note triggers, so a chord
+  leg is bit-identical to playing that note directly.
 - PCM instruments (8-bit signed/unsigned, 16-bit, mono and true-stereo).
 - AdLib instrument types are skipped (no OPL synth).
 - **Channel mute flag (`+128` in the header's channel-settings byte)**:
