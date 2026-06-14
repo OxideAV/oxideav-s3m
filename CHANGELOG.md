@@ -112,6 +112,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Gxx` / `Lxy` tone portamento now honours the "empty note targets the
+  last note" peculiarity** per the multimedia.cx behavioural reference §Gxx
+  (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`): "If the
+  current note is empty, the destination note is set to the last note to
+  show up in the channel, **even if it has occurred without the Gxx
+  effect**." Previously the porta target (`target_frequency`) was only ever
+  set when a row carried an explicit note, so a bare `Gxx` row (no note)
+  was a per-tick no-op against a stale target. Now a `Gxx` / `Lxy` row with
+  no note re-arms the target to the channel's `last_note` frequency
+  (resolved through the current instrument's C5SPD and the canonical period
+  table), so the slide glides back toward whatever note last played in the
+  slot. Two supporting corrections make the rule hold: (a) a
+  porta-suppressed trigger (a note that appears *with* `Gxx`/`Lxy`, so the
+  retrigger is skipped) now also updates `last_note`, since that note still
+  "shows up in the channel"; and (b) the companion §Gxx rule "Gxx doesn't
+  clear the target note when it is reached, so any future Gxx with no note
+  will keep sliding back to this particular note" falls out for free — the
+  target is never zeroed on arrival, and a second bare `Gxx` recomputes the
+  same target from the unchanged `last_note`. A bare `Gxx` on a channel that
+  has never played a note (`last_note == 0`) stays a no-op. Four new unit
+  tests under `src/player.rs` drive a synthetic single-channel player
+  through `enter_row`: `bare_gxx_targets_last_note_even_without_prior_porta`,
+  `bare_gxx_does_not_clear_target_on_arrival`,
+  `porta_suppressed_trigger_updates_last_note`, and
+  `bare_gxx_with_no_prior_note_is_noop`.
+
 - **`Rxy` tremolo rebuilt to the multimedia.cx behavioural reference §Rxy
   (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`).** Four
   spec gaps in the previous per-tick handler now resolved:

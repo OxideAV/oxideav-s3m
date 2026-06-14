@@ -58,6 +58,18 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   B ceiling clamp to B-8 (ST3 has no higher period). This inherits the
   same integer-period quantisation as ordinary note triggers, so a chord
   leg is bit-identical to playing that note directly.
+- **`Gxx` / `Lxy` tone-portamento "empty note targets the last note"
+  peculiarity**. Per the multimedia.cx behavioural reference §Gxx ("If the
+  current note is empty, the destination note is set to the last note to
+  show up in the channel, even if it has occurred without the Gxx effect"),
+  a bare `Gxx` row (carrying the portamento command but no note) re-arms the
+  slide target to the channel's last-played note — including a note that
+  triggered without any portamento. A porta-suppressed trigger (a note that
+  appears *with* `Gxx`/`Lxy`) also counts as the channel's last note, and
+  the companion rule "Gxx doesn't clear the target note when it is reached"
+  holds because the target is never zeroed on arrival, so successive bare
+  `Gxx` rows keep sliding back to the same note. A `Gxx` on a channel that
+  has never played a note is a no-op.
 - PCM instruments (8-bit signed/unsigned, 16-bit, mono and true-stereo).
 - AdLib instrument types are skipped (no OPL synth).
 - **Channel mute flag (`+128` in the header's channel-settings byte)**:

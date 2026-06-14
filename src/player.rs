@@ -999,6 +999,16 @@ impl PlayerState {
                         if porta && ch.frequency > 0.0 {
                             ch.target_frequency = freq;
                             Self::clamp_amiga(ch, self.amiga_limits);
+                            // The note still "shows up in the channel" even
+                            // though the porta suppressed the retrigger, so it
+                            // becomes the channel's last note. Per the
+                            // multimedia.cx §Gxx peculiarity ("If the current
+                            // note is empty, the destination note is set to
+                            // the last note to show up in the channel"), a
+                            // later Gxx/Lxy row with *no* note must slide back
+                            // to this note — which only works if `last_note`
+                            // tracks porta-suppressed triggers too.
+                            ch.last_note = cell.note;
                         } else {
                             ch.frequency = freq;
                             ch.target_frequency = freq;
@@ -1043,6 +1053,26 @@ impl PlayerState {
                             }
                             ch.last_note = cell.note;
                         }
+                    }
+                } else if (ch.command == cmd::G_TONE_PORTA || ch.command == cmd::L_PORT_VOL)
+                    && ch.last_note != 0
+                {
+                    // Gxx / Lxy with NO note on this row. Per the
+                    // multimedia.cx behavioural reference
+                    // (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+                    // §Gxx): "If the current note is empty, the destination
+                    // note is set to the last note to show up in the channel,
+                    // even if it has occurred without the Gxx effect." So a
+                    // bare Gxx slides back toward whatever note last played in
+                    // the slot — including a note that triggered without any
+                    // porta. (The companion peculiarity — "Gxx doesn't clear
+                    // the target note when it is reached" — falls out for free
+                    // since `target_frequency` is never zeroed on arrival.)
+                    let inst_idx = ch.instrument as usize;
+                    if inst_idx > 0 && inst_idx <= self.samples.len() {
+                        let c5 = self.samples[inst_idx - 1].c5_speed.max(1);
+                        ch.target_frequency = note_to_frequency(ch.last_note, c5);
+                        Self::clamp_amiga(ch, self.amiga_limits);
                     }
                 }
 
@@ -2444,6 +2474,216 @@ pub mod tests {
         };
         PlayerState::apply_tone_porta(&mut ch0, 0);
         assert_eq!(ch0.frequency, 8000.0);
+    }
+
+    /// Build a one-channel player driven by an explicit list of cells for
+    /// channel 0 (one cell per row). Instrument 1 is a long looping-free
+    /// constant sample at C5SPD 8363 so note frequencies are predictable.
+    fn porta_target_player(cells: &[Cell]) -> PlayerState {
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.initial_speed = 6;
+        h.initial_tempo = 125;
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(1);
+        for (row, cell) in cells.iter().enumerate() {
+            pat.rows[row][0] = *cell;
+        }
+        let samples = vec![dummy_sample(4096)];
+        PlayerState::new(&h, samples, vec![pat], 44_100)
+    }
+
+    #[test]
+    fn bare_gxx_targets_last_note_even_without_prior_porta() {
+        // multimedia.cx §Gxx peculiarity: "If the current note is empty, the
+        // destination note is set to the last note to show up in the channel,
+        // even if it has occurred without the Gxx effect." So a plain note
+        // trigger (no porta) on row 0, followed by a Gxx with NO note on a
+        // later row, must set the porta target to that row-0 note.
+        let note_c5 = 0x40; // ST3 C-5 → 8363 Hz at C5SPD 8363
+        let cells = [
+            // Row 0: plain trigger of C-5, no porta involved.
+            Cell {
+                note: note_c5,
+                instrument: 1,
+                volume: 0xFF,
+                command: 0,
+                info: 0,
+            },
+            // Row 1: bare Gxx (G02) with no note. Target must become C-5.
+            Cell {
+                note: 0xFF,
+                instrument: 0,
+                volume: 0xFF,
+                command: cmd::G_TONE_PORTA,
+                info: 0x02,
+            },
+        ];
+        let mut p = porta_target_player(&cells);
+        let c5_freq = note_to_frequency(note_c5, 8363);
+
+        // Row 0 (tick 0): the note triggers. last_note records it.
+        p.enter_row();
+        assert_eq!(p.channels[0].last_note, note_c5);
+        assert!((p.channels[0].frequency - c5_freq).abs() < 1.0);
+        // Move the live pitch away so the bare-Gxx target choice is visible:
+        // pretend a slide dragged the frequency down before row 1.
+        p.channels[0].frequency = c5_freq * 0.5;
+
+        // Advance to row 1.
+        p.tick = 0;
+        p.row = 1;
+        p.enter_row();
+        // The bare Gxx must have re-armed the target to the row-0 note.
+        assert!(
+            (p.channels[0].target_frequency - c5_freq).abs() < 1.0,
+            "bare Gxx must target the last note (C-5 = {c5_freq}), got {}",
+            p.channels[0].target_frequency
+        );
+        // And a per-tick Gxx step must now slide the (lowered) frequency UP
+        // toward that target rather than sitting still.
+        let before = p.channels[0].frequency;
+        p.tick = 1;
+        p.apply_per_tick();
+        assert!(
+            p.channels[0].frequency > before,
+            "bare Gxx must glide toward the recalled target (before {before}, \
+             after {})",
+            p.channels[0].frequency
+        );
+    }
+
+    #[test]
+    fn bare_gxx_does_not_clear_target_on_arrival() {
+        // Companion §Gxx peculiarity: "Gxx doesn't clear the target note when
+        // it is reached, so any future Gxx with no note will keep sliding back
+        // to this particular note." Once the slide has converged, a later bare
+        // Gxx (still no note) must keep the same target instead of dropping to
+        // a no-op / zero.
+        let note_c5 = 0x40;
+        let cells = [
+            Cell {
+                note: note_c5,
+                instrument: 1,
+                volume: 0xFF,
+                command: 0,
+                info: 0,
+            },
+            Cell {
+                note: 0xFF,
+                instrument: 0,
+                volume: 0xFF,
+                command: cmd::G_TONE_PORTA,
+                info: 0x02,
+            },
+            Cell {
+                note: 0xFF,
+                instrument: 0,
+                volume: 0xFF,
+                command: cmd::G_TONE_PORTA,
+                info: 0x02,
+            },
+        ];
+        let mut p = porta_target_player(&cells);
+        let c5_freq = note_to_frequency(note_c5, 8363);
+
+        p.enter_row(); // row 0: trigger.
+        p.tick = 0;
+        p.row = 1;
+        p.enter_row(); // row 1: bare Gxx targets C-5 (already there).
+        p.tick = 0;
+        p.row = 2;
+        p.enter_row(); // row 2: another bare Gxx — target must persist.
+        assert!(
+            (p.channels[0].target_frequency - c5_freq).abs() < 1.0,
+            "target must persist across a second bare Gxx (expected {c5_freq}, \
+             got {})",
+            p.channels[0].target_frequency
+        );
+    }
+
+    #[test]
+    fn porta_suppressed_trigger_updates_last_note() {
+        // A note that triggers WITH a Gxx (so the retrigger is suppressed)
+        // still "shows up in the channel" and must become `last_note`, so a
+        // subsequent bare Gxx slides back to *it*, not to an older note.
+        let note_c5 = 0x40; // 8363 Hz
+        let note_d5 = 0x42; // two semitones up
+        let cells = [
+            // Row 0: plain C-5 so there is a live note for porta to glide.
+            Cell {
+                note: note_c5,
+                instrument: 1,
+                volume: 0xFF,
+                command: 0,
+                info: 0,
+            },
+            // Row 1: D-5 WITH Gxx → porta-suppressed retrigger, target = D-5.
+            Cell {
+                note: note_d5,
+                instrument: 0,
+                volume: 0xFF,
+                command: cmd::G_TONE_PORTA,
+                info: 0x10,
+            },
+            // Row 2: bare Gxx — must target D-5 (the porta-suppressed note),
+            // proving `last_note` was updated on row 1.
+            Cell {
+                note: 0xFF,
+                instrument: 0,
+                volume: 0xFF,
+                command: cmd::G_TONE_PORTA,
+                info: 0x02,
+            },
+        ];
+        let mut p = porta_target_player(&cells);
+        let d5_freq = note_to_frequency(note_d5, 8363);
+
+        p.enter_row(); // row 0
+        assert_eq!(p.channels[0].last_note, note_c5);
+        p.tick = 0;
+        p.row = 1;
+        p.enter_row(); // row 1: porta to D-5, retrigger suppressed.
+        assert_eq!(
+            p.channels[0].last_note, note_d5,
+            "a porta-suppressed trigger must still update last_note"
+        );
+        p.tick = 0;
+        p.row = 2;
+        p.enter_row(); // row 2: bare Gxx targets the row-1 note.
+        assert!(
+            (p.channels[0].target_frequency - d5_freq).abs() < 1.0,
+            "bare Gxx must target the porta-suppressed D-5 (expected {d5_freq}, \
+             got {})",
+            p.channels[0].target_frequency
+        );
+    }
+
+    #[test]
+    fn bare_gxx_with_no_prior_note_is_noop() {
+        // Guard: a bare Gxx on a channel that has never played a note
+        // (last_note == 0) must not touch target_frequency — there is no
+        // "last note to show up" to slide toward.
+        let cells = [Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::G_TONE_PORTA,
+            info: 0x02,
+        }];
+        let mut p = porta_target_player(&cells);
+        p.enter_row();
+        assert_eq!(p.channels[0].last_note, 0);
+        assert_eq!(p.channels[0].target_frequency, 0.0);
     }
 
     #[test]
