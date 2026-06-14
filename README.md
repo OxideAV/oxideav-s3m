@@ -88,7 +88,10 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `Hxy`), `Vxx` (global volume), `Xxx` (set pan), plus the `Sxy`
   family (`S1x` glissando, `S2x` finetune from the spec C4Spd table,
   `S3x`/`S4x` vibrato/tremolo waveform select [sine, ramp-down, square,
-  random] with bit-2 "keep position across new note" support, `S80`
+  random — the sine/ramp/square shapes use the exact ProTracker integer
+  `sintab` and the half-cycle signed-pointer convention from FireLight
+  §6.8, not an idealized `sin()`] with bit-2 "keep position across new
+  note" support, `S80`
   pan, `SAx` legacy stereo control [pre-ST3 16-position pan with the
   XOR-0x8 nibble swap from FireLight §6.23, kept around for
   PANIC.S3M / STRSHINE.S3M compatibility], `SBx` pattern loop, `SCx`

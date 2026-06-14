@@ -433,38 +433,80 @@ fn note_to_frequency(note: u8, c5_speed: u32) -> f32 {
     note_index_to_frequency(n, c5_speed)
 }
 
+/// ProTracker half-sine table, transcribed verbatim from the FireLight
+/// S3M Player Tutorial §6.8 ("This is the sine table used by Protracker.
+/// If a player calls itself fully protracker compatible, it really should
+/// be using this table.") in
+/// `docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt`.
+///
+/// The table is *half* a sine wave (one all-positive hump, peaking at 255
+/// at index 16). ST3 walks a signed pointer (-32..+31, 64 distinct
+/// positions); the low 5 bits index this 32-entry table and the sign bit
+/// (pointer >= 0 vs < 0) decides whether the magnitude raises or lowers
+/// the pitch — together yielding one full oscillation. Using the literal
+/// table instead of a computed `sin()` matches the exact integer
+/// modulation values ST3 produces (the tutorial calls its routine "100%
+/// accurate").
+pub const PROTRACKER_SINE: [u8; 32] = [
+    0, 24, 49, 74, 97, 120, 141, 161, 180, 197, 212, 224, 235, 244, 250, 253, 255, 253, 250, 244,
+    235, 224, 212, 197, 180, 161, 141, 120, 97, 74, 49, 24,
+];
+
 /// Sample the selected vibrato/tremolo waveform at table position `pos`
 /// (0..=63), returning a signed integer in the range -64..=64.
+///
+/// `pos` is the unsigned form of ST3's signed `-32..+31` waveform pointer:
+/// positions `0..=31` are the "positive" half (the modulation is added),
+/// positions `32..=63` are the "negative" half (subtracted). The low five
+/// bits (`pos & 31`) index the 32-entry waveform shape per the FireLight
+/// tutorial §6.8 example routine.
+///
+/// The native shapes run 0..=255 (the documented `sintab` / ramp / square
+/// magnitudes); we scale by `/4` (255/4 ≈ 63.75) so the result lands in
+/// the ±64 range the depth math downstream already assumes, while the
+/// *shape* now tracks ST3's integer table exactly rather than an idealized
+/// floating-point sine.
 ///
 /// `Random` consumes one step of the channel's LCG. The LCG (Numerical
 /// Recipes' 32-bit ranqd1) is reproducible across runs and lets each
 /// channel keep its own independent noise without pulling rand crates.
 fn waveform_sample(wf: Waveform, pos: u8, rng: &mut u32) -> i32 {
-    match wf {
-        Waveform::Sine => {
-            // Sine in [-64,+64] sampled from a 64-entry period.
-            let phase = (pos as f32) * (std::f32::consts::PI * 2.0 / 64.0);
-            (phase.sin() * 64.0) as i32
-        }
+    // Sign: positive half for the low 32 positions, negative half above.
+    let negative = pos & 0x20 != 0;
+    let idx = (pos & 0x1F) as usize;
+    let magnitude: i32 = match wf {
+        // Direct table lookup per FireLight §6.8 `case 0: delta = sintab[temp]`.
+        Waveform::Sine => PROTRACKER_SINE[idx] as i32,
+        // Ramp down per FireLight §6.8 `case 1: temp <<= 3; if(vibpos<0)
+        // temp = 255 - temp; delta = temp`. Within each half the magnitude
+        // ramps `idx*8` (0..=248); the negative half mirrors it to 255-that.
         Waveform::RampDown => {
-            // Ramp from +64 at pos=0 down to ~-62 at pos=63.
-            let p = pos & 0x3F;
-            64 - (p as i32) * 2
-        }
-        Waveform::Square => {
-            if pos & 0x20 == 0 {
-                64
+            let t = (idx as i32) << 3;
+            if negative {
+                255 - t
             } else {
-                -64
+                t
             }
         }
+        // Square per FireLight §6.8 `case 2: delta = 255` — a constant
+        // magnitude whose sign is supplied by the half-cycle below.
+        Waveform::Square => 255,
         Waveform::Random => {
             // Numerical-recipes ranqd1: x' = 1664525 * x + 1013904223.
+            // FireLight §6.8 case 3 reuses the sine magnitude; we instead
+            // draw a fresh pseudo-random magnitude so the "random" waveform
+            // is genuinely noisy rather than a relabelled sine.
             *rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            // Take the top 8 bits as a signed value, scaled to ±64.
-            let signed = (*rng >> 24) as i8;
-            (signed as i32 / 2).clamp(-64, 64)
+            (*rng >> 24) as i32
         }
+    };
+    // Scale the 0..=255 native magnitude into the ±64 range used by the
+    // depth math, then apply the half-cycle sign.
+    let scaled = (magnitude / 4).min(64);
+    if negative {
+        -scaled
+    } else {
+        scaled
     }
 }
 
@@ -2151,22 +2193,31 @@ pub mod tests {
     #[test]
     fn waveform_square_is_bipolar_constant() {
         let mut rng = 0u32;
-        // First half (pos < 32) → +64; second half → -64.
-        assert_eq!(waveform_sample(Waveform::Square, 0, &mut rng), 64);
-        assert_eq!(waveform_sample(Waveform::Square, 31, &mut rng), 64);
-        assert_eq!(waveform_sample(Waveform::Square, 32, &mut rng), -64);
-        assert_eq!(waveform_sample(Waveform::Square, 63, &mut rng), -64);
+        // FireLight §6.8 `case 2: delta = 255`; the half-cycle supplies the
+        // sign. 255/4 = 63 (capped to the ±64 range). First half (pos < 32)
+        // → +63; second half → -63.
+        assert_eq!(waveform_sample(Waveform::Square, 0, &mut rng), 63);
+        assert_eq!(waveform_sample(Waveform::Square, 31, &mut rng), 63);
+        assert_eq!(waveform_sample(Waveform::Square, 32, &mut rng), -63);
+        assert_eq!(waveform_sample(Waveform::Square, 63, &mut rng), -63);
     }
 
     #[test]
-    fn waveform_rampdown_decreases() {
+    fn waveform_rampdown_matches_firelight_case1() {
+        // FireLight §6.8 `case 1: temp = (idx)<<3; if(vibpos<0) temp=255-temp`.
+        // Within the positive half the magnitude rises idx*8 (scaled /4);
+        // the negative half mirrors it through 255 and flips the sign,
+        // producing the documented descending ramp across the full cycle.
         let mut rng = 0u32;
-        let a = waveform_sample(Waveform::RampDown, 0, &mut rng);
-        let b = waveform_sample(Waveform::RampDown, 16, &mut rng);
-        let c = waveform_sample(Waveform::RampDown, 32, &mut rng);
-        assert!(a > b && b > c, "ramp should be strictly decreasing");
-        assert_eq!(a, 64);
-        assert_eq!(c, 0);
+        // Positive half: 0, +16, +32, +62 at idx 0/8/16/31.
+        assert_eq!(waveform_sample(Waveform::RampDown, 0, &mut rng), 0);
+        assert_eq!(waveform_sample(Waveform::RampDown, 8, &mut rng), 16);
+        assert_eq!(waveform_sample(Waveform::RampDown, 16, &mut rng), 32);
+        assert_eq!(waveform_sample(Waveform::RampDown, 31, &mut rng), 62);
+        // Negative half: -(255-idx*8)/4 → -63, -31, -1 at idx 0/16/31.
+        assert_eq!(waveform_sample(Waveform::RampDown, 32, &mut rng), -63);
+        assert_eq!(waveform_sample(Waveform::RampDown, 48, &mut rng), -31);
+        assert_eq!(waveform_sample(Waveform::RampDown, 63, &mut rng), -1);
     }
 
     #[test]
@@ -2175,6 +2226,40 @@ pub mod tests {
         let initial = rng;
         let _ = waveform_sample(Waveform::Random, 0, &mut rng);
         assert_ne!(rng, initial, "random must advance the LCG");
+    }
+
+    #[test]
+    fn protracker_sine_table_matches_firelight_listing() {
+        // Verbatim spot-checks of the 32-entry half-sine table from
+        // docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt §6.8.
+        assert_eq!(PROTRACKER_SINE[0], 0);
+        assert_eq!(PROTRACKER_SINE[1], 24);
+        assert_eq!(PROTRACKER_SINE[8], 180);
+        assert_eq!(PROTRACKER_SINE[16], 255); // peak
+        assert_eq!(PROTRACKER_SINE[31], 24);
+        // Symmetric about the index-16 peak: entry k == entry 32-k.
+        for k in 1..16 {
+            assert_eq!(
+                PROTRACKER_SINE[k],
+                PROTRACKER_SINE[32 - k],
+                "table must be symmetric about its peak at k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn waveform_sine_uses_protracker_table_with_signed_pointer() {
+        let mut rng = 0u32;
+        // Positive half (pos 0..=31): +sintab[pos]/4.
+        assert_eq!(waveform_sample(Waveform::Sine, 0, &mut rng), 0);
+        // pos 16 → 255/4 = 63 (capped to the ±64 working range).
+        assert_eq!(waveform_sample(Waveform::Sine, 16, &mut rng), 63);
+        // pos 1 → 24/4 = 6.
+        assert_eq!(waveform_sample(Waveform::Sine, 1, &mut rng), 6);
+        // Negative half (pos 32..=63): -sintab[pos & 31]/4.
+        assert_eq!(waveform_sample(Waveform::Sine, 32, &mut rng), 0);
+        assert_eq!(waveform_sample(Waveform::Sine, 48, &mut rng), -63);
+        assert_eq!(waveform_sample(Waveform::Sine, 33, &mut rng), -6);
     }
 
     #[test]
@@ -3490,9 +3575,10 @@ pub mod tests {
         // (depth * value) / (max_amplitude * 2) ... The stored volume is
         // untouched." The active volume is stored + delta, recomputed
         // every tick — NOT the previous active value + delta, which would
-        // accumulate drift. With a square waveform (deterministic ±64),
-        // R44 gives |delta| = (4·4 · 64) / 128 = 8, so the active volume
-        // must stay pinned to {stored+8, stored-8} for the whole run.
+        // accumulate drift. With a square waveform (deterministic ±63, the
+        // documented FireLight §6.8 `case 2: delta = 255` scaled to the ±64
+        // working range), R44 gives |delta| = (4·4 · 63) / 128 = 7, so the
+        // active volume must stay pinned to {stored+7, stored-7}.
         let mut ch = Channel {
             stored_volume: 40,
             volume: 40,
@@ -3502,12 +3588,12 @@ pub mod tests {
         for tick in 1..=32 {
             PlayerState::apply_tremolo(&mut ch, 4, 4);
             // Phase steps by 4·4 = 16 per tick over the 256 cycle; the
-            // square wave is high for phase < 128 → ticks 1..=7 read +64,
-            // ticks 8..=15 read -64, then the cycle repeats.
-            let expected = if (tick * 16) % 256 < 128 { 48 } else { 32 };
+            // square wave is high for phase < 128 → ticks 1..=7 read +63,
+            // ticks 8..=15 read -63, then the cycle repeats.
+            let expected = if (tick * 16) % 256 < 128 { 47 } else { 33 };
             assert_eq!(
                 ch.volume, expected,
-                "tick {tick}: active volume must be stored ± 8, never drift"
+                "tick {tick}: active volume must be stored ± 7, never drift"
             );
             assert_eq!(ch.stored_volume, 40, "stored volume is untouched");
         }
@@ -3516,7 +3602,8 @@ pub mod tests {
     #[test]
     fn tremolo_depth_scaling_and_peak_clamp() {
         // §Rxy depth is y*4 — for y = 0xF the square-wave delta is
-        // (15·4 · 64) / 128 = 30 (the documented "peaks at 32 in each
+        // (15·4 · 63) / 128 = 29 (square magnitude is the FireLight §6.8
+        // `delta = 255` scaled to ±63; the documented "peaks at 32 in each
         // direction" is the formula's theoretical bound).
         let mut ch = Channel {
             stored_volume: 32,
@@ -3525,13 +3612,13 @@ pub mod tests {
             ..Channel::default()
         };
         PlayerState::apply_tremolo(&mut ch, 4, 0xF);
-        assert_eq!(ch.volume, 62, "32 + 30 on the high half-cycle");
+        assert_eq!(ch.volume, 61, "32 + 29 on the high half-cycle");
         // Walk the phase into the low half-cycle (phase >= 128).
         ch.tremolo_pos = 128;
         PlayerState::apply_tremolo(&mut ch, 4, 0xF);
-        assert_eq!(ch.volume, 2, "32 - 30 on the low half-cycle");
+        assert_eq!(ch.volume, 3, "32 - 29 on the low half-cycle");
         // §Playback Notes: volumes peak at 63 — a stored volume high
-        // enough that stored + 30 overflows must clamp.
+        // enough that stored + 29 overflows must clamp.
         ch.tremolo_pos = 0;
         ch.stored_volume = 50;
         PlayerState::apply_tremolo(&mut ch, 4, 0xF);
@@ -3620,8 +3707,8 @@ pub mod tests {
         p.tick = 1;
         p.apply_per_tick();
         assert_eq!(
-            p.channels[0].volume, 48,
-            "tick 1 applies stored + (4·4 · 64)/128 = 40 + 8"
+            p.channels[0].volume, 47,
+            "tick 1 applies stored + (4·4 · 63)/128 = 40 + 7"
         );
     }
 

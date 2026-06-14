@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Vibrato / tremolo waveforms now use the exact ProTracker `sintab`**
+  (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt` §6.8). The
+  sine waveform previously computed `sin(2π·pos/64)·64` per tick; it now
+  reads the 32-entry ProTracker half-sine table the tutorial transcribes
+  ("This is the sine table used by Protracker. If a player calls itself
+  fully protracker compatible, it really should be using this table.")
+  through ST3's documented signed-pointer convention: positions `0..=31`
+  are the additive half-cycle, `32..=63` the subtractive half, and the low
+  five bits index the table. The ramp-down (`case 1: temp = idx<<3;
+  if(vibpos<0) temp = 255-temp`) and square (`case 2: delta = 255`) shapes
+  follow the same §6.8 example routine the tutorial calls "100% accurate".
+  Native 0..=255 magnitudes scale by `/4` into the existing ±64 working
+  range so the depth math (`Hxy`/`Uxy`/`Rxy`/`Kxy`) is unchanged in
+  structure but the modulation now lands on ST3's integer waveform values
+  (peak ±63, not ±64) rather than floating-point approximations. The table
+  is exposed as the public `PROTRACKER_SINE` constant. New unit tests lock
+  the table values, its symmetry about the index-16 peak, the signed-
+  pointer sine lookup, and the ramp-down half-cycle mirror; the three
+  square-wave tremolo tests are updated from the old ±64 peak to the
+  documented ±63.
 - **Canonical Scream Tracker 3 period table + period-based pitch**
   (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt` §4 / §5.1).
   `note_to_frequency` previously approximated pitch with a pure
