@@ -490,14 +490,14 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
 /// 0x01  12 bytes  DOS filename
 /// 0x0D   1 byte   MemSeg hi
 /// 0x0E   2 bytes  MemSeg lo (LE)  — combined: (hi << 16) | lo = parapointer
-/// 0x10   4 bytes  Length (LE)
-/// 0x14   4 bytes  Loop start (LE)
-/// 0x18   4 bytes  Loop end (LE)
+/// 0x10   4 bytes  Length (LE)      — ST3 only uses the lower 16 bits
+/// 0x14   4 bytes  Loop start (LE)  — ST3 only uses the lower 16 bits
+/// 0x18   4 bytes  Loop end (LE)    — ST3 only uses the lower 16 bits
 /// 0x1C   1 byte   Default volume
 /// 0x1D   1 byte   Reserved
 /// 0x1E   1 byte   Pack (0 = unpacked)
 /// 0x1F   1 byte   Flags
-/// 0x20   4 bytes  C5 speed (LE)
+/// 0x20   4 bytes  C5 speed (LE)    — ST3 only uses the lower 16 bits
 /// 0x24  12 bytes  Reserved
 /// 0x30  28 bytes  Sample name
 /// 0x4C   4 bytes  "SCRS" tag (for PCM)
@@ -516,13 +516,21 @@ pub fn parse_instrument(bytes: &[u8], off: usize) -> Result<Instrument> {
     let mem_hi = h[0x0D] as u32;
     let mem_lo = read_u16_le(h, 0x0E) as u32;
     let sample_parapointer = (mem_hi << 16) | mem_lo;
-    let length = read_u32_le(h, 0x10);
-    let loop_start = read_u32_le(h, 0x14);
-    let loop_end = read_u32_le(h, 0x18);
+    // The Length, Loop start, Loop end and C frequency fields are each stored
+    // as a 32-bit longword, but per the multimedia.cx Scream Tracker 3
+    // instrument-format reference ("Longword: Length, ST3 only uses the lower
+    // 16-bits.", and identically for Loop start, Loop end and C frequency) the
+    // tracker ignores the high half. We mask to the low 16 bits so a file that
+    // leaves garbage (or an out-of-range >64 KiB value) in the upper word plays
+    // the same length / loop window / pitch ST3 itself would, instead of
+    // slicing 65 536+ phantom frames out of the sample body.
+    let length = read_u32_le(h, 0x10) & 0xFFFF;
+    let loop_start = read_u32_le(h, 0x14) & 0xFFFF;
+    let loop_end = read_u32_le(h, 0x18) & 0xFFFF;
     let volume = h[0x1C].min(64);
     let pack = h[0x1E];
     let flags = h[0x1F];
-    let c5_speed = read_u32_le(h, 0x20);
+    let c5_speed = read_u32_le(h, 0x20) & 0xFFFF;
     let name = read_padded_ascii(&h[0x30..0x4C]);
     let mut tag = [0u8; 4];
     tag.copy_from_slice(&h[0x4C..0x50]);
@@ -560,6 +568,39 @@ mod tests {
         bytes[0x2C..0x30].copy_from_slice(S3M_SIGNATURE);
         bytes[0x1D] = 0x00;
         assert!(parse_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn instrument_longwords_use_only_lower_16_bits() {
+        // Per the multimedia.cx Scream Tracker 3 instrument-format reference
+        // (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`):
+        // "Longword: Length, ST3 only uses the lower 16-bits." — and the
+        // identically-worded notes for Loop start, Loop end and C frequency.
+        // A file that leaves nonzero garbage in the high half of any of these
+        // four fields must parse the same value ST3 itself would: the low
+        // 16 bits only.
+        // Place the 80-byte instrument header at a nonzero offset (a zero
+        // `off` is the "empty slot" early-return path).
+        let base = 0x40usize;
+        let mut buf = vec![0u8; base + INSTRUMENT_HEADER_SIZE];
+        let h = &mut buf[base..base + INSTRUMENT_HEADER_SIZE];
+        h[0x00] = 1; // PCM type.
+                     // Length 0x0001_2345 → 0x2345; Loop start 0xDEAD_0010 → 0x0010;
+                     // Loop end 0xBEEF_8000 → 0x8000; C5 speed 0xCAFE_56C2 → 0x56C2.
+        h[0x10..0x14].copy_from_slice(&0x0001_2345u32.to_le_bytes());
+        h[0x14..0x18].copy_from_slice(&0xDEAD_0010u32.to_le_bytes());
+        h[0x18..0x1C].copy_from_slice(&0xBEEF_8000u32.to_le_bytes());
+        h[0x20..0x24].copy_from_slice(&0xCAFE_56C2u32.to_le_bytes());
+        h[0x4C..0x50].copy_from_slice(b"SCRS");
+
+        let inst = parse_instrument(&buf, base).unwrap();
+        assert_eq!(inst.length, 0x2345, "Length must drop the high word");
+        assert_eq!(
+            inst.loop_start, 0x0010,
+            "Loop start must drop the high word"
+        );
+        assert_eq!(inst.loop_end, 0x8000, "Loop end must drop the high word");
+        assert_eq!(inst.c5_speed, 0x56C2, "C5 speed must drop the high word");
     }
 
     /// Build a minimal header byte string with a given 32-byte channel

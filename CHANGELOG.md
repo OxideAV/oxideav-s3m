@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Instrument Length / Loop start / Loop end / C frequency fields now mask
+  to their lower 16 bits.** Per the ST3 instrument-format reference
+  (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+  §"Instrument format": "Longword: Length, ST3 only uses the lower 16-bits."
+  and the identically-worded notes for Loop start, Loop end and C
+  frequency), each of these four 32-bit longwords is `& 0xFFFF`-masked at
+  parse time. A file that leaves nonzero garbage in the high word — or an
+  out-of-range value above 64 KiB — now parses the same length / loop
+  window / pitch ST3 itself would, instead of slicing tens of thousands of
+  phantom frames out of the sample body. New `header.rs` unit test
+  `instrument_longwords_use_only_lower_16_bits`.
+
 - **Vibrato / tremolo waveforms now use the exact ProTracker `sintab`**
   (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt` §6.8). The
   sine waveform previously computed `sin(2π·pos/64)·64` per tick; it now

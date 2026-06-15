@@ -71,6 +71,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
   `Gxx` rows keep sliding back to the same note. A `Gxx` on a channel that
   has never played a note is a no-op.
 - PCM instruments (8-bit signed/unsigned, 16-bit, mono and true-stereo).
+- **Instrument length / loop / C-speed fields use only their lower 16 bits**.
+  Per the ST3 instrument-format reference, the Length, Loop start, Loop end
+  and C frequency entries are each stored as a 32-bit longword but "ST3 only
+  uses the lower 16-bits". The parser now masks all four to `& 0xFFFF`, so a
+  file that leaves garbage (or an out-of-range >64 KiB value) in the high
+  half plays the same sample length / loop window / pitch ST3 itself would,
+  instead of slicing tens of thousands of phantom frames out of the sample
+  body.
 - AdLib instrument types are skipped (no OPL synth).
 - **Channel mute flag (`+128` in the header's channel-settings byte)**:
   per the ST3 format reference, a channel byte of `0x80 | type` marks
