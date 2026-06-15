@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.7...v0.0.8) - 2026-06-15
+
+### Other
+
+- instrument Length/Loop/C-speed fields use only lower 16 bits
+- Gxx/Lxy bare-note targets last note per multimedia.cx §Gxx
+- exact ProTracker sintab + signed-pointer waveforms per FireLight §6.8
+- period table: canonical ST3 9-octave integer periods + Jxy note-index arpeggio
+- Rxy tremolo: stored-volume-based delta + $Playback-Notes depth/cycle scaling + zero-stored-volume gate
+- typed auto_fast_slides() — §Dxy <= 0x1300 bound
+- typed Cwt/v decomposition (Tracker + CreatedWithTracker)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- S00 repeating SDx: double-trigger per multimedia.cx §S0x
+- persistent two-counter procedure + tick-0 firing + stored volume
+- loop-aware sample-offset wrap per ScreamTracker 3.20 effects
+- PCM active-volume peaks at 63 per multimedia.cx §Playback Notes
+- spec MV range [16,127] + stereo *11/8 boost per §Mixing volume
+- spec-correct value range + tick-1 timing + speed-1 skip
+
 ### Added
 
 - **Instrument Length / Loop start / Loop end / C frequency fields now mask
