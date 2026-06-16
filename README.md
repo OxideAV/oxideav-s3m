@@ -45,7 +45,25 @@ re-emitting one is out of scope.
 - **PCM instruments** — 8-bit signed/unsigned, 16-bit, mono and
   true-stereo. The Length / Loop start / Loop end / C-frequency fields
   are each masked to their lower 16 bits, per the ST3 instrument-format
-  reference. AdLib instrument types are skipped (no OPL synth).
+  reference.
+- **AdLib / OPL2 instruments** — `SCRI` instruments (type 2..=7) now have
+  their YM3812 register block decoded. `Instrument::adlib_instrument()`
+  unpacks the modulator + carrier operator parameters (AM/VIB/EGT/KSR/MUL,
+  KSL/TL, AR/DR, SL/RR, waveform) plus the channel feedback/connection
+  byte, per the ST3 AdLib instrument layout and the OPL register map. The
+  [`opl2`] module implements the YM3812 **operator core**: the
+  bit-for-bit decapsulated log-sin and exponential ROM tables, the phase
+  generator (`((fnum * mlTab[ML]) << block) >> 1`), full-period sine
+  reconstruction from the stored first quadrant, the half-wave-rectified
+  sine, and the MUL / FB tables. Each piece is unit-tested against the
+  decapsulation-article anchor values and the −3 dB-per-volume-step
+  exp/log identity. This is the deterministic, fully-documented foundation
+  for AdLib playback. It does **not yet synthesize audio**: the OPL2
+  envelope-generator *rate schedule* (the 9-bit / 96 dB EG attack / decay /
+  release increment timing) is not present in the staged clean-room docs —
+  only the OPLL's 7-bit / 48 dB EG is reverse-engineered, and even its
+  attack-level recurrence is an open gap. An OPL2-specific envelope-rate
+  trace is needed before the operator core can be wired into the mixer.
 - **Channel mute flag** (`+128` in the channel-settings byte) — the
   decoder reads pattern cells for muted channels (so jumps, loops, and
   pattern delays stay consistent) but the mixer silences their output.

@@ -19,6 +19,7 @@
 pub mod container;
 pub mod decoder;
 pub mod header;
+pub mod opl2;
 pub mod pattern;
 pub mod player;
 pub mod samples;

@@ -208,11 +208,36 @@ pub struct Instrument {
     pub name: String,
     /// Last 4 bytes should be "SCRS" for PCM, "SCRI" for AdLib.
     pub tag: [u8; 4],
+    /// Raw OPL2 register bytes for an AdLib instrument (`kind` 2..=7).
+    ///
+    /// Per `docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+    /// ("Instrument format → Adlib"), an AdLib instrument body stores the
+    /// chip's per-operator registers starting at header offset `0x10`
+    /// (after the type byte, the 12-byte DOS name, and 3 reserved bytes).
+    /// We capture the 11-byte register block — the 10 documented register
+    /// bytes plus the following `$C0` feedback/connection byte — so the
+    /// OPL2 core in [`crate::opl2`] can decode it. `None` for PCM / empty
+    /// instruments.
+    pub adlib_registers: Option<[u8; 11]>,
 }
 
 impl Instrument {
     pub fn is_pcm(&self) -> bool {
         self.kind == INST_TYPE_PCM
+    }
+
+    /// True for an AdLib / OPL2 FM instrument (type 2..=7: melody + drums).
+    pub fn is_adlib(&self) -> bool {
+        self.kind >= INST_TYPE_ADLIB_MELODY && self.kind <= 7
+    }
+
+    /// Decode this instrument's AdLib registers into a structured OPL2
+    /// 2-operator voice. Returns `None` for PCM / empty instruments (which
+    /// carry no register block).
+    pub fn adlib_instrument(&self) -> Option<crate::opl2::AdLibInstrument> {
+        self.adlib_registers
+            .as_ref()
+            .map(|r| crate::opl2::AdLibInstrument::from_registers(r))
     }
 
     pub fn is_looped(&self) -> bool {
@@ -534,6 +559,18 @@ pub fn parse_instrument(bytes: &[u8], off: usize) -> Result<Instrument> {
     let name = read_padded_ascii(&h[0x30..0x4C]);
     let mut tag = [0u8; 4];
     tag.copy_from_slice(&h[0x4C..0x50]);
+    // AdLib instruments (type 2..=7) reuse the same 80-byte header but the
+    // bytes mean OPL2 registers, not a PCM sample descriptor. Per the
+    // multimedia.cx ST3 instrument-format reference the 10 register bytes
+    // begin at offset 0x10 (3 reserved bytes after the 13-byte type+DOS-name
+    // prefix); the following `$C0` feedback/connection byte at 0x1A makes 11.
+    let adlib_registers = if (INST_TYPE_ADLIB_MELODY..=7).contains(&kind) {
+        let mut regs = [0u8; 11];
+        regs.copy_from_slice(&h[0x10..0x1B]);
+        Some(regs)
+    } else {
+        None
+    };
     Ok(Instrument {
         kind,
         dos_name,
@@ -547,6 +584,7 @@ pub fn parse_instrument(bytes: &[u8], off: usize) -> Result<Instrument> {
         c5_speed,
         name,
         tag,
+        adlib_registers,
     })
 }
 
@@ -601,6 +639,57 @@ mod tests {
         );
         assert_eq!(inst.loop_end, 0x8000, "Loop end must drop the high word");
         assert_eq!(inst.c5_speed, 0x56C2, "C5 speed must drop the high word");
+    }
+
+    #[test]
+    fn adlib_instrument_captures_register_block_and_decodes() {
+        // An AdLib melody instrument (type 2, tag "SCRI") stores OPL2
+        // register bytes at offset 0x10 per the multimedia.cx ST3
+        // instrument-format reference. Build one with the canonical
+        // "Trumpet"-shaped register block and verify it is captured and
+        // decodes through the OPL2 core.
+        let base = 0x40usize;
+        let mut buf = vec![0u8; base + INSTRUMENT_HEADER_SIZE];
+        {
+            let h = &mut buf[base..base + INSTRUMENT_HEADER_SIZE];
+            h[0x00] = INST_TYPE_ADLIB_MELODY;
+            // 11 register bytes at 0x10..0x1B: mod/car $20, $40, $60, $80,
+            // $E0, then $C0. $C0 = 0x0C → FB = (0x0C>>1)&7 = 6, CNT = 0.
+            let regs = [
+                0x21u8, 0x61, 0x1D, 0x07, 0x82, 0x81, 0x10, 0x07, 0x01, 0x00, 0x0C,
+            ];
+            h[0x10..0x1B].copy_from_slice(&regs);
+            h[0x4C..0x50].copy_from_slice(b"SCRI");
+        }
+
+        let inst = parse_instrument(&buf, base).unwrap();
+        assert!(inst.is_adlib(), "type-2 instrument must report is_adlib");
+        assert!(!inst.is_pcm());
+        assert_eq!(
+            inst.adlib_registers,
+            Some([0x21u8, 0x61, 0x1D, 0x07, 0x82, 0x81, 0x10, 0x07, 0x01, 0x00, 0x0C])
+        );
+
+        let voice = inst.adlib_instrument().expect("AdLib decode");
+        assert_eq!(voice.feedback, 6);
+        assert!(!voice.additive);
+        // Modulator $20 = 0x21 → MUL = 1; $E0 = 0x01 → HalfSine waveform.
+        assert_eq!(voice.modulator.mul, 1);
+        assert_eq!(voice.modulator.waveform, crate::opl2::Waveform::HalfSine);
+        // Carrier $E0 = 0x00 → full Sine.
+        assert_eq!(voice.carrier.waveform, crate::opl2::Waveform::Sine);
+    }
+
+    #[test]
+    fn pcm_instrument_has_no_adlib_registers() {
+        let base = 0x40usize;
+        let mut buf = vec![0u8; base + INSTRUMENT_HEADER_SIZE];
+        buf[base] = INST_TYPE_PCM;
+        buf[base + 0x4C..base + 0x50].copy_from_slice(b"SCRS");
+        let inst = parse_instrument(&buf, base).unwrap();
+        assert!(!inst.is_adlib());
+        assert!(inst.adlib_registers.is_none());
+        assert!(inst.adlib_instrument().is_none());
     }
 
     /// Build a minimal header byte string with a given 32-byte channel
