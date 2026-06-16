@@ -2092,29 +2092,27 @@ fn pan_mono_override_beats_explicit_pan_byte() {
 }
 
 /// SAx (legacy stereo control) toggles the high bit of the parameter
-/// nibble and writes the result to the channel pan slot. Per the
-/// FireLight S3M Player Tutorial §6.23:
+/// nibble per the multimedia.cx behavioural reference §SAx:
 ///
-///     if (eparmy > 7), then temp = eparmy - 8
-///     else                  temp = eparmy + 8
-///     setpan(temp)
+///   * SA0 / SA2 → Normal panning  (L is left, R is right).
+///   * SA1 / SA3 → Reversed panning (L is right, R is left).
+///   * SA4..SA7  → Center panning (DC offset → centre pan slot).
+///   * SA8..SAF  → No effect.
 ///
-/// This is the bit-swap (XOR 0x8) form. So SA0 → pan 8, SA7 → pan 15,
-/// SA8 → pan 0, SAF → pan 7. Row 0 here triggers a note with SA0, which
-/// must land the channel on pan slot 8 (centre-right of the 16-position
-/// scale).
+/// The hard side is the channel's bank, not the parameter. Channel 0 in
+/// the synth header is a left-bank slot (channel-settings low nibble 0),
+/// so a *reversed* SA1 must move it from its default pan 0 (hard left) to
+/// pan 15 (hard right) — a genuine, observable state change.
 #[test]
-fn effect_sax_pan_zero_lands_on_pan_eight() {
+fn effect_sax_reversed_moves_left_bank_to_right() {
     use oxideav_s3m::header::parse_header;
     use oxideav_s3m::pattern::unpack_all;
     use oxideav_s3m::player::PlayerState;
     use oxideav_s3m::samples::extract_samples;
 
-    // Row 0: trigger + SA0. Channel 0's default pan in our synth header
-    // is `0` (bank-left slot 0), so the SA0 → pan 8 result must be a
-    // genuine state change, not a no-op happening to match the default.
+    // Row 0: trigger + SA1 (reversed) on the left-bank channel 0.
     let pat_body: Vec<u8> = vec![
-        0xA0, 0x50, 1, 19, 0xA0, // row 0: trigger + SA0
+        0xA0, 0x50, 1, 19, 0xA1, // row 0: trigger + SA1
         0x00, // row 0 terminator
     ];
     let bytes = build_synth_with_pattern(pat_body);
@@ -2123,46 +2121,62 @@ fn effect_sax_pan_zero_lands_on_pan_eight() {
     let patterns = unpack_all(&h, &bytes);
     let mut player = PlayerState::new(&h, samples, patterns, OUTPUT_SAMPLE_RATE);
 
+    assert!(
+        !player.channels[0].right_bank,
+        "channel 0 is a left-bank slot in the synth header"
+    );
+
     // Drive tick 0 of row 0.
     let mut tb = vec![0i16; 2 * 64];
     player.render(&mut tb);
     assert_eq!(
-        player.channels[0].pan, 8,
-        "SA0 must map to pan 8 (XOR 0x8 of the parameter nibble)"
+        player.channels[0].pan, 15,
+        "SA1 (reversed) on a left-bank channel must pan hard-right (15)"
     );
 }
 
-/// SAx full mapping: every value in 0..=0xF must round-trip through the
-/// XOR-0x8 swap. Walks the cases that aren't already covered by the
-/// dedicated SA0 test above.
+/// SAx full mapping on a left-bank channel. The bank-keyed semantics map
+/// the 16 parameter values per multimedia.cx §SAx — normal/reversed are
+/// bank-dependent, the center group lands on the centre slot, and the
+/// 0x8..0xF group is a documented no-op (leaves the prior pan untouched).
 #[test]
-fn effect_sax_full_nibble_swap_mapping() {
+fn effect_sax_full_nibble_mapping_left_bank() {
     use oxideav_s3m::header::parse_header;
     use oxideav_s3m::pattern::unpack_all;
     use oxideav_s3m::player::PlayerState;
     use oxideav_s3m::samples::extract_samples;
 
-    // For each `x` we build a fresh module with row-0 trigger + SAx,
-    // then read the channel pan after one tick. This isolates the
-    // mapping from any cross-row state (no shared effect memory effects
-    // creep in because each module is a one-row module).
+    // Channel 0 is left-bank; its default pan is 0 (hard left). For the
+    // "no effect" group (0x8..0xF) the pan must stay at that default,
+    // so each case's expected value is interpreted against pan 0.
+    //
+    // Channel 0's resolved default pan in this stereo, no-pan-block synth
+    // header is the left-bank stereo default 3 (see the pan-resolution
+    // tests above), so the documented "no effect" group must leave it at 3.
+    //
+    // (param, expected_pan):
+    //   normal   (0,2)   → left-bank hard side   = 0
+    //   reversed (1,3)   → swapped hard side     = 15
+    //   center   (4..7)  → centre slot           = 7
+    //   no-op    (8..F)  → unchanged from default = 3
+    const DEFAULT_PAN: u8 = 3;
     let cases: [(u8, u8); 16] = [
-        (0x0, 8),
-        (0x1, 9),
-        (0x2, 10),
-        (0x3, 11),
-        (0x4, 12),
-        (0x5, 13),
-        (0x6, 14),
-        (0x7, 15),
-        (0x8, 0),
-        (0x9, 1),
-        (0xA, 2),
-        (0xB, 3),
-        (0xC, 4),
-        (0xD, 5),
-        (0xE, 6),
-        (0xF, 7),
+        (0x0, 0),           // normal
+        (0x1, 15),          // reversed
+        (0x2, 0),           // normal
+        (0x3, 15),          // reversed
+        (0x4, 7),           // center
+        (0x5, 7),           // center
+        (0x6, 7),           // center
+        (0x7, 7),           // center
+        (0x8, DEFAULT_PAN), // no effect
+        (0x9, DEFAULT_PAN), // no effect
+        (0xA, DEFAULT_PAN), // no effect
+        (0xB, DEFAULT_PAN), // no effect
+        (0xC, DEFAULT_PAN), // no effect
+        (0xD, DEFAULT_PAN), // no effect
+        (0xE, DEFAULT_PAN), // no effect
+        (0xF, DEFAULT_PAN), // no effect
     ];
     for (x, expected_pan) in cases {
         let pat_body: Vec<u8> = vec![
@@ -2183,7 +2197,8 @@ fn effect_sax_full_nibble_swap_mapping() {
         player.render(&mut tb);
         assert_eq!(
             player.channels[0].pan, expected_pan,
-            "SA{x:X} must map to pan {expected_pan} (FireLight §6.23 XOR 0x8 swap)"
+            "SA{x:X} on a left-bank channel must map to pan {expected_pan} \
+             (multimedia.cx §SAx)"
         );
     }
 }

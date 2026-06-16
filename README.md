@@ -62,8 +62,11 @@ re-emitting one is out of scope.
   `Txx` (tempo), `Uxy` (fine vibrato), `Vxx` (global volume, with the
   range / tick-1 / speed-1 quirks), `Xxx` (set pan), and the `Sxy`
   family (`S1x` glissando, `S2x` finetune, `S3x`/`S4x` waveform select,
-  `S80` pan, `SAx` legacy stereo, `SBx` pattern loop, `SCx` note cut /
-  freeze, `SDx` note delay, `SEx` pattern delay). `S0x` filter and
+  `S80` pan, `SAx` legacy "old stereo control" — bank-keyed
+  normal/reversed/center mapping (`SA0`/`SA2` keep the channel's L/R bank,
+  `SA1`/`SA3` swap it, `SA4`–`SA7` centre, `SA8`–`SAF` no-op), `SBx`
+  pattern loop, `SCx` note cut / freeze, `SDx` note delay, `SEx` pattern
+  delay). `S0x` filter and
   `SFx` funkrepeat decode as no-ops (not implemented in ST3 itself).
 - **Effect memory** — channels remember the latest nonzero parameter
   per command and substitute it back when a row carries the same

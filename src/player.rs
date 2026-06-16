@@ -306,6 +306,16 @@ pub struct Channel {
     /// a thawing E/F/G/H/J/K/L/U command (or a fresh note trigger) can
     /// resume playback from where it stopped.
     pub frozen: bool,
+    /// File-defined stereo side of this channel: `false` = left, `true` =
+    /// right. Derived from the low nibble of the channel-settings byte
+    /// (slots 0..=7 are the left bank `L1..L8`, slots 8..=15 the right
+    /// bank `R1..R8`). Needed by the legacy `SAx` ("old stereo control")
+    /// effect, whose normal/reversed/center mapping is keyed on the
+    /// channel's bank per the multimedia.cx behavioural reference
+    /// (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+    /// §SAx: "This effect is dependent on what channel type you put it
+    /// on ... SA0/SA2: Normal panning (L is left, R is right) ...").
+    pub right_bank: bool,
 }
 
 /// Note/instrument/volume stash for the SDx (note delay) effect.
@@ -350,6 +360,7 @@ impl Default for Channel {
             effect_memory: [0; 27],
             muted: false,
             frozen: false,
+            right_bank: false,
         }
     }
 }
@@ -685,6 +696,15 @@ impl PlayerState {
             .map(|i| Channel {
                 pan: header.pans.get(i).copied().unwrap_or(8) & 0x0F,
                 muted: header.muted.get(i).copied().unwrap_or(false),
+                // Stereo bank from the channel-settings low nibble: slots
+                // 0..=7 = left (`L1..L8`), 8..=15 = right (`R1..R8`). Used
+                // only by the legacy SAx effect. 0xFF (unused) slots fall
+                // back to the left bank — they emit no audio anyway.
+                right_bank: header
+                    .channels
+                    .get(i)
+                    .map(|&c| c != 0xFF && (c & 0x0F) >= 8)
+                    .unwrap_or(false),
                 ..Channel::default()
             })
             .collect();
@@ -1261,30 +1281,51 @@ impl PlayerState {
                             ch.keep_tremolo_pos_on_new_note = (p & 0x04) != 0;
                         }
                         0x8 => ch.pan = p,
-                        // SAx — legacy "stereo control" 16-position pan.
+                        // SAx — legacy "old stereo control".
                         //
-                        // Per the FireLight S3M Player Tutorial §6.23
-                        // (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt`)
-                        // this is a pre-ST3 panning command kept around for
-                        // compatibility with legacy modules such as
-                        // PANIC.S3M and STRSHINE.S3M. The tutorial spells
-                        // out the bit-swap algorithm:
+                        // Per the multimedia.cx behavioural reference
+                        // (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+                        // §SAx): "This effect is dependent on what channel
+                        // type you put it on", and the parameter nibble
+                        // selects one of four behaviours:
                         //
-                        //     if (eparmy > 7), then temp = eparmy - 8
-                        //     else                  temp = eparmy + 8
-                        //     setpan(temp)
+                        //   * SA0 / SA2 → Normal panning  (L is left,
+                        //     R is right).
+                        //   * SA1 / SA3 → Reversed panning (L is right,
+                        //     R is left).
+                        //   * SA4..SA7  → Center panning (the doc notes it
+                        //     "adds DC offset to either left or right"; in
+                        //     our integer pan model that is the centre slot).
+                        //   * SA8..SAF  → No effect.
                         //
-                        // i.e. the high bit of the parameter nibble is
-                        // toggled before it is written to the channel pan
-                        // slot. The ST3.20 effects reference
-                        // (`ScreamTracker-v3.20-effects.txt` §SAx) calls
-                        // out PANIC by Future Crew as the canonical
-                        // dependent: "The only .S3M file released that
-                        // would support it is the soundtrack from Panic by
-                        // Future Crew." ST3 itself stopped emitting SAx in
-                        // new files (the editor uses S8x now), so this
-                        // path only matters for back-catalogue playback.
-                        0xA => ch.pan = p ^ 0x08,
+                        // The L/R designation comes from the channel's bank
+                        // (`right_bank`, derived from the channel-settings
+                        // low nibble at load time), NOT from the parameter:
+                        // a left-bank channel pans hard-left under a normal
+                        // SA0 and hard-right under a reversed SA1, and vice
+                        // versa for a right-bank channel. We resolve to the
+                        // hard-left / hard-right / centre pan slots an S8x
+                        // command would land on (`0` / `15` / `7`) so
+                        // back-catalogue modules carrying this legacy effect
+                        // play with the intended stereo image. ST3's editor
+                        // emits S8x in new files, so this path only matters
+                        // for legacy playback.
+                        0xA => match p {
+                            0x0 | 0x2 => {
+                                // Normal: bank decides the hard side.
+                                ch.pan = if ch.right_bank { 0x0F } else { 0x00 };
+                            }
+                            0x1 | 0x3 => {
+                                // Reversed: swap the bank's hard side.
+                                ch.pan = if ch.right_bank { 0x00 } else { 0x0F };
+                            }
+                            0x4..=0x7 => {
+                                // Center (DC-offset) → centre pan slot.
+                                ch.pan = 0x07;
+                            }
+                            // 0x8..=0xF: documented "No effect".
+                            _ => {}
+                        },
                         0xB => {
                             // Collect loop requests across channels; ST3
                             // applies the last one on the row.
@@ -2693,6 +2734,105 @@ pub mod tests {
         assert_eq!(S2X_FINETUNE_TABLE[0x0], 7895);
         assert_eq!(S2X_FINETUNE_TABLE[0x8], 8363);
         assert_eq!(S2X_FINETUNE_TABLE[0xF], 8757);
+    }
+
+    /// Build a one-channel player whose single channel is in the chosen
+    /// stereo bank (false = left slot 0, true = right slot 8). Cells drive
+    /// channel 0, one cell per row.
+    fn banked_sax_player(right_bank: bool, cells: &[Cell]) -> PlayerState {
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        // Channel-settings low nibble selects the bank: 0 = L1, 8 = R1.
+        h.channels[0] = if right_bank { 8 } else { 0 };
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.initial_speed = 6;
+        h.initial_tempo = 125;
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(cells.len().max(1));
+        for (row, cell) in cells.iter().enumerate() {
+            pat.rows[row][0] = *cell;
+        }
+        let samples = vec![dummy_sample(4096)];
+        PlayerState::new(&h, samples, vec![pat], 44_100)
+    }
+
+    /// SAx ("old stereo control") is bank-dependent per the multimedia.cx
+    /// behavioural reference §SAx: SA0/SA2 "Normal panning (L is left, R is
+    /// right)", SA1/SA3 "Reversed". A right-bank channel must pan hard-right
+    /// under a normal SA0 and hard-left under a reversed SA1 — the exact
+    /// mirror of a left-bank channel under the same parameters.
+    #[test]
+    fn sax_normal_and_reversed_are_bank_dependent() {
+        let note = Cell {
+            note: 0x40,
+            instrument: 1,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xA0, // SA0 — normal
+        };
+        // Right-bank, normal → hard right (15).
+        let mut pr = banked_sax_player(true, &[note]);
+        assert!(pr.channels[0].right_bank);
+        pr.enter_row();
+        assert_eq!(
+            pr.channels[0].pan, 15,
+            "SA0 (normal) on a right-bank channel must pan hard-right"
+        );
+
+        // Left-bank, normal → hard left (0).
+        let mut pl = banked_sax_player(false, &[note]);
+        assert!(!pl.channels[0].right_bank);
+        pl.enter_row();
+        assert_eq!(
+            pl.channels[0].pan, 0,
+            "SA0 (normal) on a left-bank channel must pan hard-left"
+        );
+
+        // Right-bank, reversed (SA1) → hard left (0).
+        let rev = Cell { info: 0xA1, ..note };
+        let mut prr = banked_sax_player(true, &[rev]);
+        prr.enter_row();
+        assert_eq!(
+            prr.channels[0].pan, 0,
+            "SA1 (reversed) on a right-bank channel must pan hard-left"
+        );
+    }
+
+    /// SAx center group (SA4..SA7) lands on the centre slot and the no-op
+    /// group (SA8..SAF) leaves the pan untouched, per multimedia.cx §SAx.
+    #[test]
+    fn sax_center_and_noop_groups() {
+        let base = Cell {
+            note: 0x40,
+            instrument: 1,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xA5, // SA5 — center
+        };
+        let mut pc = banked_sax_player(true, &[base]);
+        // Right-bank default pan is 8 (our synth fills pans with 8).
+        pc.enter_row();
+        assert_eq!(
+            pc.channels[0].pan, 7,
+            "SA5 (center) must land on the centre pan slot"
+        );
+
+        // SAC (no effect) — pan must stay at the channel's prior value.
+        let noop = Cell { info: 0xAC, ..base };
+        let mut pn = banked_sax_player(true, &[noop]);
+        let before = pn.channels[0].pan;
+        pn.enter_row();
+        assert_eq!(
+            pn.channels[0].pan, before,
+            "SAC (8..F group) is a documented no-op and must not change pan"
+        );
     }
 
     /// Build a `SampleBody` of `len` constant-value PCM frames so the

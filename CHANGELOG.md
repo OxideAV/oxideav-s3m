@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- SAx ("old stereo control"): bank-keyed normal/reversed/center/no-op mapping per multimedia.cx §SAx
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.7...v0.0.8) - 2026-06-15
 
 ### Other
