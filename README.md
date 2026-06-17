@@ -45,7 +45,12 @@ re-emitting one is out of scope.
 - **PCM instruments** — 8-bit signed/unsigned, 16-bit, mono and
   true-stereo. The Length / Loop start / Loop end / C-frequency fields
   are each masked to their lower 16 bits, per the ST3 instrument-format
-  reference.
+  reference. Looped voices wrap at `loop_end` (the half-open
+  `[loop_start, loop_end)` window), never the physical PCM buffer
+  length — the post-loop tail is silent and the linear interpolator's
+  next-frame folds back to `loop_start` at the boundary, matching ST3's
+  loop-clipping (FireLight §2.10). One-shot voices still run to the
+  buffer end and deactivate.
 - **AdLib / OPL2 instruments** — `SCRI` instruments (type 2..=7) now have
   their YM3812 register block decoded. `Instrument::adlib_instrument()`
   unpacks the modulator + carrier operator parameters (AM/VIB/EGT/KSR/MUL,

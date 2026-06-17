@@ -1943,8 +1943,15 @@ impl PlayerState {
             // detection match the unmuted path, then return silence.
             let idx = ch.instrument as usize;
             if idx > 0 && idx <= samples.len() {
-                let len = samples[idx - 1].pcm.len() as f64;
-                if ch.sample_pos < len {
+                let body = &samples[idx - 1];
+                // Mirror the unmuted boundary: looped samples advance up to
+                // their `loop_end` window, one-shots up to the buffer length.
+                let end = if body.is_looped() {
+                    (body.loop_end as f64).min(body.pcm.len() as f64)
+                } else {
+                    body.pcm.len() as f64
+                };
+                if ch.sample_pos < end {
                     let step = (ch.frequency as f64) / (out_rate as f64);
                     ch.sample_pos += step;
                 }
@@ -1960,11 +1967,25 @@ impl PlayerState {
             return (0.0, 0.0);
         }
 
+        // A looped sample wraps back to `loop_start` the instant the read
+        // cursor reaches `loop_end` (the loop window is the half-open
+        // `[loop_start, loop_end)`), regardless of how much PCM body sits
+        // past that point. ST3 never plays the post-loop tail of a looping
+        // sample — FireLight §2.10 notes FMOD even "clips samples at their
+        // loop end points." So the effective end-of-playback boundary is
+        // `loop_end` for a looped sample, and the full buffer length only
+        // for a one-shot.
         let len = body.pcm.len() as f64;
-        if ch.sample_pos >= len {
-            if body.is_looped() {
+        let looped = body.is_looped();
+        let end = if looped {
+            (body.loop_end as f64).min(len)
+        } else {
+            len
+        };
+        if ch.sample_pos >= end {
+            if looped {
                 let ls = body.loop_start as f64;
-                let le = body.loop_end as f64;
+                let le = end;
                 let span = le - ls;
                 if span > 0.0 {
                     let over = ch.sample_pos - ls;
@@ -1982,10 +2003,19 @@ impl PlayerState {
         let i = ch.sample_pos as usize;
         let frac = (ch.sample_pos - i as f64) as f32;
         let n = body.pcm.len();
-        let next_idx = if i + 1 < n {
+        // At the last frame before the loop boundary, the next sample the
+        // linear interpolator should reach for is `loop_start` (the loop
+        // wraps there), not the frame physically past `loop_end` in the
+        // buffer. Key the wrap on the effective `end`, not the buffer length.
+        let end_idx = end as usize;
+        let next_idx = if looped {
+            if i + 1 < end_idx {
+                i + 1
+            } else {
+                body.loop_start as usize
+            }
+        } else if i + 1 < n {
             i + 1
-        } else if body.is_looped() {
-            body.loop_start as usize
         } else {
             i
         };
@@ -2968,6 +2998,112 @@ pub mod tests {
         assert_eq!(frozen.volume, 64);
         assert!(frozen.active);
         assert_eq!(frozen.frequency, 8363.0);
+    }
+
+    #[test]
+    fn looped_sample_wraps_at_loop_end_not_buffer_length() {
+        // A looping sample whose loop window `[loop_start, loop_end)` ends
+        // *before* the physical PCM buffer must wrap back to `loop_start`
+        // the moment the read cursor reaches `loop_end` — the post-loop
+        // tail of the buffer is never played. FireLight §2.10: ST3 (and
+        // FMOD) "clip samples at their loop end points." Here loop_end is 8
+        // but the buffer is 16 frames long; the trailing 8 frames carry a
+        // poison value the mixer must never reach.
+        let mut pcm = vec![1_000i16; 8];
+        pcm.extend(std::iter::repeat(-30_000i16).take(8)); // post-loop tail
+        let sample = SampleBody {
+            pcm,
+            pcm_right: None,
+            loop_start: 2,
+            loop_end: 8,
+            looped: true,
+            volume: 64,
+            c5_speed: 8363,
+        };
+        let samples = vec![sample];
+        let mut ch = Channel {
+            instrument: 1,
+            // Step the cursor one PCM frame per output frame so the loop is
+            // exercised quickly (out_rate == frequency).
+            frequency: 44_100.0,
+            sample_pos: 0.0,
+            volume: 64,
+            pan: 8,
+            active: true,
+            target_frequency: 44_100.0,
+            ..Channel::default()
+        };
+        for _ in 0..200 {
+            let (l, r) = PlayerState::mix_channel(&mut ch, &samples, 44_100.0);
+            // The poison tail (-30_000) would drive |sample| ~0.9; the loop
+            // window value (+1_000) sits near 0.03. If we ever read the tail
+            // the magnitude jumps well past the loop-window level.
+            assert!(
+                l.abs() < 0.2 && r.abs() < 0.2,
+                "mixer read past loop_end into the post-loop tail (l={l}, r={r})"
+            );
+            // The cursor may momentarily land exactly on `loop_end` after a
+            // step (the wrap fires at the *start* of the next mix call,
+            // before any read), but it must never advance past it — the
+            // frame at `loop_end` and beyond is the poison tail.
+            assert!(
+                ch.sample_pos <= 8.0,
+                "cursor walked past loop_end (got {})",
+                ch.sample_pos
+            );
+        }
+        // And the channel must still be playing — a looped voice never ends.
+        assert!(ch.active, "looped voice must not deactivate");
+    }
+
+    #[test]
+    fn looped_sample_interp_next_frame_wraps_to_loop_start() {
+        // At the last frame before `loop_end`, the linear interpolator's
+        // "next" sample must be `loop_start`, not the frame physically past
+        // loop_end in the buffer. Construct a sample where the frame at
+        // loop_end-1 and the frame at loop_end differ sharply, but the
+        // loop_start frame matches loop_end-1 — so a correct wrap keeps the
+        // interpolated value flat while a buggy read past loop_end dips.
+        let pcm = vec![
+            0i16,   // 0
+            8_000,  // 1 = loop_start
+            8_000,  // 2
+            8_000,  // 3 = loop_end - 1 (last in-window frame)
+            -8_000, // 4 = loop_end (post-loop poison — must not be reached)
+            -8_000, // 5
+        ];
+        let sample = SampleBody {
+            pcm,
+            pcm_right: None,
+            loop_start: 1,
+            loop_end: 4,
+            looped: true,
+            volume: 64,
+            c5_speed: 8363,
+        };
+        let samples = vec![sample];
+        // Park the cursor mid-way between frame 3 (loop_end-1) and the wrap.
+        let mut ch = Channel {
+            instrument: 1,
+            frequency: 44_100.0,
+            sample_pos: 3.5,
+            volume: 64,
+            pan: 8,
+            active: true,
+            target_frequency: 44_100.0,
+            ..Channel::default()
+        };
+        let (l, _r) = PlayerState::mix_channel(&mut ch, &samples, 44_100.0);
+        // s0 = frame 3 (+8_000), s1 = loop_start frame 1 (+8_000): the
+        // interpolation stays at +8_000 (≈0.24 after volume/pan). A buggy
+        // read of frame 4 (-8_000) would land near the midpoint ≈0.0.
+        // Correct wrap: ≈ +0.11. Buggy read of frame 4 (-8_000) at frac 0.5
+        // collapses the interpolation to ≈ 0.0. The 0.05 gate cleanly
+        // separates the two outcomes.
+        assert!(
+            l > 0.05,
+            "interp at loop boundary read past loop_end instead of wrapping to loop_start (l={l})"
+        );
     }
 
     /// Build a minimal-but-valid S3mHeader purely in-memory so the

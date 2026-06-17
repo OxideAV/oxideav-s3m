@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- mixer: looped samples wrap at `loop_end`, not the PCM buffer length — the post-loop tail is never played and the interpolator's next-frame wraps to `loop_start` at the boundary (FireLight §2.10)
 - AdLib/OPL2 operator core: decapsulated YM3812 log-sin/exp ROM tables + phase generator + sine/half-sine waveforms + MUL/FB tables + SCRI instrument register decode (envelope rates gapped)
 - SAx ("old stereo control"): bank-keyed normal/reversed/center/no-op mapping per multimedia.cx §SAx
 
