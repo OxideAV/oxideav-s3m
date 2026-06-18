@@ -77,7 +77,11 @@ re-emitting one is out of scope.
   `Cxx` (pattern break), `Dxy` volume slide (full case matrix including
   the fine forms and the both-nibbles-nonzero quirk), `Exx` / `Fxx`
   pitch slides (with fine + extra-fine forms), `Gxx` (tone portamento,
-  including the empty-note-targets-last-note rule), `Hxy` (vibrato),
+  including the empty-note-targets-last-note rule), `Hxy` (vibrato — a
+  256-cycle phase stepped by `speed * 4` and sampled at `phase / 4`,
+  matching the FireLight §6.8 signed `-32..+31` pointer and the same
+  phase model `Rxy` tremolo uses, so a full oscillation takes `64 / speed`
+  ticks rather than a quarter of that),
   `Ixy` (tremor), `Jxy` (arpeggio, resolved through the period table),
   `Kxy` (vibrato + volume), `Lxy` (portamento + volume), `Oxx` (sample
   offset, honouring the loop window on looped samples), `Qxy`

@@ -221,7 +221,15 @@ pub struct Channel {
     pub command: u8,
     /// Effect parameter byte.
     pub info: u8,
-    /// Vibrato phase in table units (0..=63).
+    /// Vibrato phase as the full 0..=255 cycle position. Per the
+    /// multimedia.cx §Playback Notes ("Vibrato and tremolo have a full
+    /// cycle length of 256, though Hxy and Rxy use x*4 and y*4 as their
+    /// parameters"), `Hxy`/`Uxy`/`Kxy` step this by `speed * 4` per
+    /// nonzero tick and sample the 64-entry waveform table at `phase / 4`.
+    /// That `phase / 4` is exactly the FireLight §6.8 signed `-32..+31`
+    /// vibrato pointer incremented by `speed` — the two descriptions are
+    /// the same phase model, with this field holding the finer 8-bit
+    /// counter so fine vibrato (`Uxy`) shares the same stepping.
     pub vibrato_pos: u8,
     /// Tremolo phase as the full 0..=255 cycle position. Per the
     /// multimedia.cx §Playback Notes ("Vibrato and tremolo have a full
@@ -1654,9 +1662,19 @@ impl PlayerState {
         if ch.target_frequency <= 0.0 {
             return;
         }
-        ch.vibrato_pos = (ch.vibrato_pos.wrapping_add(speed * 4)) & 0x3F;
+        // §Playback Notes: "Vibrato and tremolo have a full cycle length of
+        // 256, though Hxy and Rxy use x*4 and y*4 as their parameters." The
+        // phase counter is the full 0..=255 cycle stepped by `speed * 4`
+        // (wrapping at 256), and the 64-entry waveform table is sampled at
+        // `phase / 4`. This `phase / 4` reproduces FireLight §6.8's signed
+        // `-32..+31` pointer incremented by `speed`: e.g. speed 4 advances
+        // the pointer by 1 table slot per tick, completing the full
+        // oscillation in 64 ticks — NOT 16. (The earlier `(pos + speed*4) &
+        // 0x3F` form masked to 6 bits *and* sampled directly, advancing the
+        // pointer 4× too fast and quartering the vibrato period.)
+        ch.vibrato_pos = ch.vibrato_pos.wrapping_add(speed * 4);
         let wf = ch.vibrato_waveform;
-        let s = waveform_sample(wf, ch.vibrato_pos, &mut ch.random_state);
+        let s = waveform_sample(wf, ch.vibrato_pos >> 2, &mut ch.random_state);
         let div = if fine { 512 } else { 128 };
         let delta = (s * depth as i32) / div;
         let mult = 2.0f32.powf(delta as f32 / 48.0);
@@ -2494,10 +2512,15 @@ pub mod tests {
         ch.effect_memory[cmd::H_VIBRATO as usize] = 0x24; // remembered H24
         let (h_speed, h_depth) = PlayerState::vibrato_memory(&ch);
         assert_eq!((h_speed, h_depth), (2, 4));
-        // First vibrato step from pos 0 advances by speed*4 = 8; the sine
-        // sample at pos 8 (sin(π/4)) is nonzero, so the depth-4 wobble must
-        // shift the pitch off the carrier.
-        PlayerState::apply_vibrato(&mut ch, h_speed, h_depth, false);
+        // Each vibrato step advances the phase by speed*4 = 8 and samples the
+        // sine at phase/4. Step three ticks so the phase (24) lands at table
+        // index 6 (PROTRACKER_SINE[6] = 141), where the depth-4 wobble is
+        // large enough to shift the carrier off-pitch — proving the
+        // remembered H depth is what drives the modulation.
+        for _ in 0..3 {
+            PlayerState::apply_vibrato(&mut ch, h_speed, h_depth, false);
+        }
+        assert_eq!(ch.vibrato_pos, 24);
         assert_ne!(
             ch.frequency, 8363.0,
             "Kxy vibrato must move pitch using the remembered H depth"
@@ -2514,6 +2537,74 @@ pub mod tests {
         assert_eq!(
             ch2.frequency, 8363.0,
             "speed-0 vibrato is a no-op; proves K02 nibbles are wrong params"
+        );
+    }
+
+    #[test]
+    fn vibrato_phase_steps_speed_times_4_over_256_cycle() {
+        // §Playback Notes: "Vibrato and tremolo have a full cycle length of
+        // 256, though Hxy and Rxy use x*4 and y*4 as their parameters."
+        // Vibrato must share the tremolo phase convention: speed 8 → 32
+        // phase units per tick → a full cycle every 8 ticks (256 / (4·8)),
+        // NOT the quartered period the old `& 0x3F` form produced.
+        let mut ch = Channel {
+            target_frequency: 8363.0,
+            frequency: 8363.0,
+            ..Channel::default()
+        };
+        for _ in 0..3 {
+            PlayerState::apply_vibrato(&mut ch, 8, 1, false);
+        }
+        assert_eq!(ch.vibrato_pos, 96, "3 ticks at speed 8 → phase 96");
+        for _ in 0..5 {
+            PlayerState::apply_vibrato(&mut ch, 8, 1, false);
+        }
+        assert_eq!(ch.vibrato_pos, 0, "8 ticks wrap the full 256 cycle");
+    }
+
+    #[test]
+    fn vibrato_completes_one_oscillation_in_16_ticks_at_speed_4() {
+        // FireLight §6.8: the signed -32..+31 pointer is incremented by the
+        // vibrato speed; the half-sine table is used twice for one full
+        // oscillation (64 pointer steps). Our 8-bit phase steps by speed*4
+        // and is sampled at phase/4, so the FireLight pointer advances by
+        // exactly `speed` slots per tick. At speed 4 the pointer covers all
+        // 64 slots in 64/4 = 16 ticks, so phase returns to 0 after 16 ticks.
+        // The old `& 0x3F` form (stepping the 6-bit pointer by speed*4)
+        // would have wrapped in just 4 ticks — a quartered period.
+        let base = 8363.0f32;
+        let mut ch = Channel {
+            target_frequency: base,
+            frequency: base,
+            vibrato_waveform: Waveform::Sine,
+            ..Channel::default()
+        };
+        // Tick 1: phase 0→16, sampled at phase/4 = table idx 4,
+        // PROTRACKER_SINE[4] = 97 — a positive (added) modulation.
+        PlayerState::apply_vibrato(&mut ch, 4, 8, false);
+        assert_eq!(ch.vibrato_pos, 16);
+        assert!(
+            ch.frequency > base,
+            "first quarter of the sine adds to the carrier"
+        );
+        // Into the negative half: phase 144 (pointer 36) samples table idx
+        // 4 on the subtracted half (PROTRACKER_SINE[4] = 97), so the carrier
+        // drops below base. From phase 16, 8 more ticks (×16) → phase 144.
+        for _ in 0..8 {
+            PlayerState::apply_vibrato(&mut ch, 4, 8, false);
+        }
+        assert_eq!(ch.vibrato_pos, 144, "9 ticks → into the negative half");
+        assert!(
+            ch.frequency < base,
+            "the second half of the cycle subtracts from the carrier"
+        );
+        // Run out the remaining 7 ticks (16 total) — phase wraps to 0.
+        for _ in 0..7 {
+            PlayerState::apply_vibrato(&mut ch, 4, 8, false);
+        }
+        assert_eq!(
+            ch.vibrato_pos, 0,
+            "16 ticks at speed 4 complete exactly one full oscillation"
         );
     }
 
