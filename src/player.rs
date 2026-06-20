@@ -324,6 +324,19 @@ pub struct Channel {
     /// §SAx: "This effect is dependent on what channel type you put it
     /// on ... SA0/SA2: Normal panning (L is left, R is right) ...").
     pub right_bank: bool,
+    /// Global volume *latched into this voice* at the moment its note
+    /// volume was last (re)written. Per the multimedia.cx behavioural
+    /// reference §Vxx: "It does not affect past notes, that are still
+    /// playing, unless their volume is changed, which applies the new
+    /// global volume to that voice." A Vxx change updates the player's
+    /// *current* global volume but does NOT retroactively touch this
+    /// field; only a note trigger or a volume-modifying effect (volume
+    /// column, Dxy/Kxy/Lxy slide, Qxy retrigger modifier, Rxy tremolo,
+    /// Ixy tremor) re-latches it to the value live at the time of that
+    /// write. The mixer scales by this per-voice value, not the live
+    /// player global volume, so a Vxx between two notes only affects the
+    /// note(s) whose volume changed after it. Range `0..=64`.
+    pub voice_global_vol: u8,
 }
 
 /// Note/instrument/volume stash for the SDx (note delay) effect.
@@ -369,6 +382,10 @@ impl Default for Channel {
             muted: false,
             frozen: false,
             right_bank: false,
+            // Default to full scale (64/64 = unity). A freshly-constructed
+            // channel that has never carried a note plays at the player's
+            // global volume the first time it triggers, re-latching there.
+            voice_global_vol: 64,
         }
     }
 }
@@ -907,6 +924,13 @@ impl PlayerState {
             }
             ch.command = cell.command;
             ch.info = cell.info;
+            // Snapshot the channel's note volume before this row's tick-0
+            // writes. Any change (a note trigger reloading the instrument
+            // default, a volume-column write, or a tick-0 volume slide)
+            // re-latches the voice's global volume to the value live *now*
+            // — which at tick 0 is still the pre-Vxx player global volume,
+            // so a same-row Vxx does not reach a freshly-triggered note.
+            let vol_before_row = ch.volume;
             // Capture the *raw* row infobyte before effect-memory recall.
             // Needed below to disambiguate a true S00 (raw 0, resolved by
             // memory) from a freshly-written Sxy of the same resolved value
@@ -1007,6 +1031,13 @@ impl PlayerState {
                         let v = clamp_pcm_volume(s.volume as u16);
                         ch.volume = v;
                         ch.stored_volume = v;
+                        // An instrument reload is a note-volume write: latch
+                        // the global volume even when `v` equals the prior
+                        // value (the post-loop change check would miss a
+                        // same-numeric-volume re-trigger after an inter-row
+                        // Vxx). At tick 0 `self.global_volume` is still the
+                        // pre-Vxx value, so a same-row Vxx is excluded.
+                        ch.voice_global_vol = self.global_volume;
                     }
                 }
 
@@ -1117,6 +1148,10 @@ impl PlayerState {
                     let v = clamp_pcm_volume(cell.volume as u16);
                     ch.volume = v;
                     ch.stored_volume = v;
+                    // Volume-column write re-latches the voice global volume
+                    // (see the instrument-reload branch for why this is
+                    // unconditional rather than change-gated).
+                    ch.voice_global_vol = self.global_volume;
                 }
             }
 
@@ -1367,6 +1402,15 @@ impl PlayerState {
                 }
                 _ => {}
             }
+
+            // Re-latch the voice global volume if any tick-0 write changed
+            // the note volume. `self.global_volume` here is the pre-Vxx
+            // value (Vxx drains on tick 1), so same-row triggers keep the
+            // old global volume — satisfying §Vxx "does not affect events
+            // on the same row, where the effect is set".
+            if ch.volume != vol_before_row {
+                ch.voice_global_vol = self.global_volume;
+            }
         }
 
         if replaying_held_row {
@@ -1444,6 +1488,15 @@ impl PlayerState {
                 self.global_volume = g;
             }
         }
+        // Snapshot the (post-Vxx-drain) player global volume so the channel
+        // loop can re-latch it into any voice whose note volume a per-tick
+        // effect changes. Per §Vxx, a Vxx "is also applied on the same row
+        // if anything updates the note volume on tick 1 or tick 2 ... like
+        // the Dxx effect (when doing a non-fine slide)" — with the
+        // per-voice latch, that falls out naturally: the volume-modifying
+        // effect changes `ch.volume`, which re-latches this value (now the
+        // new global volume from this row's Vxx).
+        let global_vol_now = self.global_volume;
         // Clone sample metadata we need for deferred SDx triggers. Can't
         // borrow `&self.samples` inside the mutable-channel loop.
         let samples_snapshot: Vec<(u32, u8)> = self
@@ -1457,6 +1510,11 @@ impl PlayerState {
         for ch in &mut self.channels {
             let x = ch.info >> 4;
             let y = ch.info & 0x0F;
+            // Snapshot the note volume before this tick's effects. Any
+            // change (SDx-deferred trigger, Dxy/Kxy/Lxy slide, Qxy
+            // retrigger modifier, Rxy tremolo, Ixy tremor) re-latches the
+            // voice's global volume to `global_vol_now`.
+            let vol_before_tick = ch.volume;
 
             // SDx (note delay): fire the stashed trigger at tick x.
             if let Some(pd) = ch.pending_delay {
@@ -1473,6 +1531,12 @@ impl PlayerState {
                             let v = clamp_pcm_volume(samples_snapshot[idx - 1].1 as u16);
                             ch.volume = v;
                             ch.stored_volume = v;
+                            // SDx-deferred instrument reload fires on tick x
+                            // (>= 1), so `global_vol_now` is the post-Vxx
+                            // value — the delayed note correctly picks up a
+                            // same-row Vxx, per §Vxx "applied to notes ...
+                            // that have a note delay (SDx with x >= 1)".
+                            ch.voice_global_vol = global_vol_now;
                         }
                     }
                     if pd.note == 0xFE {
@@ -1507,6 +1571,10 @@ impl PlayerState {
                         let v = clamp_pcm_volume(pd.volume as u16);
                         ch.volume = v;
                         ch.stored_volume = v;
+                        // SDx-deferred volume-column write re-latches the
+                        // (post-Vxx) global volume; see the deferred
+                        // instrument-reload branch above.
+                        ch.voice_global_vol = global_vol_now;
                     }
                     ch.pending_delay = None;
                 }
@@ -1629,6 +1697,13 @@ impl PlayerState {
                     Self::clamp_amiga(ch, amiga_limits);
                 }
                 _ => {}
+            }
+
+            // Re-latch the voice global volume if this tick changed the
+            // note volume (§Vxx: a same-row Vxx reaches any voice whose
+            // volume is updated on a later tick).
+            if ch.volume != vol_before_tick {
+                ch.voice_global_vol = global_vol_now;
             }
         }
     }
@@ -2061,6 +2136,19 @@ impl PlayerState {
         // ceiling of an unmodified ST3 PCM channel.
         let v = (ch.volume.min(PCM_VOLUME_PEAK) as f32) / 64.0;
 
+        // Per-voice global volume. Unlike the channel volume, this is the
+        // *global* volume that was live the last time this voice's note
+        // volume was written (see [`Channel::voice_global_vol`]). Applying
+        // it here — rather than as a single player-wide scalar at the
+        // mix-down step — is what makes a Vxx between two notes affect only
+        // the voices whose volume changed after it, per the multimedia.cx
+        // §Vxx rule "It does not affect past notes, that are still playing,
+        // unless their volume is changed". The divisor is 64 (global volume
+        // is a 0..=64 quantity), so a voice latched at the default 64 plays
+        // at unity.
+        let gv = (ch.voice_global_vol.min(64) as f32) / 64.0;
+        let v = v * gv;
+
         // Advance position.
         let step = (ch.frequency as f64) / (out_rate as f64);
         ch.sample_pos += step;
@@ -2106,9 +2194,11 @@ impl PlayerState {
         } else {
             mv_raw
         };
-        let gv = (self.global_volume as f32) / 64.0;
+        // Global volume is applied per-voice inside `mix_channel` (each
+        // voice carries the global volume latched at its last volume write,
+        // per §Vxx), so it is *not* re-applied here.
         let norm = (self.active_channels as f32).max(1.0).sqrt();
-        let scale = mv * gv / norm;
+        let scale = mv / norm;
         l = (l * scale).clamp(-1.0, 1.0);
         r = (r * scale).clamp(-1.0, 1.0);
         out[0] = (l * 32767.0) as i16;
@@ -2136,8 +2226,9 @@ impl PlayerState {
         } else {
             mv_raw
         };
-        let gv = (self.global_volume as f32) / 64.0;
-        let scale = mv * gv;
+        // Global volume is applied per-voice inside `mix_channel`; not
+        // re-applied here (see `render_one`).
+        let scale = mv;
         for (i, ch) in self.channels.iter_mut().enumerate() {
             let (cl, cr) = Self::mix_channel(ch, &self.samples, out_rate);
             let l = (cl * scale).clamp(-1.0, 1.0);
@@ -3849,6 +3940,374 @@ pub mod tests {
         assert_eq!(
             p.global_volume, 0x30,
             "row 1's empty cell must NOT touch the global volume"
+        );
+    }
+
+    // ----- Per-voice latched global volume (§Vxx) ---------------------
+    //
+    // §Vxx (multimedia.cx behavioural reference):
+    //   "It does not affect past notes, that are still playing, unless
+    //    their volume is changed, which applies the new global volume to
+    //    that voice."
+    // The player models this with a per-voice `voice_global_vol` latch: a
+    // note trigger / volume write captures the global volume live at that
+    // moment; a Vxx change updates the player-wide global volume but does
+    // NOT retroactively re-latch already-playing voices. The mixer scales
+    // each voice by its own latched value.
+
+    /// Build a one-PCM-channel player whose pattern is supplied by the
+    /// caller, with a non-trivial instrument default volume so triggers
+    /// are observable. `global_volume` starts at 64 (unity).
+    fn voice_gv_player(rows: Vec<[Cell; 32]>) -> PlayerState {
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.initial_speed = 6;
+        h.initial_tempo = 125;
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let n = rows.len().max(1);
+        let mut pat = Pattern::empty(1);
+        for (i, row) in rows.into_iter().enumerate() {
+            pat.rows[i] = row.to_vec();
+        }
+        // A 32-frame constant PCM sample with default volume 40 so an
+        // instrument reload writes an observable stored volume.
+        let sample = SampleBody {
+            pcm: vec![0x4000i16; 64],
+            pcm_right: None,
+            loop_start: 0,
+            loop_end: 0,
+            looped: false,
+            volume: 40,
+            c5_speed: 8363,
+        };
+        let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
+        // Keep the harness from running off the synthesized pattern.
+        p.order = vec![0u8; n.max(1)];
+        p
+    }
+
+    fn note_cell(note: u8) -> Cell {
+        Cell {
+            note,
+            instrument: 1,
+            volume: 0xFF,
+            command: 0,
+            info: 0,
+        }
+    }
+
+    fn vxx_cell(param: u8) -> Cell {
+        Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::V_GLOBAL_VOL,
+            info: param,
+        }
+    }
+
+    /// Drive a full row: tick 0 (`enter_row`) then ticks `1..speed`
+    /// (`apply_per_tick`), then advance the row pointer like `render` does.
+    fn play_full_row(p: &mut PlayerState) {
+        p.tick = 0;
+        p.enter_row();
+        for t in 1..p.speed {
+            p.tick = t;
+            p.apply_per_tick();
+        }
+        p.tick = 0;
+        p.next_row();
+    }
+
+    #[test]
+    fn note_trigger_latches_current_global_volume() {
+        // A fresh note latches the global volume live at trigger time.
+        let empty = [Cell::EMPTY; 32];
+        let mut r0 = empty;
+        r0[0] = note_cell(0x40); // C-5
+        let p_rows = vec![r0, empty];
+        let mut p = voice_gv_player(p_rows);
+        p.global_volume = 50;
+        p.channels[0].voice_global_vol = 64; // stale; must be overwritten
+        play_full_row(&mut p);
+        assert_eq!(
+            p.channels[0].voice_global_vol, 50,
+            "note trigger must latch the global volume live at tick 0"
+        );
+    }
+
+    #[test]
+    fn vxx_does_not_retroactively_change_a_held_voice() {
+        // Row 0 triggers a note (latches GV=64). Row 1 carries only a Vxx
+        // dropping the global volume — the still-playing voice from row 0
+        // must KEEP its latched 64, not pick up the new value.
+        let empty = [Cell::EMPTY; 32];
+        let mut r0 = empty;
+        r0[0] = note_cell(0x40);
+        let mut r1 = empty;
+        r1[0] = vxx_cell(0x10); // global volume -> 16
+        let mut r2 = empty;
+        r2[0] = Cell::EMPTY;
+        let mut p = voice_gv_player(vec![r0, r1, r2]);
+
+        play_full_row(&mut p); // row 0: trigger
+        assert_eq!(p.channels[0].voice_global_vol, 64);
+        assert!(p.channels[0].active);
+
+        play_full_row(&mut p); // row 1: Vxx 0x10, no new note
+        assert_eq!(
+            p.global_volume, 0x10,
+            "player-wide global volume must update on the Vxx row"
+        );
+        assert_eq!(
+            p.channels[0].voice_global_vol, 64,
+            "a held voice must NOT be retroactively rescaled by Vxx"
+        );
+    }
+
+    #[test]
+    fn note_after_vxx_picks_up_the_new_global_volume() {
+        // Row 0: note (latch 64). Row 1: Vxx -> 16. Row 2: a NEW note must
+        // latch the now-current global volume (16), even though its
+        // numeric channel volume (instrument default 40) is unchanged from
+        // the row-0 trigger — the latch is unconditional on a trigger.
+        let empty = [Cell::EMPTY; 32];
+        let mut r0 = empty;
+        r0[0] = note_cell(0x40);
+        let mut r1 = empty;
+        r1[0] = vxx_cell(0x10);
+        let mut r2 = empty;
+        r2[0] = note_cell(0x40); // same note + instrument as row 0
+        let mut p = voice_gv_player(vec![r0, r1, r2]);
+
+        play_full_row(&mut p); // row 0
+        play_full_row(&mut p); // row 1 (Vxx)
+        assert_eq!(p.global_volume, 0x10);
+        play_full_row(&mut p); // row 2 (re-trigger)
+        assert_eq!(
+            p.channels[0].voice_global_vol, 0x10,
+            "a note re-triggered after a Vxx must latch the new global volume \
+             even when its numeric channel volume is unchanged"
+        );
+    }
+
+    #[test]
+    fn volume_column_after_vxx_relatches() {
+        // §Vxx "unless their volume is changed": a held voice that gets an
+        // explicit volume-column write on a later row re-latches the
+        // (by-then current) global volume.
+        let empty = [Cell::EMPTY; 32];
+        let mut r0 = empty;
+        r0[0] = note_cell(0x40); // latch 64
+        let mut r1 = empty;
+        r1[0] = vxx_cell(0x20); // GV -> 32
+        let mut r2 = empty;
+        r2[0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 30, // volume-column write, no new note
+            command: 0,
+            info: 0,
+        };
+        let mut p = voice_gv_player(vec![r0, r1, r2]);
+        play_full_row(&mut p); // row 0
+        play_full_row(&mut p); // row 1
+        assert_eq!(p.channels[0].voice_global_vol, 64);
+        play_full_row(&mut p); // row 2: volume column
+        assert_eq!(
+            p.channels[0].voice_global_vol, 0x20,
+            "a volume-column write re-latches the current global volume"
+        );
+        assert_eq!(p.channels[0].volume, 30);
+    }
+
+    #[test]
+    fn dxy_slide_after_vxx_relatches_voice() {
+        // §Vxx: a Vxx "is also applied on the same row if anything updates
+        // the note volume on tick 1 or tick 2 ... like the Dxx effect
+        // (when doing a non-fine slide)". A held voice running a Dxy slide
+        // on the same row as a Vxx re-latches the new global volume because
+        // the slide changes the active volume on a later tick.
+        let empty = [Cell::EMPTY; 32];
+        let mut r0 = empty;
+        r0[0] = note_cell(0x40); // latch 64, volume 40
+        let mut r1 = empty;
+        // Same row: Vxx is global so only one channel carries it; put the
+        // Dxy on the same channel after the GV has been raised on a prior
+        // row. Use two rows to keep the single-channel model clean:
+        //   row 1: Vxx -> 16
+        //   row 2: D01 (slide down by 1 on nonzero ticks)
+        r1[0] = vxx_cell(0x10);
+        let mut r2 = empty;
+        r2[0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::D_VOL_SLIDE,
+            info: 0x01, // D01: slide down 1 per nonzero tick
+        };
+        let mut p = voice_gv_player(vec![r0, r1, r2]);
+        play_full_row(&mut p); // row 0 trigger
+        play_full_row(&mut p); // row 1 Vxx
+        assert_eq!(p.channels[0].voice_global_vol, 64);
+        play_full_row(&mut p); // row 2: D01 changes active volume
+        assert!(
+            p.channels[0].volume < 40,
+            "D01 must have lowered the active volume"
+        );
+        assert_eq!(
+            p.channels[0].voice_global_vol, 0x10,
+            "a volume slide re-latches the current global volume onto the voice"
+        );
+    }
+
+    #[test]
+    fn untouched_voice_keeps_old_gv_while_sibling_relatches() {
+        // Two channels: ch0 holds a note untouched across a Vxx; ch1
+        // re-triggers after the Vxx. Only ch1 must pick up the new GV.
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.channels[1] = 1;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.muted[1] = false;
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.initial_speed = 6;
+        h.initial_tempo = 125;
+        h.enabled_channels = 2;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(32);
+        // Row 0: both channels trigger (latch 64).
+        pat.rows[0][0] = note_cell(0x40);
+        pat.rows[0][1] = note_cell(0x40);
+        // Row 1: Vxx on ch0 drops GV. ch0's note keeps playing untouched;
+        // ch1's note also keeps playing untouched.
+        pat.rows[1][0] = vxx_cell(0x18);
+        // Row 2: ch1 re-triggers (on a *later* row, after the Vxx drained),
+        // so it must pick up the new global volume. ch0 stays untouched.
+        pat.rows[2][1] = note_cell(0x41);
+        let sample = SampleBody {
+            pcm: vec![0x4000i16; 64],
+            pcm_right: None,
+            loop_start: 0,
+            loop_end: 0,
+            looped: false,
+            volume: 40,
+            c5_speed: 8363,
+        };
+        let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
+        p.order = vec![0u8, 0u8];
+
+        play_full_row(&mut p); // row 0
+        assert_eq!(p.channels[0].voice_global_vol, 64);
+        assert_eq!(p.channels[1].voice_global_vol, 64);
+        play_full_row(&mut p); // row 1: Vxx (no trigger)
+        assert_eq!(p.global_volume, 0x18);
+        assert_eq!(
+            p.channels[0].voice_global_vol, 64,
+            "the untouched held voice keeps its old global volume"
+        );
+        assert_eq!(
+            p.channels[1].voice_global_vol, 64,
+            "a held voice not retriggered on the Vxx row keeps its old GV"
+        );
+        play_full_row(&mut p); // row 2: ch1 re-triggers
+        assert_eq!(
+            p.channels[0].voice_global_vol, 64,
+            "ch0, still untouched, must keep its old global volume"
+        );
+        assert_eq!(
+            p.channels[1].voice_global_vol, 0x18,
+            "ch1, re-triggered after the Vxx, latches the new global volume"
+        );
+    }
+
+    #[test]
+    fn note_on_same_row_as_vxx_keeps_old_global_volume() {
+        // §Vxx "does not affect events on the same row, where the effect is
+        // set". A note triggered on the *same* row as a Vxx keeps the
+        // pre-Vxx global volume — the Vxx only drains on tick 1, after the
+        // tick-0 trigger has already latched. This holds even though, in
+        // ST3's single-channel-per-slot model, the Vxx and the note may sit
+        // on the same channel.
+        let empty = [Cell::EMPTY; 32];
+        let mut r0 = empty;
+        // Same channel carries both a fresh note and the Vxx.
+        r0[0] = Cell {
+            note: 0x40,
+            instrument: 1,
+            volume: 0xFF,
+            command: cmd::V_GLOBAL_VOL,
+            info: 0x10, // GV -> 16 on tick 1
+        };
+        let mut p = voice_gv_player(vec![r0, empty]);
+        play_full_row(&mut p);
+        assert_eq!(p.global_volume, 0x10, "Vxx still drains on tick 1");
+        assert_eq!(
+            p.channels[0].voice_global_vol, 64,
+            "a same-row trigger keeps the pre-Vxx global volume"
+        );
+    }
+
+    #[test]
+    fn mixer_scales_by_per_voice_global_volume() {
+        // End-to-end: two identical voices differing only in their latched
+        // global volume produce proportional output amplitudes.
+        let mut h = synth_header();
+        h.stereo = false;
+        h.master_volume = 48;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [7u8; 32];
+        h.global_volume = 64;
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+        let sample = SampleBody {
+            pcm: vec![0x4000i16; 1024],
+            pcm_right: None,
+            loop_start: 0,
+            loop_end: 0,
+            looped: false,
+            volume: 64,
+            c5_speed: 8363,
+        };
+        let render_at = |gv: u8| -> i32 {
+            let mut p = PlayerState::new(&h, vec![sample.clone()], vec![Pattern::empty(1)], 44_100);
+            p.channels[0].instrument = 1;
+            p.channels[0].volume = 63;
+            p.channels[0].pan = 7;
+            p.channels[0].active = true;
+            p.channels[0].frequency = 8363.0;
+            p.channels[0].sample_pos = 0.0;
+            p.channels[0].voice_global_vol = gv;
+            let mut buf = [0i16; 2];
+            p.render_one(&mut buf);
+            (buf[0] as i32).abs() + (buf[1] as i32).abs()
+        };
+        let full = render_at(64);
+        let half = render_at(32);
+        assert!(full > 0);
+        // Half global volume should produce roughly half amplitude.
+        let ratio = half as f32 / full as f32;
+        assert!(
+            (ratio - 0.5).abs() < 0.05,
+            "voice at GV=32 should be ~half the GV=64 amplitude (got {ratio})"
         );
     }
 
