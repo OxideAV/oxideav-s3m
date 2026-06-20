@@ -87,7 +87,8 @@ re-emitting one is out of scope.
   offset, honouring the loop window on looped samples), `Qxy`
   (retrigger, with the full volume-modifier table), `Rxy` (tremolo),
   `Txx` (tempo), `Uxy` (fine vibrato), `Vxx` (global volume, with the
-  range / tick-1 / speed-1 quirks), `Xxx` (set pan), and the `Sxy`
+  range / tick-1 / speed-1 quirks **and the per-voice latch — see
+  below**), `Xxx` (set pan), and the `Sxy`
   family (`S1x` glissando, `S2x` finetune, `S3x`/`S4x` waveform select,
   `S80` pan, `SAx` legacy "old stereo control" — bank-keyed
   normal/reversed/center mapping (`SA0`/`SA2` keep the channel's L/R bank,
@@ -95,6 +96,24 @@ re-emitting one is out of scope.
   pattern loop, `SCx` note cut / freeze, `SDx` note delay, `SEx` pattern
   delay). `S0x` filter and
   `SFx` funkrepeat decode as no-ops (not implemented in ST3 itself).
+- **Per-voice global volume (`Vxx`)** — global volume is *latched into
+  each voice* at the moment its note volume was last written, not applied
+  as a single player-wide scalar at mix-down. Per the multimedia.cx
+  behavioural reference §Vxx ("It does not affect past notes, that are
+  still playing, unless their volume is changed, which applies the new
+  global volume to that voice"), a `Vxx` updates the player-wide global
+  volume but does **not** retroactively rescale voices that are already
+  sounding — only a note trigger, volume-column write, instrument reload
+  (including the `SDx`-deferred forms), or any active-volume effect
+  (`Dxy`/`Kxy`/`Lxy` slide, `Qxy` modifier, `Rxy` tremolo, `Ixy` tremor)
+  re-latches the global volume live at that write. The tick ordering
+  follows for free: a same-row trigger (tick 0) keeps the pre-`Vxx`
+  value because `Vxx` drains on tick 1, while an `SDx`-deferred trigger
+  or a later-tick volume slide picks up the post-`Vxx` value — matching
+  the §Vxx "applied to notes that have a note delay" and "applied if
+  anything updates the note volume on tick 1 or tick 2" clauses. The
+  mixer scales each voice by its own latched value in both the
+  mixed-stereo and per-channel render paths.
 - **Effect memory** — channels remember the latest nonzero parameter
   per command and substitute it back when a row carries the same
   command with parameter 0; `H` / `U` and the `Sxy` family share their
