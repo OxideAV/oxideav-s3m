@@ -5278,4 +5278,161 @@ pub mod tests {
             "the loop start row must survive a within-pattern loop-back"
         );
     }
+
+    /// Build a single-channel player carrying two distinct PCM instruments so
+    /// the note-vs-sample handling rules can be exercised. Instrument 1 has a
+    /// loud default volume + C5 8363; instrument 2 has a quieter default + a
+    /// different C5 so a sample swap is observable.
+    fn two_sample_player(cells: &[Cell]) -> PlayerState {
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.initial_speed = 6;
+        h.initial_tempo = 125;
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let mut pat = Pattern::empty(1);
+        for (row, cell) in cells.iter().enumerate() {
+            pat.rows[row][0] = *cell;
+        }
+        let s1 = SampleBody {
+            volume: 60,
+            c5_speed: 8363,
+            ..dummy_sample(4096)
+        };
+        let s2 = SampleBody {
+            volume: 20,
+            c5_speed: 16000,
+            ..dummy_sample(4096)
+        };
+        PlayerState::new(&h, vec![s1, s2], vec![pat], 44_100)
+    }
+
+    #[test]
+    fn note_without_instrument_retriggers_keeping_volume() {
+        // §"note/sample handling": "Note w/o sample results in retriggering
+        // the note without resetting the volume." A bare note (no instrument
+        // column) must reset the sample cursor to 0 (retrigger) yet preserve
+        // whatever active volume the channel already carried.
+        let cells = [
+            // Row 0: full trigger of instrument 1 (loads default volume 60).
+            Cell {
+                note: 0x40,
+                instrument: 1,
+                volume: 0xFF,
+                command: 0,
+                info: 0,
+            },
+            // Row 1: bare note, no instrument number.
+            Cell {
+                note: 0x48,
+                instrument: 0,
+                volume: 0xFF,
+                command: 0,
+                info: 0,
+            },
+        ];
+        let mut p = two_sample_player(&cells);
+        p.enter_row();
+        // Force a quieter live volume + advance the cursor so the retrigger /
+        // volume-preservation are both observable.
+        p.channels[0].volume = 30;
+        p.channels[0].sample_pos = 1234.0;
+
+        p.tick = 0;
+        p.row = 1;
+        p.enter_row();
+        assert_eq!(
+            p.channels[0].sample_pos, 0.0,
+            "a note with no instrument must retrigger (cursor → 0)"
+        );
+        assert_eq!(
+            p.channels[0].volume, 30,
+            "a note with no instrument must NOT reset the volume"
+        );
+        assert_eq!(
+            p.channels[0].instrument, 1,
+            "the instrument is unchanged by a bare note"
+        );
+    }
+
+    #[test]
+    fn instrument_without_note_swaps_sample_resets_volume_no_retrigger() {
+        // §"note/sample handling": "Sample w/o note results in resetting the
+        // volume and switching samples w/o retriggering the note." An
+        // instrument column with no note must (a) load the new sample's
+        // default volume, (b) swap the instrument index, and (c) leave the
+        // sample cursor where it was (no retrigger). The doc also notes the
+        // pitch is NOT reconverted, so the running frequency stays put.
+        let cells = [
+            // Row 0: full trigger of instrument 1.
+            Cell {
+                note: 0x40,
+                instrument: 1,
+                volume: 0xFF,
+                command: 0,
+                info: 0,
+            },
+            // Row 1: instrument 2 with NO note.
+            Cell {
+                note: 0xFF,
+                instrument: 2,
+                volume: 0xFF,
+                command: 0,
+                info: 0,
+            },
+        ];
+        let mut p = two_sample_player(&cells);
+        p.enter_row();
+        let freq_before = p.channels[0].frequency;
+        p.channels[0].sample_pos = 2048.0;
+
+        p.tick = 0;
+        p.row = 1;
+        p.enter_row();
+        assert_eq!(
+            p.channels[0].instrument, 2,
+            "an instrument with no note must switch the sample"
+        );
+        assert_eq!(
+            p.channels[0].volume, 20,
+            "an instrument with no note must reset to the new sample's default volume"
+        );
+        assert_eq!(
+            p.channels[0].sample_pos, 2048.0,
+            "an instrument with no note must NOT retrigger (cursor unchanged)"
+        );
+        assert_eq!(
+            p.channels[0].frequency, freq_before,
+            "an instrument swap with no note keeps the running pitch (no period reconvert)"
+        );
+    }
+
+    #[test]
+    fn instrument_without_note_on_an_off_channel_stays_off() {
+        // §"note/sample handling": "If the note is off, it will stay off — it
+        // will not retrigger." An instrument number with no note arriving on a
+        // channel that never sounded must not wake the voice.
+        let cells = [Cell {
+            note: 0xFF,
+            instrument: 2,
+            volume: 0xFF,
+            command: 0,
+            info: 0,
+        }];
+        let mut p = two_sample_player(&cells);
+        assert!(!p.channels[0].active, "channel starts inactive");
+        p.enter_row();
+        assert!(
+            !p.channels[0].active,
+            "an instrument with no note must not activate a silent channel"
+        );
+    }
 }
