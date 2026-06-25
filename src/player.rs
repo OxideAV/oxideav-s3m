@@ -685,6 +685,17 @@ pub struct PlayerState {
     /// loop state per pattern (globally, not per-channel).
     loop_start_row: u8,
     loop_count: Option<u8>,
+    /// The order-table playback position (`order_index`) whose pattern the
+    /// SBx loop state currently belongs to. Pattern-loop is **per-pattern**:
+    /// "you should not try looping back to a loop point in another pattern!
+    /// ... If you don't enter an SB0 command, the loop defaults to the
+    /// beginning of the pattern"
+    /// (`docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt` §SBx). When
+    /// playback advances to a different order slot, the loop start row resets
+    /// to 0 (the top of the new pattern) and any in-flight loop counter is
+    /// dropped, so a stale loop point can never bleed across the boundary.
+    /// `None` until the first row is entered.
+    loop_pattern_order: Option<u8>,
     /// SEx pattern delay: when non-zero we hold the current row, replaying
     /// all per-tick effects but not re-triggering notes. Decremented at
     /// the end of each row-cycle until zero.
@@ -803,6 +814,7 @@ impl PlayerState {
             pending_jump: None,
             loop_start_row: 0,
             loop_count: None,
+            loop_pattern_order: None,
             pattern_delay_remaining: 0,
             replaying_for_pattern_delay: false,
             pending_global_vol: None,
@@ -887,6 +899,23 @@ impl PlayerState {
             return;
         }
         let row_cells: Vec<Cell> = self.patterns[pat_idx].rows[self.row as usize].clone();
+
+        // Pattern-loop is scoped to a single pattern. When playback crosses
+        // into a different order slot (natural advance, Bxx, Cxx, or an order
+        // skip past a marker — `find_next_playable_order` has already settled
+        // `order_index` on the slot being played), reset the SBx loop start to
+        // the top of the new pattern and discard any in-flight loop counter —
+        // a loop point set in a previous pattern must never trigger a jump in
+        // this one, and an SBx with no preceding SB0 defaults to row 0
+        // (`docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt` §SBx).
+        // Keyed on `order_index` (the playback position), so a within-pattern
+        // SBx loop back to `loop_start_row` keeps its state.
+        let cur_order = self.order_index;
+        if self.loop_pattern_order != Some(cur_order) {
+            self.loop_pattern_order = Some(cur_order);
+            self.loop_start_row = 0;
+            self.loop_count = None;
+        }
 
         // Drop any Vxx stash left over from the previous row. A speed-1
         // row never reaches tick 1, so the per-tick drain misses it; we
@@ -5102,6 +5131,151 @@ pub mod tests {
             p.channels[0].pending_delay.map(|pd| pd.fire_tick),
             Some(3),
             "raw SD3 must stash the deferred trigger for tick 3"
+        );
+    }
+
+    /// Build a single-PCM-channel player from an explicit list of patterns and
+    /// an order table, so multi-pattern SBx (pattern-loop) scope can be
+    /// exercised directly.
+    fn multi_pattern_player(order: Vec<u8>, patterns: Vec<Pattern>) -> PlayerState {
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 0;
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.initial_speed = 6;
+        h.initial_tempo = 125;
+        h.enabled_channels = 1;
+        h.order = order;
+        let samples = vec![dummy_sample(4096)];
+        PlayerState::new(&h, samples, patterns, 44_100)
+    }
+
+    #[test]
+    fn pattern_loop_start_resets_at_pattern_boundary() {
+        // §SBx: "you should not try looping back to a loop point in another
+        // pattern! ... If you don't enter an SB0 command, the loop defaults to
+        // the beginning of the pattern."
+        //
+        // Pattern 0 sets a loop start at row 3 (SB0). We then advance into
+        // pattern 1, whose row 0 carries SB1 *without* a preceding SB0. The
+        // loop must default to the top of pattern 1 (row 0), NOT jump back to
+        // the stale row-3 start inherited from pattern 0.
+        let mut pat0 = Pattern::empty(1);
+        pat0.rows[3][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xB0, // SB0 — set loop start at row 3
+        };
+        let mut pat1 = Pattern::empty(1);
+        pat1.rows[0][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xB1, // SB1 — loop once, no prior SB0 this pattern
+        };
+        let mut p = multi_pattern_player(vec![0u8, 1u8], vec![pat0, pat1]);
+
+        // Drive pattern 0 up to and including row 3 so SB0 records row 3.
+        for r in 0..=3u8 {
+            p.tick = 0;
+            p.row = r;
+            p.enter_row();
+        }
+        assert_eq!(
+            p.loop_start_row, 3,
+            "pattern 0's SB0 must record the loop start at row 3"
+        );
+
+        // Move into pattern 1, row 0.
+        p.order_index = 1;
+        p.tick = 0;
+        p.row = 0;
+        p.enter_row();
+        // The boundary crossing must have reset the stale loop start to 0.
+        assert_eq!(
+            p.loop_start_row, 0,
+            "entering a new pattern must reset the loop start to row 0"
+        );
+        assert_eq!(
+            p.loop_pattern_order,
+            Some(1),
+            "loop scope must now be bound to the new order slot"
+        );
+
+        // SB1 on pattern 1 row 0 must loop back to row 0 of pattern 1, not to
+        // pattern 0's row 3.
+        let jump = p.pending_jump.expect("SB1 must arm a loop jump");
+        assert_eq!(
+            jump.order,
+            Some(1),
+            "loop stays within pattern 1's order slot"
+        );
+        assert_eq!(
+            jump.row, 0,
+            "loop target must default to the top of pattern 1"
+        );
+    }
+
+    #[test]
+    fn within_pattern_loop_keeps_its_start_row() {
+        // A within-pattern SBx loop must NOT have its loop start clobbered by
+        // the per-pattern reset: the reset only fires when `order_index`
+        // changes, and an SBx loop-back stays on the same order slot.
+        let mut pat0 = Pattern::empty(1);
+        pat0.rows[2][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xB0, // SB0 at row 2
+        };
+        pat0.rows[5][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xB2, // SB2 — loop back to row 2 twice
+        };
+        let mut p = multi_pattern_player(vec![0u8], vec![pat0]);
+
+        for r in 0..=2u8 {
+            p.tick = 0;
+            p.row = r;
+            p.enter_row();
+        }
+        assert_eq!(p.loop_start_row, 2, "SB0 records loop start at row 2");
+
+        // Row 5: SB2 fires; loop target must be the recorded row 2.
+        p.tick = 0;
+        p.row = 5;
+        p.enter_row();
+        let jump = p.pending_jump.expect("SB2 must arm a loop jump");
+        assert_eq!(jump.order, Some(0), "within-pattern loop stays on order 0");
+        assert_eq!(
+            jump.row, 2,
+            "within-pattern loop must honour the SB0 start row, not reset to 0"
+        );
+        // Re-entering row 2 on the *same* order slot must not wipe the count.
+        p.order_index = 0;
+        p.tick = 0;
+        p.row = 2;
+        p.enter_row();
+        assert_eq!(
+            p.loop_pattern_order,
+            Some(0),
+            "staying on the same order slot must not re-arm the per-pattern reset"
+        );
+        assert_eq!(
+            p.loop_start_row, 2,
+            "the loop start row must survive a within-pattern loop-back"
         );
     }
 }
