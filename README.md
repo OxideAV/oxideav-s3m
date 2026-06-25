@@ -93,8 +93,11 @@ re-emitting one is out of scope.
   `S80` pan, `SAx` legacy "old stereo control" — bank-keyed
   normal/reversed/center mapping (`SA0`/`SA2` keep the channel's L/R bank,
   `SA1`/`SA3` swap it, `SA4`–`SA7` centre, `SA8`–`SAF` no-op), `SBx`
-  pattern loop, `SCx` note cut / freeze, `SDx` note delay, `SEx` pattern
-  delay). `S0x` filter and
+  pattern loop (per-pattern scoped — the `SB0` loop start resets to the
+  top of the pattern at every pattern boundary, and an `SBx` with no
+  preceding `SB0` defaults to row 0, so a stale loop point can never
+  bleed across patterns), `SCx` note cut / freeze, `SDx` note delay,
+  `SEx` pattern delay). `S0x` filter and
   `SFx` funkrepeat decode as no-ops (not implemented in ST3 itself).
 - **Per-voice global volume (`Vxx`)** — global volume is *latched into
   each voice* at the moment its note volume was last written, not applied
