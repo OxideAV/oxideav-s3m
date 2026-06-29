@@ -89,8 +89,12 @@ re-emitting one is out of scope.
   `Txx` (tempo), `Uxy` (fine vibrato), `Vxx` (global volume, with the
   range / tick-1 / speed-1 quirks **and the per-voice latch — see
   below**), `Xxx` (set pan), and the `Sxy`
-  family (`S1x` glissando, `S2x` finetune, `S3x`/`S4x` waveform select,
-  `S80` pan, `SAx` legacy "old stereo control" — bank-keyed
+  family (`S1x` glissando, `S2x` finetune, `S3x`/`S4x` waveform select
+  (selectors 0/1/2 are sine/ramp-down/square; selector 3 "random"
+  reuses the sine table per FireLight §6.8/§6.15 `case 3: just use
+  sine`, matching ST3's never-shipped noise LFO),
+  `S80` pan, `SAx` legacy "old
+  stereo control" — bank-keyed
   normal/reversed/center mapping (`SA0`/`SA2` keep the channel's L/R bank,
   `SA1`/`SA3` swap it, `SA4`–`SA7` centre, `SA8`–`SAF` no-op), `SBx`
   pattern loop (per-pattern scoped — the `SB0` loop start resets to the

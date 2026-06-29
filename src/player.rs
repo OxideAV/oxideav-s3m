@@ -176,8 +176,14 @@ pub enum Waveform {
     RampDown,
     /// +max / -max square (no in-between values).
     Square,
-    /// Random sample-per-tick LFO. Implemented with a 32-bit LCG so the
-    /// output is reproducible across runs of the same module.
+    /// Waveform selector 3 ("random"). Per FireLight §6.8 / §6.15
+    /// (`docs/audio/trackers/s3m/FireLight-S3M-Player-Tutorial.txt`,
+    /// `case 3: delta = sintab[temp]; // random - just use sine.`), real
+    /// Scream Tracker 3 never implemented an actual noise LFO for waveform
+    /// 3 — it falls through to the sine table. We reproduce that behaviour
+    /// so a module carrying an `S33` / `S43` waveform-select plays the same
+    /// pitch / volume modulation ST3 itself produces, rather than audible
+    /// noise.
     Random,
 }
 
@@ -250,9 +256,6 @@ pub struct Channel {
     pub vibrato_waveform: Waveform,
     /// S4x: tremolo waveform for R volume vibrato.
     pub tremolo_waveform: Waveform,
-    /// Per-channel LFO state for the `Random` waveform. Updated lazily;
-    /// only stepped when a vibrato / tremolo tick samples it.
-    pub random_state: u32,
     /// Qxy retrigger tick counter. Incremented on every tick (including
     /// tick 0); when it reaches/exceeds the retrig value `y` the sample is
     /// retriggered and the counter resets to 0. Per the multimedia.cx
@@ -371,7 +374,6 @@ impl Default for Channel {
             glissando: false,
             vibrato_waveform: Waveform::Sine,
             tremolo_waveform: Waveform::Sine,
-            random_state: 0x1234_5678,
             retrig_counter: 0,
             tremor_on_counter: 0,
             tremor_off_counter: 0,
@@ -503,16 +505,20 @@ pub const PROTRACKER_SINE: [u8; 32] = [
 /// *shape* now tracks ST3's integer table exactly rather than an idealized
 /// floating-point sine.
 ///
-/// `Random` consumes one step of the channel's LCG. The LCG (Numerical
-/// Recipes' 32-bit ranqd1) is reproducible across runs and lets each
-/// channel keep its own independent noise without pulling rand crates.
-fn waveform_sample(wf: Waveform, pos: u8, rng: &mut u32) -> i32 {
+/// Waveform selector 3 (`Random`) is *not* a noise generator: per FireLight
+/// §6.8 / §6.15 (`case 3: delta = sintab[temp];`), Scream Tracker 3 reuses
+/// the sine table for it, so this function treats `Random` identically to
+/// `Sine`.
+fn waveform_sample(wf: Waveform, pos: u8) -> i32 {
     // Sign: positive half for the low 32 positions, negative half above.
     let negative = pos & 0x20 != 0;
     let idx = (pos & 0x1F) as usize;
     let magnitude: i32 = match wf {
         // Direct table lookup per FireLight §6.8 `case 0: delta = sintab[temp]`.
-        Waveform::Sine => PROTRACKER_SINE[idx] as i32,
+        // Waveform 3 ("random") falls through to the same sine table per
+        // FireLight §6.8 `case 3: delta = sintab[temp]; // random - just use
+        // sine.` — ST3 never shipped an actual noise LFO.
+        Waveform::Sine | Waveform::Random => PROTRACKER_SINE[idx] as i32,
         // Ramp down per FireLight §6.8 `case 1: temp <<= 3; if(vibpos<0)
         // temp = 255 - temp; delta = temp`. Within each half the magnitude
         // ramps `idx*8` (0..=248); the negative half mirrors it to 255-that.
@@ -527,14 +533,6 @@ fn waveform_sample(wf: Waveform, pos: u8, rng: &mut u32) -> i32 {
         // Square per FireLight §6.8 `case 2: delta = 255` — a constant
         // magnitude whose sign is supplied by the half-cycle below.
         Waveform::Square => 255,
-        Waveform::Random => {
-            // Numerical-recipes ranqd1: x' = 1664525 * x + 1013904223.
-            // FireLight §6.8 case 3 reuses the sine magnitude; we instead
-            // draw a fresh pseudo-random magnitude so the "random" waveform
-            // is genuinely noisy rather than a relabelled sine.
-            *rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (*rng >> 24) as i32
-        }
     };
     // Scale the 0..=255 native magnitude into the ±64 range used by the
     // depth math, then apply the half-cycle sign.
@@ -1778,7 +1776,7 @@ impl PlayerState {
         // pointer 4× too fast and quartering the vibrato period.)
         ch.vibrato_pos = ch.vibrato_pos.wrapping_add(speed * 4);
         let wf = ch.vibrato_waveform;
-        let s = waveform_sample(wf, ch.vibrato_pos >> 2, &mut ch.random_state);
+        let s = waveform_sample(wf, ch.vibrato_pos >> 2);
         let div = if fine { 512 } else { 128 };
         let delta = (s * depth as i32) / div;
         let mult = 2.0f32.powf(delta as f32 / 48.0);
@@ -1827,7 +1825,7 @@ impl PlayerState {
         }
         ch.tremolo_pos = ch.tremolo_pos.wrapping_add(speed * 4);
         let wf = ch.tremolo_waveform;
-        let s = waveform_sample(wf, ch.tremolo_pos >> 2, &mut ch.random_state);
+        let s = waveform_sample(wf, ch.tremolo_pos >> 2);
         // delta = (depth * value) / (max_amplitude * 2) with depth = y*4
         // and max_amplitude = 64 (our waveform_sample range).
         let delta = (depth as i32 * 4 * s) / 128;
@@ -2431,14 +2429,13 @@ pub mod tests {
 
     #[test]
     fn waveform_square_is_bipolar_constant() {
-        let mut rng = 0u32;
         // FireLight §6.8 `case 2: delta = 255`; the half-cycle supplies the
         // sign. 255/4 = 63 (capped to the ±64 range). First half (pos < 32)
         // → +63; second half → -63.
-        assert_eq!(waveform_sample(Waveform::Square, 0, &mut rng), 63);
-        assert_eq!(waveform_sample(Waveform::Square, 31, &mut rng), 63);
-        assert_eq!(waveform_sample(Waveform::Square, 32, &mut rng), -63);
-        assert_eq!(waveform_sample(Waveform::Square, 63, &mut rng), -63);
+        assert_eq!(waveform_sample(Waveform::Square, 0), 63);
+        assert_eq!(waveform_sample(Waveform::Square, 31), 63);
+        assert_eq!(waveform_sample(Waveform::Square, 32), -63);
+        assert_eq!(waveform_sample(Waveform::Square, 63), -63);
     }
 
     #[test]
@@ -2447,24 +2444,32 @@ pub mod tests {
         // Within the positive half the magnitude rises idx*8 (scaled /4);
         // the negative half mirrors it through 255 and flips the sign,
         // producing the documented descending ramp across the full cycle.
-        let mut rng = 0u32;
         // Positive half: 0, +16, +32, +62 at idx 0/8/16/31.
-        assert_eq!(waveform_sample(Waveform::RampDown, 0, &mut rng), 0);
-        assert_eq!(waveform_sample(Waveform::RampDown, 8, &mut rng), 16);
-        assert_eq!(waveform_sample(Waveform::RampDown, 16, &mut rng), 32);
-        assert_eq!(waveform_sample(Waveform::RampDown, 31, &mut rng), 62);
+        assert_eq!(waveform_sample(Waveform::RampDown, 0), 0);
+        assert_eq!(waveform_sample(Waveform::RampDown, 8), 16);
+        assert_eq!(waveform_sample(Waveform::RampDown, 16), 32);
+        assert_eq!(waveform_sample(Waveform::RampDown, 31), 62);
         // Negative half: -(255-idx*8)/4 → -63, -31, -1 at idx 0/16/31.
-        assert_eq!(waveform_sample(Waveform::RampDown, 32, &mut rng), -63);
-        assert_eq!(waveform_sample(Waveform::RampDown, 48, &mut rng), -31);
-        assert_eq!(waveform_sample(Waveform::RampDown, 63, &mut rng), -1);
+        assert_eq!(waveform_sample(Waveform::RampDown, 32), -63);
+        assert_eq!(waveform_sample(Waveform::RampDown, 48), -31);
+        assert_eq!(waveform_sample(Waveform::RampDown, 63), -1);
     }
 
     #[test]
-    fn waveform_random_changes_state() {
-        let mut rng = 0x1234_5678u32;
-        let initial = rng;
-        let _ = waveform_sample(Waveform::Random, 0, &mut rng);
-        assert_ne!(rng, initial, "random must advance the LCG");
+    fn waveform_random_falls_through_to_sine() {
+        // FireLight §6.8 / §6.15 `case 3: delta = sintab[temp]; // random -
+        // just use sine.` — ST3's waveform selector 3 is NOT a noise LFO; it
+        // reuses the sine table. Every table position must therefore match
+        // the Sine waveform exactly, across both half-cycles, so a module
+        // carrying `S33` / `S43` modulates pitch / volume identically to the
+        // default sine rather than producing audible noise.
+        for pos in 0u8..64 {
+            assert_eq!(
+                waveform_sample(Waveform::Random, pos),
+                waveform_sample(Waveform::Sine, pos),
+                "random waveform must alias the sine table at pos={pos}"
+            );
+        }
     }
 
     #[test]
@@ -2488,17 +2493,16 @@ pub mod tests {
 
     #[test]
     fn waveform_sine_uses_protracker_table_with_signed_pointer() {
-        let mut rng = 0u32;
         // Positive half (pos 0..=31): +sintab[pos]/4.
-        assert_eq!(waveform_sample(Waveform::Sine, 0, &mut rng), 0);
+        assert_eq!(waveform_sample(Waveform::Sine, 0), 0);
         // pos 16 → 255/4 = 63 (capped to the ±64 working range).
-        assert_eq!(waveform_sample(Waveform::Sine, 16, &mut rng), 63);
+        assert_eq!(waveform_sample(Waveform::Sine, 16), 63);
         // pos 1 → 24/4 = 6.
-        assert_eq!(waveform_sample(Waveform::Sine, 1, &mut rng), 6);
+        assert_eq!(waveform_sample(Waveform::Sine, 1), 6);
         // Negative half (pos 32..=63): -sintab[pos & 31]/4.
-        assert_eq!(waveform_sample(Waveform::Sine, 32, &mut rng), 0);
-        assert_eq!(waveform_sample(Waveform::Sine, 48, &mut rng), -63);
-        assert_eq!(waveform_sample(Waveform::Sine, 33, &mut rng), -6);
+        assert_eq!(waveform_sample(Waveform::Sine, 32), 0);
+        assert_eq!(waveform_sample(Waveform::Sine, 48), -63);
+        assert_eq!(waveform_sample(Waveform::Sine, 33), -6);
     }
 
     #[test]
