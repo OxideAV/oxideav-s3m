@@ -1,5 +1,7 @@
 # oxideav-s3m
 
+[![CI](https://github.com/OxideAV/oxideav-s3m/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-s3m/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-s3m.svg)](https://crates.io/crates/oxideav-s3m) [![docs.rs](https://docs.rs/oxideav-s3m/badge.svg)](https://docs.rs/oxideav-s3m) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Scream Tracker 3 Module (S3M) container + codec for oxideav.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
