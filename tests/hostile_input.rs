@@ -22,6 +22,7 @@
 //! below are frame-bounded so a module that legitimately loops forever (a
 //! self-jumping `Bxx`) still returns control.
 
+use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase};
 use oxideav_s3m::header::parse_header;
 use oxideav_s3m::pattern::unpack_all;
 use oxideav_s3m::player::PlayerState;
@@ -312,6 +313,43 @@ fn drive_pipeline(bytes: &[u8]) {
     }
 }
 
+/// Drive the *registered decoder* public API — the entry point real
+/// consumers use — over `bytes`: build each of the two S3M decoders, feed
+/// the whole blob as one packet, and pump `receive_frame` to EOF. A frame
+/// cap keeps a legitimately-looping module from spinning forever. Exercises
+/// the demuxer/decoder state machine (parse-in-`send_packet`, the
+/// `Playing`/`Done` transitions, and error propagation) that the direct
+/// `PlayerState` path skips.
+fn drive_decoder_api(bytes: &[u8]) {
+    let tb = TimeBase::new(1, OUT_RATE as i64);
+    for codec in ["s3m", "s3m_multichannel"] {
+        let mut reg = CodecRegistry::new();
+        oxideav_s3m::decoder::register(&mut reg);
+        let params = CodecParameters::audio(CodecId::new(codec));
+        let Ok(mut dec) = reg.first_decoder(&params) else {
+            continue;
+        };
+        let pkt = Packet::new(0, tb, bytes.to_vec());
+        // A malformed header makes `send_packet` return a typed error; that
+        // is the correct outcome, not a panic.
+        if dec.send_packet(&pkt).is_err() {
+            continue;
+        }
+        // A few frames are enough to cross the Playing -> Done transition and
+        // reach the second `receive_frame`; the deep audio path is already
+        // fuzzed by `drive_pipeline`, so keep this light for CI.
+        let mut frames = 0u32;
+        while let Ok(frame) = dec.receive_frame() {
+            if let Frame::Audio(_) = frame {
+                frames += 1;
+            }
+            if frames >= 3 {
+                break;
+            }
+        }
+    }
+}
+
 #[test]
 fn seed_module_decodes_cleanly() {
     // Sanity floor: the seed the corpora derive from must itself parse and
@@ -369,6 +407,55 @@ fn rich_module_truncation_prefixes_never_panic() {
     for len in 0..=m.len() {
         drive_pipeline(&m[..len]);
     }
+}
+
+#[test]
+fn registered_decoder_api_survives_truncation_and_mutation() {
+    // The consumer-facing path (CodecRegistry -> first_decoder ->
+    // send_packet -> receive_frame) must be as robust as the direct pipeline:
+    // truncations and byte-mutations of both seeds resolve to a typed error
+    // or a bounded, panic-free frame stream. The deep audio rendering is
+    // fuzzed exhaustively by `drive_pipeline`; here we keep the frame pump
+    // shallow and sample the truncation space so the state-machine coverage
+    // stays cheap.
+    for seed in [build_valid_module(), build_rich_module()] {
+        let mut len = 0;
+        while len <= seed.len() {
+            drive_decoder_api(&seed[..len]);
+            len += 8;
+        }
+    }
+
+    let mut rng = Rng::new(0x0A11CE5E_ED0DDBAD);
+    for seed in [build_valid_module(), build_rich_module()] {
+        for _ in 0..600 {
+            let mut m = seed.clone();
+            let mutations = 1 + rng.below(8);
+            for _ in 0..mutations {
+                let idx = rng.below(m.len() as u32) as usize;
+                m[idx] = rng.next_u32() as u8;
+            }
+            drive_decoder_api(&m);
+        }
+    }
+}
+
+#[test]
+fn decoder_rejects_a_second_packet() {
+    // The S3M decoder consumes the whole song as one packet; a second
+    // packet must produce a typed error rather than corrupt state or panic.
+    let m = build_valid_module();
+    let mut reg = CodecRegistry::new();
+    oxideav_s3m::decoder::register(&mut reg);
+    let params = CodecParameters::audio(CodecId::new("s3m"));
+    let mut dec = reg.first_decoder(&params).expect("s3m decoder");
+    let tb = TimeBase::new(1, OUT_RATE as i64);
+    dec.send_packet(&Packet::new(0, tb, m.clone()))
+        .expect("first packet accepted");
+    assert!(
+        dec.send_packet(&Packet::new(0, tb, m)).is_err(),
+        "a second packet must be rejected"
+    );
 }
 
 #[test]
