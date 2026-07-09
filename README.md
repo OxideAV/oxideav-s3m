@@ -137,6 +137,23 @@ re-emitting one is out of scope.
   master-volume stereo flag with the mono-mode centre override; the
   master-volume byte is clamped to `[16, 127]` with the `* 11/8` stereo
   multiplier; and active volume peaks at 63 (not 64) on the PCM path.
+- **Hostile-input hardening** — every byte of a `.s3m` is
+  attacker-controlled, so the whole pipeline (`parse_header` →
+  `extract_samples` → `unpack_all` → render, plus the registered
+  `CodecRegistry` decoder API) is fuzzed against truncation prefixes,
+  random buffers, and byte-mutations of both a minimal and a
+  feature-rich seed module. A corrupt effect-command byte outside the
+  `A`–`Z` range no longer indexes the effect-memory table out of bounds,
+  and a truncated true-stereo sample body is split at the declared
+  per-channel length so its left/right boundary matches the file's
+  intent. Malformed modules resolve to a typed error or a bounded, silent
+  render — never a panic, out-of-bounds read, or hang.
+- **Known format gaps** — the `DP30ADPCM` packed-sample format is left
+  as raw PCM because the format reference states no documentation exists
+  for how it works, and the same-row `Bxx` + `Cxx` (position-jump plus
+  pattern-break) combination is not specified by the staged references,
+  so its precedence is left as the last-cell-wins default rather than
+  guessed.
 
 ## Usage
 
