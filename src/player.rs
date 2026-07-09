@@ -980,12 +980,20 @@ impl PlayerState {
             // Effects that do NOT carry memory: A (speed), B/C (jumps), T,
             // V (global volume) — they get a fresh-row interpretation each
             // time and zero-arg is per-effect specified.
-            if ch.command != 0 {
-                let slot = effect_memory_slot(ch.command);
+            //
+            // The command byte comes straight out of the packed pattern, so a
+            // corrupt / hostile module can carry any value 1..=255. ST3's
+            // effect alphabet is A..Z (stored 1..=26); the memory table only
+            // has a slot per letter. A command outside that range is not a
+            // real effect — skip the memory recall (and the dispatch below
+            // falls through its `_ => {}` arm) rather than index the table out
+            // of bounds.
+            let slot = effect_memory_slot(ch.command) as usize;
+            if ch.command != 0 && slot < ch.effect_memory.len() {
                 if ch.info == 0 {
-                    ch.info = ch.effect_memory[slot as usize];
+                    ch.info = ch.effect_memory[slot];
                 } else {
-                    ch.effect_memory[slot as usize] = ch.info;
+                    ch.effect_memory[slot] = ch.info;
                 }
             }
             // Clear any leftover delayed trigger from a prior row.
@@ -2786,6 +2794,34 @@ pub mod tests {
         }
         let samples = vec![dummy_sample(4096)];
         PlayerState::new(&h, samples, vec![pat], 44_100)
+    }
+
+    #[test]
+    fn out_of_range_effect_command_does_not_index_memory_out_of_bounds() {
+        // The command byte is taken verbatim from the packed pattern, so a
+        // corrupt module can carry any value 1..=255. ST3's effect alphabet
+        // is A..Z (stored 1..=26) and the per-channel effect-memory table has
+        // exactly one slot per letter. A command byte above 26 (here 0x40)
+        // must be treated as "no effect" — the memory recall is skipped
+        // rather than indexing the 27-entry table out of bounds. Regression
+        // for a panic surfaced by the hostile-input mutation fuzzer.
+        let cells = [Cell {
+            note: 0x40,
+            instrument: 1,
+            volume: 0xFF,
+            command: 0x40, // 64 — far past the Z (26) ceiling.
+            info: 0x55,
+        }];
+        let mut p = porta_target_player(&cells);
+        let mut buf = vec![0i16; 4096];
+        // Must render without panicking; the out-of-range command is inert.
+        let produced = p.render(&mut buf);
+        assert!(produced > 0, "player should still render the note");
+        // The bogus command must not have written into any memory slot.
+        assert!(
+            p.channels[0].effect_memory.iter().all(|&v| v == 0),
+            "an out-of-range command must not populate effect memory"
+        );
     }
 
     #[test]
