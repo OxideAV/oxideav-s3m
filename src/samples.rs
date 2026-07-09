@@ -6,7 +6,9 @@
 //! - **8-bit unsigned** (FFI = 2 in the header, the ST3-standard format).
 //! - **8-bit signed** (FFI = 1 — rare, older tools).
 //! - **16-bit** (flag bit 2 set) — LE unsigned by convention.
-//! - **Stereo** (flag bit 1 set) — interleaved as left-then-right.
+//! - **Stereo** (flag bit 1 set) — block-sequential: the whole left
+//!   channel (`length` samples) is followed by the whole right channel,
+//!   not per-frame interleaved.
 //!
 //! We convert everything up to signed 16-bit. For mono samples `pcm_right`
 //! is `None` and mixing uses the single `pcm` buffer as both L and R. For
@@ -86,19 +88,25 @@ pub fn decode_instrument(inst: &Instrument, bytes: &[u8], signed_samples: bool) 
     // ST3 stereo sample layout: the full left block is followed by the
     // full right block (not interleaved per-frame). MemSeg gives the
     // start of the left block; the right block starts `length * bps`
-    // bytes later.
+    // bytes later — i.e. the split is at the *declared* per-channel length,
+    // not the number of complete stereo frames that happen to be present.
+    // Splitting at the declared length keeps the left/right boundary the
+    // file intended even when the sample body is truncated: the left block
+    // gets its full `length * bps` bytes (clamped to what exists) and the
+    // right block reads from `length * bps` onward. `raw` is already bounded
+    // to `length * bytes_per_frame`, so every `.min(raw.len())` below is the
+    // real end.
     let bps = if is_16 { 2 } else { 1 };
-    let frame_bytes_mono = bps;
-    let left_end = (actual_samples * frame_bytes_mono).min(raw.len());
+    let left_block_bytes = len * bps;
+    let left_end = left_block_bytes.min(raw.len());
     let left_raw = &raw[..left_end];
     let right_raw: &[u8] = if is_stereo {
-        let start = actual_samples * frame_bytes_mono;
-        let max_end = raw.len();
-        if start >= max_end {
+        let start = left_block_bytes.min(raw.len());
+        let end = (2 * left_block_bytes).min(raw.len());
+        if start >= end {
             &[]
         } else {
-            let len = (actual_samples * frame_bytes_mono).min(max_end - start);
-            &raw[start..start + len]
+            &raw[start..end]
         }
     } else {
         &[]
@@ -168,4 +176,173 @@ pub fn extract_samples(header: &S3mHeader, bytes: &[u8]) -> Vec<SampleBody> {
         .iter()
         .map(|i| decode_instrument(i, bytes, signed_samples))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::{
+        Instrument, INST_TYPE_PCM, SAMPLE_FLAG_16BIT, SAMPLE_FLAG_LOOP, SAMPLE_FLAG_STEREO,
+    };
+
+    /// Build a PCM instrument whose sample body sits at byte offset
+    /// `parapointer << 4` in the buffer, so the tests exercise the same
+    /// `sample_byte_offset()` path the real parser feeds `decode_instrument`.
+    fn pcm_instrument(parapointer: u32, length: u32, flags: u8) -> Instrument {
+        Instrument {
+            kind: INST_TYPE_PCM,
+            sample_parapointer: parapointer,
+            length,
+            flags,
+            volume: 40,
+            c5_speed: 8363,
+            ..Instrument::default()
+        }
+    }
+
+    /// Place `sample` bytes at the instrument's byte offset in a fresh buffer.
+    fn buffer_with_sample(parapointer: u32, sample: &[u8]) -> Vec<u8> {
+        let off = (parapointer as usize) << 4;
+        let mut buf = vec![0u8; off + sample.len()];
+        buf[off..off + sample.len()].copy_from_slice(sample);
+        buf
+    }
+
+    #[test]
+    fn empty_or_zero_length_instrument_yields_no_pcm_but_keeps_metadata() {
+        // A non-PCM (or zero-length) instrument must still surface its stored
+        // default volume and a floored c5 speed so a note that references it
+        // has a sane pitch/volume even though there's no audio to mix.
+        let mut inst = pcm_instrument(0x10, 0, 0);
+        inst.volume = 55;
+        inst.c5_speed = 0; // must floor to 1, never divide-by-zero downstream.
+        let body = decode_instrument(&inst, &[], false);
+        assert!(body.pcm.is_empty());
+        assert_eq!(body.volume, 55);
+        assert_eq!(body.c5_speed, 1);
+    }
+
+    #[test]
+    fn eight_bit_unsigned_uses_128_bias() {
+        // ST3-standard 8-bit PCM is unsigned: 0x80 is the zero crossing,
+        // 0x00 the negative peak, 0xFF just shy of the positive peak. Each
+        // byte maps to `(b - 128) * 256`.
+        let inst = pcm_instrument(0x10, 4, 0);
+        let buf = buffer_with_sample(0x10, &[0x80, 0x00, 0xFF, 0xC0]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![0, -32768, 32512, 16384]);
+        assert!(body.pcm_right.is_none());
+    }
+
+    #[test]
+    fn eight_bit_signed_selected_by_ffi_is_two_s_complement() {
+        // FFI = 1 flags signed samples: the byte is a raw two's-complement
+        // i8 scaled by 256 with no bias.
+        let inst = pcm_instrument(0x10, 4, 0);
+        let buf = buffer_with_sample(0x10, &[0x00, 0x7F, 0x80, 0xFF]);
+        let body = decode_instrument(&inst, &buf, true);
+        assert_eq!(body.pcm, vec![0, 32512, -32768, -256]);
+    }
+
+    #[test]
+    fn sixteen_bit_unsigned_uses_0x8000_bias() {
+        // 16-bit LE, unsigned convention: subtract 0x8000. 0x8000 → 0,
+        // 0x0000 → -32768, 0xFFFF → +32767.
+        let inst = pcm_instrument(0x10, 3, SAMPLE_FLAG_16BIT);
+        let buf = buffer_with_sample(0x10, &[0x00, 0x80, 0x00, 0x00, 0xFF, 0xFF]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![0, -32768, 32767]);
+    }
+
+    #[test]
+    fn sixteen_bit_signed_selected_by_ffi_is_raw_le() {
+        // With signed samples the 16-bit words are read as raw little-endian
+        // i16 without the 0x8000 bias.
+        let inst = pcm_instrument(0x10, 2, SAMPLE_FLAG_16BIT);
+        let buf = buffer_with_sample(0x10, &[0x00, 0x00, 0xFF, 0x7F]);
+        let body = decode_instrument(&inst, &buf, true);
+        assert_eq!(body.pcm, vec![0, 32767]);
+    }
+
+    #[test]
+    fn true_stereo_splits_left_then_right_blocks() {
+        // ST3 stereo layout is block-sequential, not per-frame interleaved:
+        // the whole left channel precedes the whole right channel. For an
+        // 8-bit stereo sample of length 3 the first 3 bytes are left, the
+        // next 3 are right.
+        let inst = pcm_instrument(0x10, 3, SAMPLE_FLAG_STEREO);
+        let buf = buffer_with_sample(0x10, &[0x80, 0xC0, 0x00, 0x80, 0x40, 0xFF]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![0, 16384, -32768]);
+        let right = body
+            .pcm_right
+            .expect("stereo sample must carry a right channel");
+        assert_eq!(right, vec![0, -16384, 32512]);
+    }
+
+    #[test]
+    fn stereo_with_truncated_right_block_pads_right_to_left_length() {
+        // A sample whose right block is cut short must still yield a right
+        // channel exactly as long as the left (zero-padded), so the mixer's
+        // single sample-position cursor can index both without bounds checks.
+        let inst = pcm_instrument(0x10, 4, SAMPLE_FLAG_STEREO);
+        // 4 left bytes + only 2 right bytes present.
+        let buf = buffer_with_sample(0x10, &[0x80, 0x81, 0x82, 0x83, 0x80, 0xFF]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm.len(), 4);
+        let right = body.pcm_right.expect("right channel present");
+        assert_eq!(right.len(), 4);
+        assert_eq!(&right[..2], &[0, 32512]);
+        assert_eq!(&right[2..], &[0, 0]); // padded tail
+    }
+
+    #[test]
+    fn loop_window_clamps_to_decoded_pcm_length() {
+        // A loop end past the actual decoded length must be clamped to it,
+        // and the `looped` flag only holds when the (clamped) window is
+        // non-empty. Here loop_end 999 clamps to 4 and the loop survives.
+        let mut inst = pcm_instrument(0x10, 4, SAMPLE_FLAG_LOOP);
+        inst.loop_start = 1;
+        inst.loop_end = 999;
+        let buf = buffer_with_sample(0x10, &[0x80, 0x90, 0xA0, 0xB0]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.loop_start, 1);
+        assert_eq!(body.loop_end, 4);
+        assert!(body.is_looped());
+        assert_eq!(body.loop_length(), 3);
+    }
+
+    #[test]
+    fn loop_flag_with_empty_window_is_not_looped() {
+        // loop_start >= loop_end after clamping means there's no window to
+        // loop over, so `is_looped` must report false even with the flag set.
+        let mut inst = pcm_instrument(0x10, 4, SAMPLE_FLAG_LOOP);
+        inst.loop_start = 3;
+        inst.loop_end = 2;
+        let buf = buffer_with_sample(0x10, &[0x80, 0x90, 0xA0, 0xB0]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert!(!body.is_looped());
+    }
+
+    #[test]
+    fn declared_length_beyond_buffer_decodes_only_available_frames() {
+        // A hostile length field that overruns the file must decode only the
+        // bytes that actually exist rather than reading past the buffer.
+        let inst = pcm_instrument(0x10, 1000, 0);
+        let buf = buffer_with_sample(0x10, &[0x80, 0x81, 0x82]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm.len(), 3);
+    }
+
+    #[test]
+    fn sample_offset_at_or_past_buffer_end_yields_empty_body() {
+        // A parapointer that lands at/after EOF has no readable bytes; the
+        // decoder returns an empty body while preserving volume / c5 speed.
+        let inst = pcm_instrument(0x40, 8, 0); // offset 0x400, buffer shorter
+        let buf = vec![0u8; 0x100];
+        let body = decode_instrument(&inst, &buf, false);
+        assert!(body.pcm.is_empty());
+        assert_eq!(body.volume, 40);
+        assert_eq!(body.c5_speed, 8363);
+    }
 }
