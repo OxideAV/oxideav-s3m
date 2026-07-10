@@ -544,6 +544,57 @@ fn random_buffers_never_panic() {
 }
 
 #[test]
+fn adpcm_random_bodies_decode_bounded() {
+    // Property-fuzz the DP30ADPCM depacker through the public
+    // `decode_instrument` path: random delta tables, packed streams,
+    // declared lengths (including lengths far past the buffer), offsets,
+    // and flag bytes. Invariants under all of it: never a panic, never
+    // more output samples than the declared length, every decoded point
+    // an exact signed-8-bit value scaled by 256, mono-only output, and a
+    // loop window clamped inside the decoded PCM.
+    use oxideav_s3m::header::{Instrument, INST_TYPE_PCM, PACK_DP30ADPCM};
+    use oxideav_s3m::samples::decode_instrument;
+    let mut rng = Rng::new(0xADCC_0DEC_5EED_0001);
+    for _ in 0..4000 {
+        let buf_len = rng.below(96) as usize;
+        let mut buf = vec![0u8; buf_len];
+        for byte in buf.iter_mut() {
+            *byte = rng.next_u32() as u8;
+        }
+        let length = match rng.below(4) {
+            0 => rng.below(16),           // shorter than the table region
+            1 => rng.below(200),          // around the buffer scale
+            2 => 0xFFFF,                  // maximal 16-bit declared length
+            _ => rng.below(u32::MAX / 8), // hostile huge
+        };
+        let inst = Instrument {
+            kind: INST_TYPE_PCM,
+            pack: PACK_DP30ADPCM,
+            sample_parapointer: rng.below(8),
+            length,
+            loop_start: rng.below(512),
+            loop_end: rng.below(512),
+            flags: rng.next_u32() as u8,
+            volume: 40,
+            c5_speed: 8363,
+            ..Instrument::default()
+        };
+        let body = decode_instrument(&inst, &buf, rng.below(2) == 0);
+        assert!(
+            body.pcm.len() <= length as usize,
+            "decoded {} samples for declared length {length}",
+            body.pcm.len()
+        );
+        assert!(body.pcm_right.is_none(), "packed samples are mono-only");
+        for &s in &body.pcm {
+            assert_eq!(s % 256, 0, "sample {s} is not a scaled signed-8-bit point");
+        }
+        assert!(body.loop_end as usize <= body.pcm.len());
+        assert!(body.loop_start <= body.loop_end || !body.looped);
+    }
+}
+
+#[test]
 fn byte_mutations_of_valid_module_never_panic() {
     // Take the known-good module and corrupt 1..=8 random bytes with random
     // values, many thousands of times. This is the corpus most likely to
