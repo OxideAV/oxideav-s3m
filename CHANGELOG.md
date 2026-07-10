@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `DP30ADPCM` packed-sample decode (instrument pack byte = 1): a 16-entry signed-8-bit delta lookup table followed by one 4-bit code per output sample, low nibble first, accumulated into a wrapping signed-8-bit value (staged doc §Part 2, `s3m-position-jump-pattern-break-and-adpcm.md` — the official ST3 references only name the flag). The depacker bounds its read to the bytes present, drops the odd-length padding nibble, and decodes hostile pack=1 bodies carrying 16-bit/stereo flag bits as the documented 8-bit mono layout; `PACK_UNPACKED` / `PACK_DP30ADPCM` constants exported from `header`
+
 ### Other
 
 - Bxx + Cxx on the same row now merge: the target order comes from the (right-most) Bxx and the target row from the (right-most valid) Cxx, regardless of which channel carries which — previously the two overwrote each other last-cell-wins, so a later Bxx discarded an earlier Cxx's row. A Cxx targeting row >= 64 stays ignored and no longer clobbers a valid same-row Cxx to its left (staged doc §Part 1, `s3m-position-jump-pattern-break-and-adpcm.md`)

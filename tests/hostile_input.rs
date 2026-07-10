@@ -156,21 +156,22 @@ fn pack_pattern(rows: &[&[PatCell]]) -> Vec<u8> {
 
 /// Build a feature-rich but valid module: four channels (two left / two
 /// right PCM), one looped 8-bit mono instrument, one true-stereo 16-bit
-/// instrument, an explicit 32-byte pan block, Amiga-limits + fast-slides
-/// flags, an order table carrying a `0xFE` marker, and two patterns whose
-/// rows spread vibrato / porta / arpeggio / retrigger / tremolo / tremor /
+/// instrument, one `DP30ADPCM` delta-packed instrument (pack byte = 1),
+/// an explicit 32-byte pan block, Amiga-limits + fast-slides flags, an
+/// order table carrying a `0xFE` marker, and two patterns whose rows
+/// spread vibrato / porta / arpeggio / retrigger / tremolo / tremor /
 /// combined-slide / sample-offset / extended / global-volume / tempo /
-/// pattern-break effects across the channels. Fuzzing mutations of this
-/// exercises the stereo sample decoder, the pan-block parser, the Amiga
-/// clamp, and every per-tick effect kernel — far deeper than the minimal
-/// seed reaches.
+/// same-row position-jump + pattern-break effects across the channels.
+/// Fuzzing mutations of this exercises the stereo sample decoder, the
+/// ADPCM depacker, the pan-block parser, the Amiga clamp, and every
+/// per-tick effect kernel — far deeper than the minimal seed reaches.
 fn build_rich_module() -> Vec<u8> {
     let mut b = vec![0u8; 0x60];
     put(&mut b, 0x00, b"RICH-SEED");
     b[0x1C] = 0x1A;
     b[0x1D] = 0x10;
     put(&mut b, 0x20, &4u16.to_le_bytes()); // ord_num
-    put(&mut b, 0x22, &2u16.to_le_bytes()); // ins_num
+    put(&mut b, 0x22, &3u16.to_le_bytes()); // ins_num
     put(&mut b, 0x24, &2u16.to_le_bytes()); // pat_num
     put(&mut b, 0x26, &((1u16 << 4) | (1u16 << 6)).to_le_bytes()); // Amiga + fast slides
     put(&mut b, 0x28, &0x1320u16.to_le_bytes());
@@ -192,12 +193,13 @@ fn build_rich_module() -> Vec<u8> {
     put(&mut b, 0x60, &[0x00, 0xFE, 0x01, 0xFF]); // order: pat0, marker, pat1, end
     put(&mut b, 0x64, &0x0010u16.to_le_bytes()); // inst1 → 0x100
     put(&mut b, 0x66, &0x0018u16.to_le_bytes()); // inst2 → 0x180
-    put(&mut b, 0x68, &0x0040u16.to_le_bytes()); // pat0 → 0x400
-    put(&mut b, 0x6A, &0x0050u16.to_le_bytes()); // pat1 → 0x500
-                                                 // Pan block at 0x6C: bit 5 set + explicit low nibble on every channel.
-    b.resize(0x6C + 32, 0);
+    put(&mut b, 0x68, &0x001Du16.to_le_bytes()); // inst3 → 0x1D0
+    put(&mut b, 0x6A, &0x0040u16.to_le_bytes()); // pat0 → 0x400
+    put(&mut b, 0x6C, &0x0050u16.to_le_bytes()); // pat1 → 0x500
+                                                 // Pan block at 0x6E: bit 5 set + explicit low nibble on every channel.
+    b.resize(0x6E + 32, 0);
     for i in 0..32 {
-        b[0x6C + i] = 0x20 | ((i as u8 * 3) & 0x0F);
+        b[0x6E + i] = 0x20 | ((i as u8 * 3) & 0x0F);
     }
 
     // Instrument 1 — looped 8-bit mono, length 32, loop [8, 24).
@@ -224,6 +226,17 @@ fn build_rich_module() -> Vec<u8> {
     put(&mut b, i2 + 0x20, &8363u32.to_le_bytes());
     put(&mut b, i2 + 0x4C, b"SCRS");
 
+    // Instrument 3 — DP30ADPCM delta-packed (pack byte 1), 16 samples.
+    let i3 = 0x1D0;
+    b.resize(i3 + 80, 0);
+    b[i3] = 1;
+    put(&mut b, i3 + 0x0E, &0x0038u16.to_le_bytes()); // sample → 0x380
+    put(&mut b, i3 + 0x10, &16u32.to_le_bytes());
+    b[i3 + 0x1C] = 40;
+    b[i3 + 0x1E] = 1; // pack = DP30ADPCM
+    put(&mut b, i3 + 0x20, &8363u32.to_le_bytes());
+    put(&mut b, i3 + 0x4C, b"SCRS");
+
     // Sample 1 body (32 bytes) at 0x200.
     let s1 = 0x200;
     b.resize(s1 + 32, 0);
@@ -235,6 +248,14 @@ fn build_rich_module() -> Vec<u8> {
     b.resize(s2 + 48, 0);
     for i in 0..48 {
         b[s2 + i] = (i as u8).wrapping_mul(5).wrapping_add(3);
+    }
+    // Sample 3 body at 0x380: 16-byte ADPCM delta table (slot 1 = +2) then
+    // 8 packed bytes of nibble-code 1 pairs → a 2,4,…,32 ramp.
+    let s3 = 0x380;
+    b.resize(s3 + 24, 0);
+    b[s3 + 1] = 2; // table[1] = +2, all other deltas 0
+    for i in 0..8 {
+        b[s3 + 16 + i] = 0x11;
     }
 
     // Pattern 0 — spread effects across the four channels and four rows.
@@ -266,10 +287,17 @@ fn build_rich_module() -> Vec<u8> {
     ]);
     put(&mut b, 0x400, &pat0);
 
-    // Pattern 1 — a note then a pattern break.
+    // Pattern 1 — a note, the ADPCM instrument, then a same-row
+    // position-jump + pattern-break pair (order from B, row from C).
     let pat1 = pack_pattern(&[
-        &[(0, 0x44, 1, 0xFF, 0, 0)],
-        &[(0, 0xFF, 0, 0xFF, 3, 0x02)], // C02 break to row 2
+        &[
+            (0, 0x44, 1, 0xFF, 0, 0),
+            (1, 0x40, 3, 0xFF, 0, 0), // play the DP30ADPCM instrument
+        ],
+        &[
+            (0, 0xFF, 0, 0xFF, 3, 0x02), // C02 break to row 2 …
+            (1, 0xFF, 0, 0xFF, 2, 0x02), // … merged with B02 → order 2, row 2
+        ],
     ]);
     put(&mut b, 0x500, &pat1);
 
@@ -377,16 +405,21 @@ fn rich_module_decodes_cleanly() {
     // rather than only the early-error path.
     let m = build_rich_module();
     let header = parse_header(&m).expect("rich module must parse");
-    assert_eq!(header.ins_num, 2);
+    assert_eq!(header.ins_num, 3);
     assert_eq!(header.pat_num, 2);
     assert_eq!(header.enabled_channels, 4);
     let samples = extract_samples(&header, &m);
-    assert_eq!(samples.len(), 2);
+    assert_eq!(samples.len(), 3);
     assert_eq!(samples[0].pcm.len(), 32);
     assert!(samples[0].is_looped());
     // Instrument 2 is true stereo: both channel buffers populated.
     assert_eq!(samples[1].pcm.len(), 12);
     assert!(samples[1].pcm_right.is_some());
+    // Instrument 3 is DP30ADPCM-packed: the +2-delta nibble ramp must
+    // depack to 2, 4, …, 32 (scaled by 256) end-to-end from the file bytes.
+    let ramp: Vec<i16> = (1..=16).map(|i| i * 2 * 256).collect();
+    assert_eq!(samples[2].pcm, ramp);
+    assert!(samples[2].pcm_right.is_none());
     let patterns = unpack_all(&header, &m);
     let mut player = PlayerState::new(&header, samples, patterns, OUT_RATE);
     let mut buf = vec![0i16; 8192];

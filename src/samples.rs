@@ -9,13 +9,16 @@
 //! - **Stereo** (flag bit 1 set) — block-sequential: the whole left
 //!   channel (`length` samples) is followed by the whole right channel,
 //!   not per-frame interleaved.
+//! - **DP30ADPCM-packed** (pack byte = 1) — 4-bit delta-packed 8-bit mono
+//!   data: a 16-entry signed delta table followed by one nibble per output
+//!   sample, low nibble first (see `decode_dp30adpcm` for the layout).
 //!
 //! We convert everything up to signed 16-bit. For mono samples `pcm_right`
 //! is `None` and mixing uses the single `pcm` buffer as both L and R. For
 //! true stereo samples we decode both sides into `pcm` (left) and
 //! `pcm_right` (right) and the mixer routes them through the channel pan.
 
-use crate::header::{Instrument, S3mHeader};
+use crate::header::{Instrument, S3mHeader, PACK_DP30ADPCM};
 
 /// Decoded sample body ready for mixing.
 #[derive(Clone, Debug, Default)]
@@ -64,6 +67,37 @@ pub fn decode_instrument(inst: &Instrument, bytes: &[u8], signed_samples: bool) 
     }
     let off = inst.sample_byte_offset();
     let len = inst.length as usize;
+    if inst.pack == PACK_DP30ADPCM {
+        // DP30ADPCM (pack type 1): 4-bit delta-packed 8-bit samples. The
+        // packing is defined only for 8-bit mono data — there is no 16-bit
+        // or stereo variant — so a hostile pack=1 body carrying those flag
+        // bits is still decoded as the documented 8-bit mono layout. The
+        // FFI signed/unsigned convention likewise does not apply: the
+        // decoded stream is signed 8-bit by definition. Total packed size
+        // on disk = 16-byte delta table + one nibble per sample (rounded
+        // up), bounded to the bytes actually present
+        // (`docs/audio/trackers/s3m/
+        // s3m-position-jump-pattern-break-and-adpcm.md` §Part 2).
+        let needed = 16usize.saturating_add(len.div_ceil(2));
+        let end = off.saturating_add(needed).min(bytes.len());
+        let pcm = if off < end {
+            decode_dp30adpcm(&bytes[off..end], len)
+        } else {
+            Vec::new()
+        };
+        let loop_start = inst.loop_start.min(pcm.len() as u32);
+        let loop_end = inst.loop_end.min(pcm.len() as u32);
+        let looped = inst.is_looped() && loop_end > loop_start;
+        return SampleBody {
+            pcm,
+            pcm_right: None,
+            loop_start,
+            loop_end,
+            looped,
+            volume: inst.volume,
+            c5_speed: inst.c5_speed.max(1),
+        };
+    }
     let is_16 = inst.is_16bit();
     let is_stereo = inst.is_stereo();
     let bytes_per_frame = if is_16 { 2 } else { 1 } * if is_stereo { 2 } else { 1 };
@@ -165,6 +199,43 @@ pub fn decode_instrument(inst: &Instrument, bytes: &[u8], signed_samples: bool) 
         volume: inst.volume,
         c5_speed: inst.c5_speed.max(1),
     }
+}
+
+/// Decode a `DP30ADPCM` (pack type 1) sample body into signed-16-bit PCM.
+///
+/// Layout (`docs/audio/trackers/s3m/
+/// s3m-position-jump-pattern-break-and-adpcm.md` §Part 2):
+///
+/// ```text
+/// +0x00 .. +0x0F : int8 delta lookup table[16]
+/// +0x10 ..       : ceil(n / 2) packed bytes, two 4-bit codes per byte
+/// ```
+///
+/// Each nibble — **low nibble first, then high** — indexes the signed
+/// delta table; the delta accumulates into a signed 8-bit value that
+/// wraps on overflow, and the accumulator's value *after* each add is
+/// the next output sample. If `n` is odd the final byte's high nibble is
+/// padding and is not emitted. The decoded signed-8-bit points are scaled
+/// by 256 to match the crate's i16 mixing convention. A `raw` shorter
+/// than the 16-byte table yields no samples; a truncated packed block
+/// yields only the samples its bytes cover.
+fn decode_dp30adpcm(raw: &[u8], n: usize) -> Vec<i16> {
+    let Some(table) = raw.get(..16) else {
+        return Vec::new();
+    };
+    let packed = &raw[16..];
+    let mut out: Vec<i16> = Vec::with_capacity(n.min(packed.len().saturating_mul(2)));
+    let mut delta: i8 = 0;
+    'bytes: for &b in packed {
+        for code in [b & 0x0F, b >> 4] {
+            if out.len() >= n {
+                break 'bytes;
+            }
+            delta = delta.wrapping_add(table[code as usize] as i8);
+            out.push(delta as i16 * 256);
+        }
+    }
+    out
 }
 
 /// Decode every instrument's sample body.
@@ -332,6 +403,159 @@ mod tests {
         let buf = buffer_with_sample(0x10, &[0x80, 0x81, 0x82]);
         let body = decode_instrument(&inst, &buf, false);
         assert_eq!(body.pcm.len(), 3);
+    }
+
+    // ---- DP30ADPCM (pack type 1) — layout per
+    // `docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`
+    // §Part 2: 16-byte signed delta table, then two 4-bit codes per byte,
+    // low nibble first, accumulated into a wrapping signed-8-bit value.
+
+    /// A pack=1 PCM instrument at `parapointer << 4`.
+    fn adpcm_instrument(parapointer: u32, length: u32, flags: u8) -> Instrument {
+        let mut inst = pcm_instrument(parapointer, length, flags);
+        inst.pack = crate::header::PACK_DP30ADPCM;
+        inst
+    }
+
+    /// Build a packed DP30ADPCM body: the 16-entry signed delta table
+    /// followed by the packed nibble bytes.
+    fn adpcm_body(table: &[i8; 16], packed: &[u8]) -> Vec<u8> {
+        let mut body: Vec<u8> = table.iter().map(|&d| d as u8).collect();
+        body.extend_from_slice(packed);
+        body
+    }
+
+    #[test]
+    fn adpcm_worked_example_low_nibble_first_accumulation() {
+        // The staged doc's worked micro-example: table[1] = +4,
+        // table[15] = -1, packed bytes 0x11 0xF1 → samples 4, 8, 12, 11
+        // (low nibble of each byte decodes before the high nibble; a
+        // high-first reading would give 4, 8, 7, 11 instead).
+        let mut table = [0i8; 16];
+        table[1] = 4;
+        table[15] = -1;
+        let inst = adpcm_instrument(0x10, 4, 0);
+        let buf = buffer_with_sample(0x10, &adpcm_body(&table, &[0x11, 0xF1]));
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![4 * 256, 8 * 256, 12 * 256, 11 * 256]);
+        assert!(body.pcm_right.is_none());
+    }
+
+    #[test]
+    fn adpcm_odd_length_drops_the_padding_high_nibble() {
+        // N = 3 over the same two packed bytes: the final byte's high
+        // nibble is padding and must not be emitted.
+        let mut table = [0i8; 16];
+        table[1] = 4;
+        table[15] = -1;
+        let inst = adpcm_instrument(0x10, 3, 0);
+        let buf = buffer_with_sample(0x10, &adpcm_body(&table, &[0x11, 0xF1]));
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![4 * 256, 8 * 256, 12 * 256]);
+    }
+
+    #[test]
+    fn adpcm_accumulator_wraps_as_signed_8_bit() {
+        // The running delta is a plain wrapping int8: three +100 steps
+        // give 100, then 200 → wraps to -56, then -56 + 100 = 44.
+        let mut table = [0i8; 16];
+        table[2] = 100;
+        let inst = adpcm_instrument(0x10, 3, 0);
+        let buf = buffer_with_sample(0x10, &adpcm_body(&table, &[0x22, 0x02]));
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![100 * 256, -56 * 256, 44 * 256]);
+    }
+
+    #[test]
+    fn adpcm_truncated_packed_block_decodes_only_present_nibbles() {
+        // Length claims 8 samples (4 packed bytes) but only 2 packed
+        // bytes exist: the decode is bounded to the 4 nibbles present.
+        let mut table = [0i8; 16];
+        table[1] = 1;
+        let inst = adpcm_instrument(0x10, 8, 0);
+        let buf = buffer_with_sample(0x10, &adpcm_body(&table, &[0x11, 0x11]));
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![256, 512, 768, 1024]);
+    }
+
+    #[test]
+    fn adpcm_body_shorter_than_the_delta_table_yields_no_samples() {
+        // Fewer than 16 bytes cannot even hold the lookup table; the
+        // body decodes to silence while keeping the metadata.
+        let inst = adpcm_instrument(0x10, 4, 0);
+        let buf = buffer_with_sample(0x10, &[1, 2, 3, 4, 5]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert!(body.pcm.is_empty());
+        assert_eq!(body.volume, 40);
+        assert_eq!(body.c5_speed, 8363);
+    }
+
+    #[test]
+    fn adpcm_output_is_signed_regardless_of_ffi() {
+        // The packed stream is signed 8-bit by definition — the header's
+        // FFI signed/unsigned convention applies to raw PCM only, so both
+        // FFI readings must decode identically.
+        let mut table = [0i8; 16];
+        table[3] = -5;
+        let inst = adpcm_instrument(0x10, 2, 0);
+        let buf = buffer_with_sample(0x10, &adpcm_body(&table, &[0x33]));
+        let unsigned_ffi = decode_instrument(&inst, &buf, false);
+        let signed_ffi = decode_instrument(&inst, &buf, true);
+        assert_eq!(unsigned_ffi.pcm, vec![-5 * 256, -10 * 256]);
+        assert_eq!(unsigned_ffi.pcm, signed_ffi.pcm);
+    }
+
+    #[test]
+    fn adpcm_ignores_hostile_16bit_and_stereo_flags() {
+        // The packing is defined only for 8-bit mono data; a pack=1 body
+        // carrying the 16-bit / stereo flag bits still decodes as the
+        // documented layout — N mono samples, no right channel.
+        let mut table = [0i8; 16];
+        table[1] = 2;
+        let inst = adpcm_instrument(0x10, 4, SAMPLE_FLAG_16BIT | SAMPLE_FLAG_STEREO);
+        let buf = buffer_with_sample(0x10, &adpcm_body(&table, &[0x11, 0x11]));
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![512, 1024, 1536, 2048]);
+        assert!(body.pcm_right.is_none());
+    }
+
+    #[test]
+    fn adpcm_loop_window_clamps_to_decoded_length() {
+        // Loop points beyond the decoded sample count clamp exactly like
+        // the raw-PCM path so the mixer's loop wrap stays in bounds.
+        let mut table = [0i8; 16];
+        table[1] = 1;
+        let mut inst = adpcm_instrument(0x10, 4, SAMPLE_FLAG_LOOP);
+        inst.loop_start = 1;
+        inst.loop_end = 999;
+        let buf = buffer_with_sample(0x10, &adpcm_body(&table, &[0x11, 0x11]));
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.loop_start, 1);
+        assert_eq!(body.loop_end, 4);
+        assert!(body.is_looped());
+    }
+
+    #[test]
+    fn adpcm_offset_past_buffer_end_yields_empty_body() {
+        // A parapointer landing at/after EOF has nothing to decode; the
+        // metadata-only body comes back exactly like the raw-PCM path.
+        let inst = adpcm_instrument(0x40, 8, 0);
+        let buf = vec![0u8; 0x100];
+        let body = decode_instrument(&inst, &buf, false);
+        assert!(body.pcm.is_empty());
+        assert_eq!(body.volume, 40);
+    }
+
+    #[test]
+    fn unknown_pack_values_fall_back_to_the_unpacked_path() {
+        // The spec names only pack 0 and 1; any other value is treated as
+        // unpacked raw PCM (the pre-existing behaviour for garbage bytes)
+        // rather than rejected, keeping hostile files playable-but-bounded.
+        let mut inst = pcm_instrument(0x10, 2, 0);
+        inst.pack = 0x7F;
+        let buf = buffer_with_sample(0x10, &[0x80, 0xC0]);
+        let body = decode_instrument(&inst, &buf, false);
+        assert_eq!(body.pcm, vec![0, 16384]);
     }
 
     #[test]

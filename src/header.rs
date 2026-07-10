@@ -180,6 +180,18 @@ pub const SAMPLE_FLAG_LOOP: u8 = 0x01;
 pub const SAMPLE_FLAG_STEREO: u8 = 0x02;
 pub const SAMPLE_FLAG_16BIT: u8 = 0x04;
 
+/// Pack-type values (byte 0x1E of the instrument header). The spec's
+/// sample-header table names exactly two: `0 = unpacked, 1 = DP30ADPCM
+/// packing (not used by ST3.01)`
+/// (`docs/audio/trackers/s3m/ScreamTracker-v3.20-s3m.txt`).
+pub const PACK_UNPACKED: u8 = 0;
+/// "DigiPlayer 3.0 ADPCM": a 4-bit delta packing — a 16-byte signed
+/// delta lookup table followed by one nibble per output sample. Layout
+/// documented in
+/// `docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`
+/// §Part 2 (the official ST3 references only name the flag).
+pub const PACK_DP30ADPCM: u8 = 1;
+
 /// An S3M instrument / sample definition (80 bytes in the file).
 #[derive(Clone, Debug, Default)]
 pub struct Instrument {
@@ -198,7 +210,8 @@ pub struct Instrument {
     pub loop_end: u32,
     /// Default volume 0..=64.
     pub volume: u8,
-    /// Packing scheme (should be 0 for uncompressed PCM).
+    /// Packing scheme: [`PACK_UNPACKED`] (raw PCM) or [`PACK_DP30ADPCM`]
+    /// (4-bit delta-packed, decoded by `samples::decode_instrument`).
     pub pack: u8,
     /// Flags: bit0 loop, bit1 stereo, bit2 16-bit.
     pub flags: u8,

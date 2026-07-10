@@ -45,7 +45,14 @@ re-emitting one is out of scope.
   ratios and the integer period truncation of real ST3 rather than a
   pure equal-tempered approximation.
 - **PCM instruments** — 8-bit signed/unsigned, 16-bit, mono and
-  true-stereo. The Length / Loop start / Loop end / C-frequency fields
+  true-stereo, plus **`DP30ADPCM` delta-packed samples** (pack byte = 1
+  in the instrument header): a 16-entry signed delta table followed by
+  one 4-bit code per output sample, low nibble first, accumulated into a
+  wrapping signed-8-bit value. The depacker bounds its read to the bytes
+  actually present, drops the odd-length padding nibble, and ignores the
+  (undefined-for-packed-data) 16-bit / stereo flag bits and the FFI
+  signedness convention — the decoded stream is signed 8-bit by
+  definition. The Length / Loop start / Loop end / C-frequency fields
   are each masked to their lower 16 bits, per the ST3 instrument-format
   reference. Looped voices wrap at `loop_end` (the half-open
   `[loop_start, loop_end)` window), never the physical PCM buffer
@@ -76,7 +83,13 @@ re-emitting one is out of scope.
   pattern delays stay consistent) but the mixer silences their output.
   AdLib slots without the flag are also reported as muted.
 - **Effects** — the full command set: `Axx` (speed), `Bxx` (pos jump),
-  `Cxx` (pattern break), `Dxy` volume slide (full case matrix including
+  `Cxx` (pattern break) — a same-row `Bxx` + `Cxx` pair **merges** into
+  "row `Cxx` (decimal) of the pattern at order `Bxx` (hex)" because the
+  two commands write independent target-order / target-row state; within
+  each variable the right-most channel's write wins, an out-of-range
+  `Cxx` (row ≥ 64) is ignored without disturbing an earlier valid one,
+  and `SBx` keeps its loop-back priority over the merged destination —
+  `Dxy` volume slide (full case matrix including
   the fine forms and the both-nibbles-nonzero quirk), `Exx` / `Fxx`
   pitch slides (with fine + extra-fine forms), `Gxx` (tone portamento,
   including the empty-note-targets-last-note rule), `Hxy` (vibrato — a
@@ -126,7 +139,11 @@ re-emitting one is out of scope.
 - **Effect memory** — channels remember the latest nonzero parameter
   per command and substitute it back when a row carries the same
   command with parameter 0; `H` / `U` and the `Sxy` family share their
-  slots.
+  slots. `Axx` / `Bxx` / `Cxy` / `Txx` / `Vxx` carry **no** memory (they
+  are unmarked in the effect-list reference): their zero parameters are
+  literal, so `A00` / `T00` are ignored per their own rules, `B00` jumps
+  to order 0, `C00` breaks to row 0, and `V00` silences the global
+  volume rather than recalling a stale parameter.
 - **Header-flag-driven playback modes** — fast slides (flag bit 6, or
   `CwtV == 0x1300`) and Amiga period limits (flag bit 4, clamping
   playback to the PAL Amiga period range `[113, 856]` across note
@@ -148,12 +165,16 @@ re-emitting one is out of scope.
   per-channel length so its left/right boundary matches the file's
   intent. Malformed modules resolve to a typed error or a bounded, silent
   render — never a panic, out-of-bounds read, or hang.
-- **Known format gaps** — the `DP30ADPCM` packed-sample format is left
-  as raw PCM because the format reference states no documentation exists
-  for how it works, and the same-row `Bxx` + `Cxx` (position-jump plus
-  pattern-break) combination is not specified by the staged references,
-  so its precedence is left as the last-cell-wins default rather than
-  guessed.
+- **Known format gaps** — AdLib playback awaits an OPL2
+  envelope-generator rate trace (see the OPL2 bullet above). The former
+  `DP30ADPCM` and same-row `Bxx`+`Cxx` gaps are closed: both are now
+  implemented from the staged clean-room note
+  (`docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`).
+  That note flags two residual unknowns it could not pin down — exact
+  ST3 multi-channel edge behaviour when a jump lands on the very last
+  order, and finer `SBx`-vs-jump interactions — for which this decoder
+  keeps its existing documented behaviour (order-table end ⇒ song end;
+  `SBx` loop-back overrides a same-row jump).
 
 ## Usage
 
