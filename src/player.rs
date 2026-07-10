@@ -166,6 +166,25 @@ fn effect_memory_slot(command: u8) -> u8 {
     }
 }
 
+/// Whether an effect participates in the per-channel "%"/"*" parameter
+/// memory. Per the multimedia.cx effect list
+/// (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`
+/// §Effects), only the effects marked `%` or `*` recall the latest
+/// nonzero parameter; Axx / Bxx / Cxy / Txx / Vxx carry no marker and
+/// take their infobyte literally every row — `A00` / `T00` are simply
+/// ignored per their own rules, `B00` jumps to order 0, `C00` breaks to
+/// row 0, and `V00` sets the global volume to 0.
+fn effect_uses_memory(command: u8) -> bool {
+    !matches!(
+        command,
+        cmd::A_SET_SPEED
+            | cmd::B_POS_JUMP
+            | cmd::C_PAT_BREAK
+            | cmd::T_SET_TEMPO
+            | cmd::V_GLOBAL_VOL
+    )
+}
+
 /// Vibrato / tremolo waveform selector (S3x / S4x parameter low nibble).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Waveform {
@@ -935,6 +954,17 @@ impl PlayerState {
         let mut row_speed: Option<u8> = None;
         let mut row_tempo: Option<u8> = None;
         let mut row_jump: Option<Jump> = None;
+        // Bxx / Cxx write two *independent* pieces of playback state — Bxx
+        // the target order, Cxx the target row — and ST3 merges them when
+        // both appear on one row: "jump to row Cxx (decimal) of the pattern
+        // at order Bxx (hex)". Within each variable it is last-writer-wins
+        // across the left-to-right channel scan, but a later Bxx must not
+        // discard an earlier Cxx's row (nor vice-versa) because they are
+        // different variables — channel order between the pair does not
+        // matter. See `docs/audio/trackers/s3m/
+        // s3m-position-jump-pattern-break-and-adpcm.md` §Part 1.
+        let mut jump_order: Option<u8> = None;
+        let mut jump_row: Option<u8> = None;
 
         let mut row_loop_request: Option<u8> = None;
         let mut row_pattern_delay: Option<u8> = None;
@@ -989,7 +1019,7 @@ impl PlayerState {
             // falls through its `_ => {}` arm) rather than index the table out
             // of bounds.
             let slot = effect_memory_slot(ch.command) as usize;
-            if ch.command != 0 && slot < ch.effect_memory.len() {
+            if ch.command != 0 && slot < ch.effect_memory.len() && effect_uses_memory(ch.command) {
                 if ch.info == 0 {
                     ch.info = ch.effect_memory[slot];
                 } else {
@@ -1198,21 +1228,21 @@ impl PlayerState {
                     row_speed = Some(ch.info);
                 }
                 cmd::B_POS_JUMP => {
-                    row_jump = Some(Jump {
-                        order: Some(ch.info),
-                        row: 0,
-                    });
+                    // Writes only the target *order* (hex infobyte). The
+                    // implicit row-0 destination of a bare Bxx comes from the
+                    // merge below (`jump_row` still `None` → row 0), so a
+                    // companion Cxx on the same row can override it.
+                    jump_order = Some(ch.info);
                 }
                 cmd::C_PAT_BREAK => {
-                    // Parameter is BCD (high nibble * 10 + low). Per the
-                    // multimedia.cx behavioural reference, an out-of-range
-                    // target (>= 64) makes ST3 ignore the effect entirely.
+                    // Writes only the target *row*. Parameter is BCD (high
+                    // nibble * 10 + low). Per the multimedia.cx behavioural
+                    // reference, an out-of-range target (>= 64) makes ST3
+                    // ignore the effect entirely — an earlier same-row Cxx
+                    // write survives an invalid later one.
                     let r = (ch.info >> 4) * 10 + (ch.info & 0x0F);
                     if r < 64 {
-                        row_jump = Some(Jump {
-                            order: None,
-                            row: r,
-                        });
+                        jump_row = Some(r);
                     }
                 }
                 cmd::D_VOL_SLIDE => {
@@ -1452,6 +1482,20 @@ impl PlayerState {
             // Held rows do not re-trigger anything but still walk through
             // the per-tick path for the rest of the row.
             return;
+        }
+
+        // Merge the row's Bxx / Cxx writes into one jump: order from the
+        // last Bxx (or "next order" when only a Cxx appeared → `None`),
+        // row from the last valid Cxx (or 0 when only a Bxx appeared).
+        // `B02`+`C16` therefore lands on order 02 row 16 regardless of
+        // which channel carried which command
+        // (`docs/audio/trackers/s3m/
+        // s3m-position-jump-pattern-break-and-adpcm.md` §Part 1).
+        if jump_order.is_some() || jump_row.is_some() {
+            row_jump = Some(Jump {
+                order: jump_order,
+                row: jump_row.unwrap_or(0),
+            });
         }
 
         // Resolve SBx (pattern loop) after the row is scanned. SB0 marks
@@ -5316,6 +5360,236 @@ pub mod tests {
         assert_eq!(
             p.loop_start_row, 2,
             "the loop start row must survive a within-pattern loop-back"
+        );
+    }
+
+    /// Build an 8-channel player whose pattern-0 row 0 carries the given
+    /// `(channel, command, info)` effect cells, so same-row Bxx / Cxx
+    /// channel precedence can be exercised. `order` is the order table.
+    fn bc_row_player(cells: &[(usize, u8, u8)], order: Vec<u8>) -> PlayerState {
+        let mut h = synth_header();
+        h.flags = 0;
+        h.tracker_version = 0x1320;
+        h.channels = [0xFFu8; 32];
+        h.muted = [true; 32];
+        for i in 0..8 {
+            h.channels[i] = i as u8;
+            h.muted[i] = false;
+        }
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.initial_speed = 6;
+        h.initial_tempo = 125;
+        h.enabled_channels = 8;
+        let n_pats = order.iter().copied().max().unwrap_or(0) as usize + 1;
+        h.order = order;
+        let mut pat = Pattern::empty(8);
+        for &(ch, command, info) in cells {
+            pat.rows[0][ch] = Cell {
+                note: 0xFF,
+                instrument: 0,
+                volume: 0xFF,
+                command,
+                info,
+            };
+        }
+        let patterns = vec![pat; n_pats];
+        PlayerState::new(&h, vec![dummy_sample(4096)], patterns, 44_100)
+    }
+
+    // ---- Same-row Bxx + Cxx precedence, per
+    // `docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`
+    // §Part 1: Bxx writes the target order, Cxx the target row; the two
+    // merge instead of overwriting each other.
+
+    #[test]
+    fn bxx_plus_cxx_same_row_merge_order_from_b_row_from_c() {
+        // Worked example 1: B02 in ch0, C16 in ch5 → order 02, row 16
+        // (decimal from the BCD infobyte 0x16).
+        let mut p = bc_row_player(
+            &[(0, cmd::B_POS_JUMP, 0x02), (5, cmd::C_PAT_BREAK, 0x16)],
+            vec![0, 1, 2, 3],
+        );
+        p.enter_row();
+        let jump = p.pending_jump.expect("B+C must arm a jump");
+        assert_eq!(jump.order, Some(2), "order comes from the Bxx");
+        assert_eq!(jump.row, 16, "row comes from the Cxx (decimal)");
+        p.next_row();
+        assert_eq!(p.order_index, 2);
+        assert_eq!(p.row, 16);
+    }
+
+    #[test]
+    fn cxx_before_bxx_merges_identically() {
+        // Worked example 2: the merge is channel-order-insensitive because
+        // the two effects write *different* variables — C16 in ch0 with
+        // B02 in ch5 must land on the same order 02, row 16.
+        let mut p = bc_row_player(
+            &[(0, cmd::C_PAT_BREAK, 0x16), (5, cmd::B_POS_JUMP, 0x02)],
+            vec![0, 1, 2, 3],
+        );
+        p.enter_row();
+        let jump = p.pending_jump.expect("C+B must arm a jump");
+        assert_eq!(
+            jump.order,
+            Some(2),
+            "a later Bxx must not discard the earlier Cxx's row — order still from B"
+        );
+        assert_eq!(jump.row, 16, "row survives from the earlier Cxx");
+    }
+
+    #[test]
+    fn bare_bxx_targets_row_zero_of_the_named_order() {
+        // Worked example 3: B02 alone → order 02, row 0.
+        let mut p = bc_row_player(&[(3, cmd::B_POS_JUMP, 0x02)], vec![0, 1, 2, 3]);
+        p.enter_row();
+        let jump = p.pending_jump.expect("Bxx must arm a jump");
+        assert_eq!(jump.order, Some(2));
+        assert_eq!(jump.row, 0);
+    }
+
+    #[test]
+    fn bare_cxx_targets_next_order_at_its_row() {
+        // Worked example 4: C16 alone on order 05 → order 06, row 16.
+        let mut p = bc_row_player(&[(0, cmd::C_PAT_BREAK, 0x16)], vec![0; 8]);
+        p.order_index = 5;
+        p.enter_row();
+        let jump = p.pending_jump.expect("Cxx must arm a jump");
+        assert_eq!(jump.order, None, "bare Cxx advances to the next order");
+        assert_eq!(jump.row, 16);
+        p.next_row();
+        assert_eq!(p.order_index, 6);
+        assert_eq!(p.row, 16);
+    }
+
+    #[test]
+    fn b00_plus_c00_restarts_the_song() {
+        // Worked example 5: B00 + C00 → order 0, row 0. Both infobytes are
+        // literal zeros — B/C carry no effect memory, so a zero parameter
+        // must never be replaced by a stale remembered value.
+        let mut p = bc_row_player(
+            &[(0, cmd::B_POS_JUMP, 0x00), (1, cmd::C_PAT_BREAK, 0x00)],
+            vec![0, 1],
+        );
+        p.order_index = 1;
+        // Poison the channel memory slots to prove B00/C00 stay literal.
+        p.channels[0].effect_memory[cmd::B_POS_JUMP as usize] = 0x07;
+        p.channels[1].effect_memory[cmd::C_PAT_BREAK as usize] = 0x32;
+        p.enter_row();
+        let jump = p.pending_jump.expect("B00+C00 must arm a jump");
+        assert_eq!(
+            jump.order,
+            Some(0),
+            "B00 means order 0, not a memory recall"
+        );
+        assert_eq!(jump.row, 0, "C00 means row 0, not a memory recall");
+    }
+
+    #[test]
+    fn two_bxx_on_one_row_rightmost_order_wins() {
+        // Within one variable it is last-writer-wins across the
+        // left-to-right channel scan.
+        let mut p = bc_row_player(
+            &[(0, cmd::B_POS_JUMP, 0x01), (4, cmd::B_POS_JUMP, 0x03)],
+            vec![0, 1, 2, 3],
+        );
+        p.enter_row();
+        let jump = p.pending_jump.expect("jump armed");
+        assert_eq!(jump.order, Some(3), "right-most Bxx's order wins");
+        assert_eq!(jump.row, 0);
+    }
+
+    #[test]
+    fn two_cxx_on_one_row_rightmost_row_wins() {
+        let mut p = bc_row_player(
+            &[(0, cmd::C_PAT_BREAK, 0x08), (4, cmd::C_PAT_BREAK, 0x12)],
+            vec![0, 0],
+        );
+        p.enter_row();
+        let jump = p.pending_jump.expect("jump armed");
+        assert_eq!(jump.order, None);
+        assert_eq!(jump.row, 12, "right-most Cxx's (decimal) row wins");
+    }
+
+    #[test]
+    fn invalid_cxx_leaves_an_earlier_valid_row_write_intact() {
+        // A Cxx targeting row >= 64 is ignored entirely (multimedia.cx
+        // §Cxy), so it must not clobber a valid same-row Cxx to its left.
+        let mut p = bc_row_player(
+            &[
+                (0, cmd::C_PAT_BREAK, 0x16), // row 16 — valid
+                (4, cmd::C_PAT_BREAK, 0x99), // row 99 — ignored
+            ],
+            vec![0, 0],
+        );
+        p.enter_row();
+        let jump = p.pending_jump.expect("the valid Cxx still arms a jump");
+        assert_eq!(jump.row, 16);
+    }
+
+    #[test]
+    fn bxx_with_only_an_invalid_cxx_falls_back_to_row_zero() {
+        let mut p = bc_row_player(
+            &[
+                (0, cmd::B_POS_JUMP, 0x02),
+                (1, cmd::C_PAT_BREAK, 0x64), // row 64 — out of range, ignored
+            ],
+            vec![0, 1, 2, 3],
+        );
+        p.enter_row();
+        let jump = p.pending_jump.expect("Bxx alone still arms a jump");
+        assert_eq!(jump.order, Some(2));
+        assert_eq!(jump.row, 0, "the ignored Cxx contributes no row");
+    }
+
+    #[test]
+    fn sbx_pattern_loop_still_overrides_a_same_row_b_c_merge() {
+        // The SBx loop-back keeps its documented priority over a same-row
+        // jump: the merged B/C destination is discarded while the loop
+        // counter is live.
+        let mut p = bc_row_player(
+            &[
+                (0, cmd::B_POS_JUMP, 0x02),
+                (1, cmd::C_PAT_BREAK, 0x16),
+                (2, cmd::S_EXTENDED, 0xB1), // SB1 — loop back once
+            ],
+            vec![0, 1, 2, 3],
+        );
+        p.enter_row();
+        let jump = p.pending_jump.expect("SB1 arms the loop jump");
+        assert_eq!(jump.order, Some(0), "loop stays on the current order");
+        assert_eq!(jump.row, 0, "loop target is the (default) loop start row");
+    }
+
+    #[test]
+    fn axx_and_txx_zero_parameters_are_ignored_not_memory_recalled() {
+        // Axx / Txx carry no effect memory (unmarked in the multimedia.cx
+        // effect list): A00 / T00-with-value-below-33 are ignored per their
+        // own rules even when the channel holds a stale nonzero parameter.
+        let mut p = bc_row_player(
+            &[(0, cmd::A_SET_SPEED, 0x00), (1, cmd::T_SET_TEMPO, 0x00)],
+            vec![0, 0],
+        );
+        p.channels[0].effect_memory[cmd::A_SET_SPEED as usize] = 0x02;
+        p.channels[1].effect_memory[cmd::T_SET_TEMPO as usize] = 0xF0;
+        let (speed, bpm) = (p.speed, p.bpm);
+        p.enter_row();
+        assert_eq!(p.speed, speed, "A00 must be ignored, not recall speed 2");
+        assert_eq!(p.bpm, bpm, "T00 must be ignored, not recall tempo 0xF0");
+    }
+
+    #[test]
+    fn v00_sets_global_volume_to_zero_literally() {
+        // V00 is a *valid* "set global volume to 0" — with no effect
+        // memory, a stale remembered Vxx parameter must not resurrect it.
+        let mut p = bc_row_player(&[(0, cmd::V_GLOBAL_VOL, 0x00)], vec![0, 0]);
+        p.channels[0].effect_memory[cmd::V_GLOBAL_VOL as usize] = 0x20;
+        p.enter_row();
+        p.tick = 1;
+        p.apply_per_tick(); // Vxx drains on tick 1
+        assert_eq!(
+            p.global_volume, 0,
+            "V00 must set the global volume to 0, not recall 0x20"
         );
     }
 
