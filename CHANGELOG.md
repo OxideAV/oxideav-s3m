@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AdLib / OPL2 playback — ungated.** The nine OPL2 melody channels
+  (channel-settings type 16..=24) now render into the audible mix. The
+  former envelope-rate docs gap is closed from the staged acquisition
+  record (`docs/audio/trackers/s3m/s3m-adlib-opl2-envelope-rates.md` +
+  `tables/opl2-ksr-rate-offset.csv`, docs #262): `opl2::effective_rate`
+  implements `RATE = 4*R + Rks` with the `R == 0 ⇒ RATE = 0` freeze, the
+  KSR key-scale offset table (conformance-tested against the staged CSV
+  when the docs tree is present), and the documented saturation of the
+  75-overflow at 63; `opl2::Envelope` runs the ADSR trajectory with
+  full-scale traversal times anchored to the record's two quoted
+  vendor-table samples (attack 2826.24 ms / decay 8212.48 ms at RATE 4)
+  and its exact per-RM halving law. `opl2::OplVoice` synthesizes the
+  two-operator voice (FM/additive connection, modulator self-feedback at
+  the FB table's π/16 modulation index, per-operator envelopes), and the
+  player keys voices from `SCRI` instruments at note trigger, handles
+  the AdLib note-off (`0xFE` → release stage instead of a PCM cut), Qxy
+  re-keying, SDx-deferred triggers, and drives all pitch effects through
+  the FM voice via the channel frequency. AdLib volume semantics per the
+  multimedia.cx behavioural reference: instrument-default 64 is kept
+  (unity) while operations clip to 0..=63, and Rxy tremolo is inert at
+  stored volume 64. `SampleBody` gains an `adlib` field, `S3mHeader` an
+  `adlib` per-channel flag; AdLib slots default-pan to centre (the
+  YM3812's mono output) and count toward the mixer normalisation. The
+  RL envelope-time sub-steps, attack curve shape, vendor key-scale-number
+  and sustain-level scaling, and AM/VIB/KSL remain documented
+  interpolations/omissions pending further staged data; the AdLib drum
+  slots (25..=29) stay muted. End-to-end tests drive a real `.s3m` blob
+  through the container/codec registry, and the hostile-input corpus
+  gains an AdLib seed so mutations reach the FM path.
+
 - `DP30ADPCM` packed-sample decode (instrument pack byte = 1): a 16-entry signed-8-bit delta lookup table followed by one 4-bit code per output sample, low nibble first, accumulated into a wrapping signed-8-bit value (staged doc §Part 2, `s3m-position-jump-pattern-break-and-adpcm.md` — the official ST3 references only name the flag). The depacker bounds its read to the bytes present, drops the odd-length padding nibble, and decodes hostile pack=1 bodies carrying 16-bit/stereo flag bits as the documented 8-bit mono layout; `PACK_UNPACKED` / `PACK_DP30ADPCM` constants exported from `header`
 
 ### Other

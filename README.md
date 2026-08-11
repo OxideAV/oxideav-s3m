@@ -60,28 +60,52 @@ re-emitting one is out of scope.
   next-frame folds back to `loop_start` at the boundary, matching ST3's
   loop-clipping (FireLight §2.10). One-shot voices still run to the
   buffer end and deactivate.
-- **AdLib / OPL2 instruments** — `SCRI` instruments (type 2..=7) now have
-  their YM3812 register block decoded. `Instrument::adlib_instrument()`
-  unpacks the modulator + carrier operator parameters (AM/VIB/EGT/KSR/MUL,
-  KSL/TL, AR/DR, SL/RR, waveform) plus the channel feedback/connection
-  byte, per the ST3 AdLib instrument layout and the OPL register map. The
-  [`opl2`] module implements the YM3812 **operator core**: the
-  bit-for-bit decapsulated log-sin and exponential ROM tables, the phase
-  generator (`((fnum * mlTab[ML]) << block) >> 1`), full-period sine
-  reconstruction from the stored first quadrant, the half-wave-rectified
-  sine, and the MUL / FB tables. Each piece is unit-tested against the
-  decapsulation-article anchor values and the −3 dB-per-volume-step
-  exp/log identity. This is the deterministic, fully-documented foundation
-  for AdLib playback. It does **not yet synthesize audio**: the OPL2
-  envelope-generator *rate schedule* (the 9-bit / 96 dB EG attack / decay /
-  release increment timing) is not present in the staged clean-room docs —
-  only the OPLL's 7-bit / 48 dB EG is reverse-engineered, and even its
-  attack-level recurrence is an open gap. An OPL2-specific envelope-rate
-  trace is needed before the operator core can be wired into the mixer.
+- **AdLib / OPL2 playback** — the nine OPL2 melody channels
+  (channel-settings type 16..=24) are rendered into the audible mix.
+  `SCRI` instruments (type 2..=7) decode their YM3812 register block
+  (`Instrument::adlib_instrument()`: AM/VIB/EGT/KSR/MUL, KSL/TL, AR/DR,
+  SL/RR, waveform, feedback/connection), and the [`opl2`] module
+  synthesizes them end to end:
+  - **Operator core** — the bit-for-bit decapsulated log-sin and
+    exponential ROM tables, the phase generator
+    (`((fnum * mlTab[ML]) << block) >> 1`), full-period sine
+    reconstruction, the half-wave-rectified sine, and the MUL / FB
+    tables, unit-tested against the decapsulation-article anchors and
+    the −3 dB-per-volume-step exp/log identity.
+  - **Envelope generator** — closes the former EG-rate docs gap via the
+    staged acquisition record
+    (`docs/audio/trackers/s3m/s3m-adlib-opl2-envelope-rates.md` +
+    `tables/opl2-ksr-rate-offset.csv`, docs #262): `RATE = 4*R + Rks`
+    with the `R == 0 ⇒ RATE = 0` freeze, the key-scale offset table
+    (KSR bit × 4-bit key-scale number, conformance-tested against the
+    staged CSV), the documented clamp of the 75-overflow at 63, and
+    ADSR timing anchored to the two quoted vendor-table samples
+    (attack 2826.24 ms / decay 8212.48 ms full-scale at RATE 4) with
+    the record's exact per-RM halving law. Trajectory tests pin the
+    absolute times within ±2 output samples.
+  - **Voice wiring** — FM and additive connections, modulator
+    self-feedback at the FB table's π/16-unit modulation index, KSR
+    envelope scaling from the triggering note, the AdLib note-off
+    (`0xFE` keys the voice into its release instead of a PCM-style
+    cut, per the v3.20 manual §Adlib FM-songs), `Qxy` re-keying, and
+    the full pitch-effect set (slides / vibrato / portamento /
+    arpeggio / `S2x`) driving the FM voice through the channel
+    frequency. AdLib channels keep an instrument-default volume of 64
+    (unity) while every operation clips to 0..=63, and `Rxy` tremolo
+    is inert at stored volume 64 — both per the multimedia.cx
+    behavioural reference.
+  - **Documented interpolations / omissions** (details in the `opl2`
+    module doc): the envelope-time table's `RL` sub-steps interpolate
+    geometrically and the attack curve runs linear-in-dB pending the
+    un-staged vendor base values; the key-scale-number derivation from
+    the note (2 codes per octave, split at F♯/G) and the 3 dB-per-step
+    sustain level are documented interim readings; the AM/VIB LFOs,
+    the KSL slope, and OPL2 waveforms 2/3 stay decoded-but-unapplied;
+    the AdLib *drum* slots (25..=29, unused per the channel map)
+    remain muted.
 - **Channel mute flag** (`+128` in the channel-settings byte) — the
   decoder reads pattern cells for muted channels (so jumps, loops, and
   pattern delays stay consistent) but the mixer silences their output.
-  AdLib slots without the flag are also reported as muted.
 - **Effects** — the full command set: `Axx` (speed), `Bxx` (pos jump),
   `Cxx` (pattern break) — a same-row `Bxx` + `Cxx` pair **merges** into
   "row `Cxx` (decimal) of the pattern at order `Bxx` (hex)" because the
@@ -165,11 +189,13 @@ re-emitting one is out of scope.
   per-channel length so its left/right boundary matches the file's
   intent. Malformed modules resolve to a typed error or a bounded, silent
   render — never a panic, out-of-bounds read, or hang.
-- **Known format gaps** — AdLib playback awaits an OPL2
-  envelope-generator rate trace (see the OPL2 bullet above). The former
-  `DP30ADPCM` and same-row `Bxx`+`Cxx` gaps are closed: both are now
-  implemented from the staged clean-room note
-  (`docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`).
+- **Known format gaps** — the former AdLib envelope-rate, `DP30ADPCM`,
+  and same-row `Bxx`+`Cxx` gaps are all closed from staged clean-room
+  notes. What remains open on the AdLib side is refinement data, not a
+  playability gap: the 16 un-staged envelope-time base values (RL
+  sub-steps + attack curve), the vendor key-scale-number and
+  sustain-level scaling rules, and the AM/VIB/KSL tables — see the
+  OPL2 bullet above.
   That note flags two residual unknowns it could not pin down — exact
   ST3 multi-channel edge behaviour when a jump lands on the very last
   order, and finer `SBx`-vs-jump interactions — for which this decoder
