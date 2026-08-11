@@ -41,14 +41,36 @@
 //!
 //! # Scope
 //!
-//! This module provides the *deterministic, fully-documented* half of OPL2
-//! AdLib playback: instrument-register decode and the operator waveform
-//! core. The OPL2 **envelope generator rates** (the per-rate attack /
-//! decay / release increment schedule over OPL2's 9-bit / 96 dB envelope)
-//! are not present in the staged docs — only the OPLL's 7-bit / 48 dB EG
-//! is reverse-engineered, and even its attack-level recurrence is an open
-//! gap. A complete audible AdLib voice therefore awaits an OPL2-specific
-//! envelope-rate trace; see the crate README "AdLib" section.
+//! This module provides instrument-register decode, the operator waveform
+//! core, the **envelope generator** (rate resolution + ADSR trajectory),
+//! and the two-operator [`OplVoice`] synthesizer the player mixes from.
+//!
+//! The envelope-rate facts come from the staged acquisition record
+//! `docs/audio/trackers/s3m/s3m-adlib-opl2-envelope-rates.md` (issue #262
+//! closure) and its table
+//! `docs/audio/trackers/s3m/tables/opl2-ksr-rate-offset.csv`, both
+//! transcribed from the Yamaha Y8950 MSX-AUDIO Application Manual §3-1-17
+//! (the Y8950 / YM3526 / YM3812 share this FM envelope core; the YM3812
+//! adds only per-operator waveform select). What the record pins exactly:
+//!
+//! - `RATE = 4 * R + Rks`, with the special case `R == 0 ⇒ RATE = 0`
+//!   (envelope frozen), where `R` is the 4-bit ADSR register nibble and
+//!   `Rks` the key-scale offset ([`KSR_RATE_OFFSET`]).
+//! - The vendor envelope-time table (Y8950 manual p.25, Table 3-6) is
+//!   indexed by the *post-key-scaling* `RATE`, decomposed `RM-RL`
+//!   (`RATE = RM*4 + RL`), and obeys an exact halving law: `RM + 1`
+//!   halves every time. Two sample values at `RM-RL = 1-0` (RATE 4) are
+//!   quoted and anchor the absolute timing here (see
+//!   [`ATTACK_FULL_SCALE_MS_AT_RATE_4`] / [`DECAY_FULL_SCALE_MS_AT_RATE_4`]).
+//!
+//! The record deliberately does **not** transcribe the full 64×4 time
+//! table (the available scan is too low-resolution to trust); the
+//! `RL` sub-steps inside one `RM` group are therefore interpolated
+//! geometrically (`2^(-RL/4)`, keeping the pinned exact-halving per +4)
+//! until the 16 base values at `RM = 1` are staged. The attack *curve
+//! shape* between its endpoints is likewise unpinned (only the full-scale
+//! traversal time is quoted), so attack runs linear-in-dB here. See the
+//! per-item comments below for what is anchor vs. interpolation.
 
 /// A full sine period is divided into this many phase steps in the OPL
 /// family (the phase accumulator's integer part wraps at 1024).
@@ -325,6 +347,262 @@ impl OperatorCore {
     }
 }
 
+// ===================== Envelope generator =====================
+
+/// Key-scale rate offset `Rks`, indexed `[KSR][key_scale_number]`.
+///
+/// Transcription of Table III-2 "Key scales for RATE" (Y8950 Application
+/// Manual §3-1-17), staged as
+/// `docs/audio/trackers/s3m/tables/opl2-ksr-rate-offset.csv` (+`.meta`).
+/// The closed form is `Rks = KSR ? N : N >> 2` — the staged table and the
+/// closed form agree in all 32 entries; a conformance test cross-checks
+/// this constant against the CSV file when the docs tree is present.
+pub const KSR_RATE_OFFSET: [[u8; 16]; 2] = [
+    // KSR = 0: Rks = N >> 2 (0..3)
+    [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+    // KSR = 1: Rks = N (0..15)
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+];
+
+/// Upper bound of the envelope-rate domain. The vendor envelope-time
+/// table is indexed by the `RM-RL` decomposition of a 6-bit RATE
+/// (0..=63), but `RATE = 4*R + Rks` reaches 75 at `R = 15`, `KSR = 1`,
+/// `N = 15`. The staged acquisition record flags this overflow as
+/// unresolved ("A player must clamp; which clamp matches the hardware is
+/// unresolved") — we saturate at 63, the table's own top row.
+pub const RATE_MAX: u8 = 63;
+
+/// The key-scale offset `Rks` for one operator ([`KSR_RATE_OFFSET`]).
+#[inline]
+pub fn key_scale_offset(ksr: bool, key_scale_number: u8) -> u8 {
+    KSR_RATE_OFFSET[usize::from(ksr)][(key_scale_number & 0x0F) as usize]
+}
+
+/// Resolve a 4-bit ADSR register nibble `R` into the envelope RATE the
+/// generator actually runs at:
+///
+/// ```text
+/// RATE = 4 * R + Rks        and, as a special case, R == 0 => RATE = 0
+/// ```
+///
+/// per the staged acquisition record
+/// (`docs/audio/trackers/s3m/s3m-adlib-opl2-envelope-rates.md`, from
+/// Y8950 Application Manual §3-1-17). `RATE = 0` means the envelope does
+/// not change at all ("there is no change in the envelope when RATE is
+/// 0"). The result saturates at [`RATE_MAX`] — see there for why.
+///
+/// Because `R >= 1` implies `RATE >= 4`, the reachable domain is
+/// `{0} ∪ [4, 63]`, exactly the rows the vendor time table prints
+/// (`15 3` down to `1 0`).
+pub fn effective_rate(r: u8, ksr: bool, key_scale_number: u8) -> u8 {
+    let r = r & 0x0F;
+    if r == 0 {
+        return 0;
+    }
+    let rate = 4 * r as u16 + key_scale_offset(ksr, key_scale_number) as u16;
+    rate.min(RATE_MAX as u16) as u8
+}
+
+/// Full 0 dB → 96 dB EG attack traversal time in ms at `RATE = 4`
+/// (`RM-RL = 1-0`).
+///
+/// Anchor value quoted verbatim by the staged acquisition record
+/// (`s3m-adlib-opl2-envelope-rates.md`: "2826.24 ms at 1-0 becoming
+/// 1413.12 ms at 2-0 in the 0 dB→96 dB attack column", Y8950 manual
+/// p.25 Table 3-6).
+pub const ATTACK_FULL_SCALE_MS_AT_RATE_4: f64 = 2826.24;
+
+/// Full-scale (96 dB) EG decay traversal time in ms at `RATE = 4`
+/// (`RM-RL = 1-0`).
+///
+/// Anchor value quoted verbatim by the staged acquisition record
+/// ("a decay of 8212.48 ms at 1-0 becoming 4106.24 ms at 2-0"). The
+/// record does not say which of the two decay columns (10%→90% vs
+/// 0 dB→96 dB) this sample came from; we read it as the 0 dB→96 dB
+/// column — the same measurement reference the attack quote names — and
+/// flag the ambiguity for the docs follow-up that stages the full table.
+/// Release uses this same constant: in EG terms a release is a decay run
+/// at the RR-derived RATE, and the vendor table ("Attack and decay time
+/// according to RATE") has no separate release column.
+pub const DECAY_FULL_SCALE_MS_AT_RATE_4: f64 = 8212.48;
+
+/// Total span of the OPL2 envelope: 9-bit attenuation over 96 dB.
+pub const EG_RANGE_DB: f64 = 96.0;
+
+/// Full-scale traversal time in ms for an envelope RATE `>= 4`.
+///
+/// The RM dimension is the staged doc's exact halving law ("incrementing
+/// RM by one halves every time, verified on sampled entries in all four
+/// columns"); the RL dimension inside one RM group is a geometric
+/// interpolation (`2^(-RL/4)`) chosen so each +4 in RATE still halves
+/// exactly — the true per-RL values await the vendor table's 16 base
+/// values at RM = 1 (deliberately not yet staged; see the module doc).
+pub fn full_scale_traversal_ms(base_ms_at_rate_4: f64, rate: u8) -> f64 {
+    debug_assert!(rate >= 4, "RATE {rate} below the table's 1-0 row");
+    base_ms_at_rate_4 * (2.0f64).powf(-((rate as f64) - 4.0) / 4.0)
+}
+
+/// dB moved per output sample at the given envelope RATE (0 = frozen).
+fn db_per_sample(rate: u8, base_ms_at_rate_4: f64, sample_rate: u32) -> f64 {
+    if rate == 0 {
+        return 0.0;
+    }
+    let ms = full_scale_traversal_ms(base_ms_at_rate_4, rate);
+    EG_RANGE_DB / (ms / 1000.0 * sample_rate.max(1) as f64)
+}
+
+/// Attenuation contributed by the sustain-level nibble, in dB.
+///
+/// One SL unit is taken as one 3 dB volume step — the `-3 dB per volume
+/// step` log-domain identity the operator core's exp/log tables encode
+/// (one step = 128 log units; see `attenuation_halves_amplitude_per_
+/// volume_step`). The vendor SL scaling (and whether SL = 15 is
+/// special-cased deeper) is not in the staged docs and is flagged as a
+/// docs gap; 3 dB/step is the documented interim reading.
+pub const SUSTAIN_DB_PER_STEP: f32 = 3.0;
+
+/// log-domain attenuation units per dB. The exponential ROM halves the
+/// amplitude every 256 units (one right-shift), i.e. 256 units =
+/// 20·log10(2) ≈ 6.0206 dB.
+pub const LOG_UNITS_PER_DB: f64 = 256.0 / 6.020_599_913;
+
+/// ADSR stage of one operator's envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EgStage {
+    /// Attenuation ramps from its current value down toward 0 dB.
+    Attack,
+    /// Attenuation ramps up toward the sustain level.
+    Decay,
+    /// Holding at the sustain level (sustained instruments, key still on).
+    Sustain,
+    /// Attenuation ramps up toward the 96 dB floor.
+    Release,
+    /// Past the 96 dB floor — the operator is silent and finished.
+    Off,
+}
+
+/// One operator's envelope generator.
+///
+/// Timing is anchored to the two staged vendor-table samples (see
+/// [`ATTACK_FULL_SCALE_MS_AT_RATE_4`] / [`DECAY_FULL_SCALE_MS_AT_RATE_4`])
+/// with the halving law giving every other RATE. The trajectory between
+/// endpoints runs linear-in-dB in all stages: exact for decay/release
+/// (a constant-rate attenuation increase is what a log-domain EG does),
+/// an approximation for attack, whose curve shape the staged record does
+/// not pin (only its full-scale traversal time).
+#[derive(Clone, Debug)]
+pub struct Envelope {
+    stage: EgStage,
+    /// Current attenuation in dB, `0.0..=96.0`.
+    atten_db: f64,
+    attack_db_per_sample: f64,
+    decay_db_per_sample: f64,
+    release_db_per_sample: f64,
+    sustain_db: f64,
+    /// EG-TYP register bit: `true` holds at the sustain level until
+    /// key-off; `false` (percussive) releases through it immediately.
+    sustained: bool,
+}
+
+impl Envelope {
+    /// Build the envelope for one operator sounding at key-scale number
+    /// `key_scale_number`, keyed on (worst case, clamped) at `sample_rate`.
+    /// Starts keyed-on in the attack stage from the 96 dB floor.
+    pub fn new(op: &Operator, key_scale_number: u8, sample_rate: u32) -> Self {
+        let ar = effective_rate(op.attack, op.ksr, key_scale_number);
+        let dr = effective_rate(op.decay, op.ksr, key_scale_number);
+        let rr = effective_rate(op.release, op.ksr, key_scale_number);
+        Envelope {
+            stage: EgStage::Attack,
+            atten_db: EG_RANGE_DB,
+            attack_db_per_sample: db_per_sample(ar, ATTACK_FULL_SCALE_MS_AT_RATE_4, sample_rate),
+            decay_db_per_sample: db_per_sample(dr, DECAY_FULL_SCALE_MS_AT_RATE_4, sample_rate),
+            release_db_per_sample: db_per_sample(rr, DECAY_FULL_SCALE_MS_AT_RATE_4, sample_rate),
+            sustain_db: (op.sustain & 0x0F) as f64 * SUSTAIN_DB_PER_STEP as f64,
+            sustained: op.eg_sustained,
+        }
+    }
+
+    /// Re-key the envelope: restart the attack from the *current*
+    /// attenuation (a retrigger on a still-sounding voice attacks from
+    /// wherever the envelope is, not from silence).
+    pub fn key_on(&mut self) {
+        self.stage = EgStage::Attack;
+    }
+
+    /// Key-off: enter the release stage from the current attenuation.
+    /// A voice already past the floor stays off.
+    pub fn key_off(&mut self) {
+        if self.stage != EgStage::Off {
+            self.stage = EgStage::Release;
+        }
+    }
+
+    /// `true` once the envelope has run past the 96 dB floor.
+    #[inline]
+    pub fn is_off(&self) -> bool {
+        self.stage == EgStage::Off
+    }
+
+    /// Current stage (for tests / introspection).
+    #[inline]
+    pub fn stage(&self) -> EgStage {
+        self.stage
+    }
+
+    /// Current attenuation in dB.
+    #[inline]
+    pub fn attenuation_db(&self) -> f64 {
+        self.atten_db
+    }
+
+    /// Advance one output sample; returns the attenuation (dB) to apply
+    /// to this sample. A frozen rate (`RATE = 0` — "no change in the
+    /// envelope") leaves the stage and attenuation untouched forever.
+    pub fn step(&mut self) -> f64 {
+        let out = self.atten_db;
+        match self.stage {
+            EgStage::Attack => {
+                if self.attack_db_per_sample > 0.0 {
+                    self.atten_db -= self.attack_db_per_sample;
+                    if self.atten_db <= 0.0 {
+                        self.atten_db = 0.0;
+                        self.stage = EgStage::Decay;
+                    }
+                }
+            }
+            EgStage::Decay => {
+                if self.atten_db >= self.sustain_db {
+                    // Sustain level reached: EG-TYP picks hold-vs-release.
+                    self.stage = if self.sustained {
+                        EgStage::Sustain
+                    } else {
+                        EgStage::Release
+                    };
+                } else if self.decay_db_per_sample > 0.0 {
+                    self.atten_db = (self.atten_db + self.decay_db_per_sample).min(self.sustain_db);
+                }
+                // decay RATE 0: frozen where the attack left it.
+            }
+            EgStage::Sustain => {
+                // Held until key_off().
+            }
+            EgStage::Release => {
+                if self.release_db_per_sample > 0.0 {
+                    self.atten_db += self.release_db_per_sample;
+                    if self.atten_db >= EG_RANGE_DB {
+                        self.atten_db = EG_RANGE_DB;
+                        self.stage = EgStage::Off;
+                    }
+                }
+                // release RATE 0: frozen — the voice never dies down.
+            }
+            EgStage::Off => {}
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +764,292 @@ mod tests {
         assert_eq!(inst.feedback, 0);
         assert!(!inst.additive);
         assert_eq!(inst.carrier.waveform, Waveform::Sine);
+    }
+
+    /// A plain operator to hang envelope parameters off in tests.
+    fn test_op(
+        attack: u8,
+        decay: u8,
+        sustain: u8,
+        release: u8,
+        ksr: bool,
+        sustained: bool,
+    ) -> Operator {
+        Operator {
+            am: false,
+            vib: false,
+            eg_sustained: sustained,
+            ksr,
+            mul: 1,
+            ksl: 0,
+            total_level: 0,
+            attack,
+            decay,
+            sustain,
+            release,
+            waveform: Waveform::Sine,
+        }
+    }
+
+    #[test]
+    fn ksr_rate_offset_matches_staged_csv() {
+        // Conformance against the staged table itself
+        // (`docs/audio/trackers/s3m/tables/opl2-ksr-rate-offset.csv`).
+        // The docs tree only exists in the umbrella workspace checkout —
+        // skip (without failing) when it is absent, e.g. on standalone CI.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/audio/trackers/s3m/tables/opl2-ksr-rate-offset.csv");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: staged CSV not present at {}", path.display());
+            return;
+        };
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next().map(str::trim),
+            Some("key_scale_number,rks_ksr0,rks_ksr1"),
+            "staged CSV layout changed"
+        );
+        let mut rows = 0usize;
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut cols = line.split(',');
+            let n: usize = cols.next().unwrap().parse().unwrap();
+            let k0: u8 = cols.next().unwrap().parse().unwrap();
+            let k1: u8 = cols.next().unwrap().parse().unwrap();
+            assert_eq!(KSR_RATE_OFFSET[0][n], k0, "KSR=0 mismatch at N={n}");
+            assert_eq!(KSR_RATE_OFFSET[1][n], k1, "KSR=1 mismatch at N={n}");
+            rows += 1;
+        }
+        assert_eq!(rows, 16, "staged CSV must carry 16 key-scale rows");
+    }
+
+    #[test]
+    fn ksr_rate_offset_matches_closed_form() {
+        // The staged record's validation: Rks = KSR ? N : N >> 2.
+        for n in 0..16u8 {
+            assert_eq!(key_scale_offset(false, n), n >> 2);
+            assert_eq!(key_scale_offset(true, n), n);
+        }
+    }
+
+    #[test]
+    fn effective_rate_is_4r_plus_rks_with_r0_special_case() {
+        // R == 0 => RATE = 0 regardless of key scaling.
+        assert_eq!(effective_rate(0, false, 0), 0);
+        assert_eq!(effective_rate(0, true, 15), 0);
+        // Plain 4*R when the offset is 0.
+        assert_eq!(effective_rate(1, false, 0), 4);
+        assert_eq!(effective_rate(15, false, 3), 60);
+        // KSR = 0: offset N >> 2; KSR = 1: offset N. Same nibble, same
+        // note — the KSR bit makes the rate 4x more pitch-sensitive.
+        assert_eq!(effective_rate(3, false, 13), 12 + 3);
+        assert_eq!(effective_rate(3, true, 13), 12 + 13);
+        // Monotone (non-decreasing) in the key-scale number.
+        for &ksr in &[false, true] {
+            let mut prev = 0;
+            for n in 0..16 {
+                let r = effective_rate(5, ksr, n);
+                assert!(r >= prev, "RATE not monotone at N={n}, KSR={ksr}");
+                prev = r;
+            }
+        }
+    }
+
+    #[test]
+    fn effective_rate_saturates_at_63() {
+        // The staged record: 4*15 + 15 = 75 overflows the 0..=63 RM-RL
+        // domain of the vendor time table; a player must clamp.
+        assert_eq!(effective_rate(15, true, 15), 63);
+        assert_eq!(effective_rate(15, true, 12), 63);
+        // Just inside the domain: 60 + 3 = 63.
+        assert_eq!(effective_rate(15, true, 3), 63);
+        assert_eq!(effective_rate(14, true, 7), 63);
+        assert_eq!(effective_rate(14, true, 6), 62);
+    }
+
+    #[test]
+    fn traversal_time_halves_every_plus_4_rate() {
+        // The staged doc's exact halving law: RM+1 halves every time.
+        for base in [
+            ATTACK_FULL_SCALE_MS_AT_RATE_4,
+            DECAY_FULL_SCALE_MS_AT_RATE_4,
+        ] {
+            for rate in 4..=59u8 {
+                let t = full_scale_traversal_ms(base, rate);
+                let t4 = full_scale_traversal_ms(base, rate + 4);
+                assert!(
+                    (t / 2.0 - t4).abs() < 1e-9 * t,
+                    "halving law broken at RATE {rate}"
+                );
+            }
+        }
+        // And the two quoted RM=2 samples come out exactly.
+        assert!((full_scale_traversal_ms(DECAY_FULL_SCALE_MS_AT_RATE_4, 8) - 4106.24).abs() < 1e-9);
+        assert!(
+            (full_scale_traversal_ms(ATTACK_FULL_SCALE_MS_AT_RATE_4, 8) - 1413.12).abs() < 1e-9
+        );
+    }
+
+    /// Count envelope steps until `pred` becomes true (bounded).
+    fn steps_until(env: &mut Envelope, limit: usize, pred: impl Fn(&Envelope) -> bool) -> usize {
+        for i in 0..limit {
+            if pred(env) {
+                return i;
+            }
+            env.step();
+        }
+        panic!("predicate not reached within {limit} envelope steps");
+    }
+
+    const FS: u32 = 44_100;
+
+    #[test]
+    fn attack_traversal_matches_staged_anchor() {
+        // AR nibble 1, KSR=0, N=0 => RATE 4 => 2826.24 ms full scale.
+        let mut env = Envelope::new(&test_op(1, 15, 0, 15, false, true), 0, FS);
+        let n = steps_until(&mut env, 200_000, |e| e.stage() == EgStage::Decay);
+        let expected = ATTACK_FULL_SCALE_MS_AT_RATE_4 / 1000.0 * FS as f64;
+        assert!(
+            (n as f64 - expected).abs() <= 2.0,
+            "attack took {n} samples, expected ~{expected:.1}"
+        );
+    }
+
+    #[test]
+    fn attack_rate_8_takes_half_the_time() {
+        // AR nibble 2 => RATE 8 => the doc's quoted 1413.12 ms.
+        let mut env = Envelope::new(&test_op(2, 15, 0, 15, false, true), 0, FS);
+        let n = steps_until(&mut env, 200_000, |e| e.stage() == EgStage::Decay);
+        let expected = 1413.12 / 1000.0 * FS as f64;
+        assert!(
+            (n as f64 - expected).abs() <= 2.0,
+            "attack took {n} samples, expected ~{expected:.1}"
+        );
+    }
+
+    #[test]
+    fn release_traversal_matches_staged_decay_anchor() {
+        // Fast attack straight to 0 dB, then key-off: the release runs
+        // the full 96 dB at the RR-derived RATE. RR nibble 1, KSR=0, N=0
+        // => RATE 4 => 8212.48 ms.
+        let mut env = Envelope::new(&test_op(15, 15, 0, 1, false, true), 0, FS);
+        steps_until(&mut env, 100_000, |e| e.stage() == EgStage::Sustain);
+        assert_eq!(env.attenuation_db(), 0.0);
+        env.key_off();
+        let n = steps_until(&mut env, 800_000, |e| e.is_off());
+        let expected = DECAY_FULL_SCALE_MS_AT_RATE_4 / 1000.0 * FS as f64;
+        assert!(
+            (n as f64 - expected).abs() <= 2.0,
+            "release took {n} samples, expected ~{expected:.1}"
+        );
+    }
+
+    #[test]
+    fn decay_slope_reaches_sustain_level_proportionally() {
+        // DR nibble 1 (RATE 4); SL = 15 => 45 dB. Linear-in-dB decay
+        // covers 45/96 of the full-scale time.
+        let mut env = Envelope::new(&test_op(15, 1, 15, 15, false, true), 0, FS);
+        steps_until(&mut env, 1_000, |e| e.stage() == EgStage::Decay);
+        let n = steps_until(&mut env, 800_000, |e| e.stage() == EgStage::Sustain);
+        let expected = 45.0 / EG_RANGE_DB * DECAY_FULL_SCALE_MS_AT_RATE_4 / 1000.0 * FS as f64;
+        assert!(
+            (n as f64 - expected).abs() <= 3.0,
+            "decay took {n} samples, expected ~{expected:.1}"
+        );
+        assert!((env.attenuation_db() - 45.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn ksr_bit_speeds_the_envelope_at_high_notes() {
+        // Same AR nibble 1 at key-scale number 13:
+        //   KSR=0 => RATE 4 + 3 = 7;  KSR=1 => RATE 4 + 13 = 17.
+        let t = |ksr: bool| {
+            let mut env = Envelope::new(&test_op(1, 15, 0, 15, ksr, true), 13, FS);
+            steps_until(&mut env, 200_000, |e| e.stage() == EgStage::Decay)
+        };
+        let slow = t(false);
+        let fast = t(true);
+        let expect_slow =
+            full_scale_traversal_ms(ATTACK_FULL_SCALE_MS_AT_RATE_4, 7) / 1000.0 * FS as f64;
+        let expect_fast =
+            full_scale_traversal_ms(ATTACK_FULL_SCALE_MS_AT_RATE_4, 17) / 1000.0 * FS as f64;
+        assert!(
+            (slow as f64 - expect_slow).abs() <= 2.0,
+            "KSR=0 took {slow}"
+        );
+        assert!(
+            (fast as f64 - expect_fast).abs() <= 2.0,
+            "KSR=1 took {fast}"
+        );
+        assert!(fast < slow, "KSR must speed the envelope up");
+    }
+
+    #[test]
+    fn rate_zero_freezes_the_envelope() {
+        // AR nibble 0 => RATE 0 => "no change in the envelope": the
+        // attack never leaves the 96 dB floor — the voice stays silent.
+        let mut env = Envelope::new(&test_op(0, 15, 0, 15, false, true), 0, FS);
+        for _ in 0..50_000 {
+            env.step();
+        }
+        assert_eq!(env.stage(), EgStage::Attack);
+        assert_eq!(env.attenuation_db(), EG_RANGE_DB);
+
+        // DR nibble 0 with a nonzero sustain level: frozen at 0 dB after
+        // the attack, never reaching the sustain level.
+        let mut env = Envelope::new(&test_op(15, 0, 15, 15, false, true), 0, FS);
+        steps_until(&mut env, 1_000, |e| e.stage() == EgStage::Decay);
+        for _ in 0..50_000 {
+            env.step();
+        }
+        assert_eq!(env.stage(), EgStage::Decay);
+        assert_eq!(env.attenuation_db(), 0.0);
+        // Key-off still releases it.
+        env.key_off();
+        assert!(env.stage() == EgStage::Release);
+    }
+
+    #[test]
+    fn percussive_envelope_releases_through_the_sustain_level() {
+        // EG-TYP = 0 (percussive): on reaching the sustain level the
+        // envelope keeps decaying at the release rate without a key-off.
+        let mut env = Envelope::new(&test_op(15, 15, 4, 15, false, false), 0, FS);
+        let n = steps_until(&mut env, 400_000, |e| e.is_off());
+        assert!(n > 0);
+        // A sustained twin with the same nibbles holds instead.
+        let mut held = Envelope::new(&test_op(15, 15, 4, 15, false, true), 0, FS);
+        steps_until(&mut held, 400_000, |e| e.stage() == EgStage::Sustain);
+        for _ in 0..10_000 {
+            held.step();
+        }
+        assert_eq!(held.stage(), EgStage::Sustain);
+        assert!((held.attenuation_db() - 4.0 * SUSTAIN_DB_PER_STEP as f64).abs() < 0.01);
+    }
+
+    #[test]
+    fn retrigger_attacks_from_current_attenuation() {
+        let mut env = Envelope::new(&test_op(1, 15, 0, 2, false, true), 0, FS);
+        // Part-way through the attack, note where we are…
+        for _ in 0..10_000 {
+            env.step();
+        }
+        let mid = env.attenuation_db();
+        assert!(mid > 0.0 && mid < EG_RANGE_DB);
+        // …release a while, then re-key: attack resumes from the current
+        // attenuation, not from the floor.
+        env.key_off();
+        for _ in 0..1_000 {
+            env.step();
+        }
+        let released = env.attenuation_db();
+        env.key_on();
+        assert_eq!(env.stage(), EgStage::Attack);
+        assert_eq!(env.attenuation_db(), released);
+        env.step();
+        assert!(env.attenuation_db() < released);
     }
 
     #[test]
