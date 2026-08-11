@@ -603,6 +603,185 @@ impl Envelope {
     }
 }
 
+// ===================== Two-operator voice =====================
+
+/// Convert an envelope attenuation in dB plus the operator's total-level
+/// register value into the log-domain attenuation [`OperatorCore::
+/// operator_sample`] consumes (8 fractional bits).
+///
+/// One TL step is 0.75 dB = 32 log units (the 6-bit TL spans 48 dB);
+/// envelope dB convert at [`LOG_UNITS_PER_DB`].
+fn atten_log_units(env_db: f64, total_level: u8) -> u32 {
+    let tl_units = ((total_level & 0x3F) as u32) << 5;
+    (env_db.max(0.0) * LOG_UNITS_PER_DB) as u32 + tl_units
+}
+
+/// Wrap a possibly-negative phase-modulated index into the 1024-step period.
+fn wrap_phase(p: i32) -> u32 {
+    p.rem_euclid(SINE_PERIOD as i32) as u32
+}
+
+/// Realtime synthesis state for one operator slot.
+#[derive(Clone, Debug)]
+struct OperatorState {
+    /// 19-bit fixed-point phase accumulator (10 integer + 9 fractional
+    /// bits), per the staged phase-step formula.
+    phase_acc: u32,
+    env: Envelope,
+}
+
+/// A sounding two-operator OPL2 voice: one modulator + one carrier with
+/// per-operator envelopes, modulator self-feedback, and the FM /
+/// additive connection selected by the instrument's `CNT` bit.
+///
+/// # Modulation depth (unit identification)
+///
+/// The staged FB table expresses the feedback modulation index in π/16
+/// units, topping out at 4π for `FB = 7`. A full-scale operator output
+/// spans ±2042 ≈ ±2048 units, and 4π of phase is exactly 2048 steps of
+/// the 1024-step period — i.e. at the documented 4π ceiling, output
+/// units and phase units coincide one-to-one. The voice therefore
+/// applies the modulator output *directly* to the carrier's phase index
+/// (the FM connection at that same full-scale depth), and scales the
+/// self-feedback path by `FB_PI_OVER_16[fb] / 64` so `FB = 7`
+/// reproduces the 4π ceiling and each lower setting halves it.
+///
+/// The feedback source is the modulator's previous output sample.
+///
+/// # Documented omissions
+///
+/// The `AM` / `VIB` operator flags (chip tremolo / vibrato LFOs) and the
+/// `KSL` attenuation slope are decoded but not applied — their depth /
+/// rate tables are not in the staged docs (flagged as docs gaps).
+#[derive(Clone, Debug)]
+pub struct OplVoice {
+    inst: AdLibInstrument,
+    sample_rate: u32,
+    modulator: OperatorState,
+    carrier: OperatorState,
+    /// Previous modulator output — the self-feedback source.
+    prev_mod_out: i32,
+}
+
+impl OplVoice {
+    /// Key a new voice on: both envelopes start their attack from the
+    /// 96 dB floor and the phase accumulators start at 0.
+    ///
+    /// `key_scale_number` is the note's 4-bit pitch code driving the
+    /// KSR rate coupling (see [`effective_rate`]).
+    pub fn new(inst: AdLibInstrument, key_scale_number: u8, sample_rate: u32) -> Self {
+        OplVoice {
+            inst,
+            sample_rate: sample_rate.max(1),
+            modulator: OperatorState {
+                phase_acc: 0,
+                env: Envelope::new(&inst.modulator, key_scale_number, sample_rate),
+            },
+            carrier: OperatorState {
+                phase_acc: 0,
+                env: Envelope::new(&inst.carrier, key_scale_number, sample_rate),
+            },
+            prev_mod_out: 0,
+        }
+    }
+
+    /// The decoded instrument this voice is sounding.
+    pub fn instrument(&self) -> &AdLibInstrument {
+        &self.inst
+    }
+
+    /// Retrigger: restart both attacks from the current attenuation
+    /// (phases keep running — see [`Envelope::key_on`]).
+    pub fn key_on(&mut self) {
+        self.modulator.env.key_on();
+        self.carrier.env.key_on();
+    }
+
+    /// Key-off: both envelopes enter their release stage.
+    pub fn key_off(&mut self) {
+        self.modulator.env.key_off();
+        self.carrier.env.key_off();
+    }
+
+    /// `true` once the voice can no longer produce sound: the carrier
+    /// envelope is past the floor (and, for the additive connection, the
+    /// modulator's too — there it feeds the output directly).
+    pub fn finished(&self) -> bool {
+        if self.inst.additive {
+            self.carrier.env.is_off() && self.modulator.env.is_off()
+        } else {
+            self.carrier.env.is_off()
+        }
+    }
+
+    /// The carrier envelope's current stage (introspection / tests).
+    pub fn carrier_stage(&self) -> EgStage {
+        self.carrier.env.stage()
+    }
+
+    /// Synthesize one output sample with the channel sounding at
+    /// `freq_hz` (the pitch a `MUL = 1` operator tracks — the same
+    /// frequency the PCM path derives from the period table). Returns a
+    /// sample nominally in `-1.0..=1.0` (the additive connection can
+    /// reach ±2; the mix-down clamp covers it, matching two PCM
+    /// channels at full scale).
+    pub fn render_sample(&mut self, core: &OperatorCore, freq_hz: f64) -> f32 {
+        if self.finished() {
+            return 0.0;
+        }
+        // Channel phase step: freq_hz periods/s over the 2^19-unit
+        // fixed-point period. Substituting `fnum * 2^block` for the
+        // real-valued `freq * 2^19 / sample_rate` keeps the staged
+        // phase-step formula `((fnum * mlTab) << block) >> 1` intact:
+        // per-operator steps scale it by `mlTab / 2`.
+        let chan_step = freq_hz.max(0.0) * (1u32 << 19) as f64 / self.sample_rate as f64;
+        let m = self.inst.modulator;
+        let c = self.inst.carrier;
+        let mod_step = (chan_step * MUL_DOUBLED[(m.mul & 0x0F) as usize] as f64 / 2.0) as u32;
+        let car_step = (chan_step * MUL_DOUBLED[(c.mul & 0x0F) as usize] as f64 / 2.0) as u32;
+
+        // Modulator, phase-offset by its own previous output scaled to
+        // the FB register's modulation index (see the type-level doc).
+        let fb_scale = FB_PI_OVER_16[(self.inst.feedback & 0x07) as usize] as i32;
+        let fb_offset = self.prev_mod_out * fb_scale / 64;
+        let mod_phase =
+            wrap_phase(OperatorCore::phase_int(self.modulator.phase_acc) as i32 + fb_offset);
+        let mod_env_db = self.modulator.env.step();
+        let mod_out = core.operator_sample(
+            mod_phase,
+            atten_log_units(mod_env_db, m.total_level),
+            m.waveform,
+        );
+        self.prev_mod_out = mod_out;
+        self.modulator.phase_acc = self.modulator.phase_acc.wrapping_add(mod_step);
+
+        // Carrier: FM connection phase-modulates it by the modulator
+        // output; the additive connection leaves its phase clean.
+        let car_env_db = self.carrier.env.step();
+        let base_phase = OperatorCore::phase_int(self.carrier.phase_acc) as i32;
+        let car_phase = if self.inst.additive {
+            wrap_phase(base_phase)
+        } else {
+            wrap_phase(base_phase + mod_out)
+        };
+        let car_out = core.operator_sample(
+            car_phase,
+            atten_log_units(car_env_db, c.total_level),
+            c.waveform,
+        );
+        self.carrier.phase_acc = self.carrier.phase_acc.wrapping_add(car_step);
+
+        let sum = if self.inst.additive {
+            mod_out + car_out
+        } else {
+            car_out
+        };
+        // Full-scale single-operator amplitude is ±2042 (§ the exp ROM's
+        // 11-bit significand with the hidden bit) — normalise on 2048.
+        sum as f32 / 2048.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,6 +1229,141 @@ mod tests {
         assert_eq!(env.attenuation_db(), released);
         env.step();
         assert!(env.attenuation_db() < released);
+    }
+
+    /// A carrier-only-ish test instrument: near-silent modulator
+    /// (TL = 63), instant attack, frozen decay (DR = 0) so the carrier
+    /// holds at 0 dB — a deterministic, steady sine after ~8 samples.
+    fn steady_sine_inst(release: u8) -> AdLibInstrument {
+        AdLibInstrument {
+            modulator: Operator {
+                total_level: 63,
+                ..test_op(15, 0, 0, release, false, true)
+            },
+            carrier: test_op(15, 0, 0, release, false, true),
+            feedback: 0,
+            additive: false,
+        }
+    }
+
+    /// The channel frequency whose `MUL = 1` operator period is exactly
+    /// 64 output samples at 44.1 kHz (44100 / 64).
+    const F_PERIOD_64: f64 = 689.0625;
+
+    #[test]
+    fn voice_renders_bounded_nonzero_audio() {
+        let core = OperatorCore::new();
+        let mut v = OplVoice::new(steady_sine_inst(4), 0, FS);
+        let mut peak = 0.0f32;
+        for _ in 0..2000 {
+            let s = v.render_sample(&core, F_PERIOD_64);
+            assert!(s.is_finite() && s.abs() <= 2.0, "sample out of range: {s}");
+            peak = peak.max(s.abs());
+        }
+        assert!(peak > 0.5, "keyed-on voice too quiet: peak {peak}");
+    }
+
+    #[test]
+    fn voice_is_periodic_at_the_channel_frequency() {
+        // 44100 / 64 Hz => the carrier repeats every 64 samples once the
+        // envelope has settled (instant attack, frozen decay).
+        let core = OperatorCore::new();
+        let mut v = OplVoice::new(steady_sine_inst(4), 0, FS);
+        let out: Vec<f32> = (0..512)
+            .map(|_| v.render_sample(&core, F_PERIOD_64))
+            .collect();
+        for i in 200..400 {
+            assert_eq!(out[i], out[i + 64], "period broken at sample {i}");
+        }
+    }
+
+    #[test]
+    fn voice_key_off_releases_to_silence_within_documented_time() {
+        // RR nibble 8, KSR=0, N=0 => RATE 32 => 8212.48 / 2^7 ≈ 64.2 ms
+        // ≈ 2830 samples at 44.1 kHz for the full 96 dB run.
+        let core = OperatorCore::new();
+        let mut v = OplVoice::new(steady_sine_inst(8), 0, FS);
+        for _ in 0..100 {
+            v.render_sample(&core, F_PERIOD_64);
+        }
+        v.key_off();
+        let expected = (DECAY_FULL_SCALE_MS_AT_RATE_4 / 128.0 / 1000.0 * FS as f64) as usize;
+        let mut silent_at = None;
+        for i in 0..expected + 200 {
+            let s = v.render_sample(&core, F_PERIOD_64);
+            if v.finished() {
+                silent_at = Some(i);
+                assert_eq!(s, 0.0);
+                break;
+            }
+        }
+        let n = silent_at.expect("voice never finished after key-off");
+        assert!(
+            n + 200 >= expected,
+            "release finished after {n} samples, expected ~{expected}"
+        );
+        assert_eq!(v.render_sample(&core, F_PERIOD_64), 0.0);
+    }
+
+    #[test]
+    fn frozen_attack_rate_keeps_the_voice_silent() {
+        // AR nibble 0 => RATE 0 => the envelope never leaves the 96 dB
+        // floor: the voice outputs exact zeros.
+        let core = OperatorCore::new();
+        let inst = AdLibInstrument {
+            modulator: Operator {
+                total_level: 63,
+                ..test_op(0, 0, 0, 4, false, true)
+            },
+            carrier: test_op(0, 0, 0, 4, false, true),
+            feedback: 0,
+            additive: false,
+        };
+        let mut v = OplVoice::new(inst, 0, FS);
+        for _ in 0..1000 {
+            assert_eq!(v.render_sample(&core, F_PERIOD_64), 0.0);
+        }
+    }
+
+    #[test]
+    fn fm_and_additive_connections_differ() {
+        let core = OperatorCore::new();
+        let mut fm_inst = steady_sine_inst(4);
+        fm_inst.modulator.total_level = 0; // full-strength modulator
+        let mut add_inst = fm_inst;
+        add_inst.additive = true;
+        let mut fm = OplVoice::new(fm_inst, 0, FS);
+        let mut add = OplVoice::new(add_inst, 0, FS);
+        let mut diff = 0.0f32;
+        for _ in 0..512 {
+            let a = fm.render_sample(&core, F_PERIOD_64);
+            let b = add.render_sample(&core, F_PERIOD_64);
+            diff = diff.max((a - b).abs());
+        }
+        assert!(
+            diff > 0.1,
+            "FM and additive outputs identical (diff {diff})"
+        );
+    }
+
+    #[test]
+    fn feedback_changes_the_modulator_spectrum() {
+        let core = OperatorCore::new();
+        let mut base = steady_sine_inst(4);
+        base.modulator.total_level = 0;
+        let mut fb7 = base;
+        fb7.feedback = 7;
+        let mut clean = OplVoice::new(base, 0, FS);
+        let mut fed = OplVoice::new(fb7, 0, FS);
+        let mut diff = 0.0f32;
+        for _ in 0..512 {
+            let a = clean.render_sample(&core, F_PERIOD_64);
+            let b = fed.render_sample(&core, F_PERIOD_64);
+            diff = diff.max((a - b).abs());
+        }
+        assert!(diff > 0.05, "FB=7 output identical to FB=0 (diff {diff})");
+        // FB=0 must disable the path entirely (table entry 0).
+        assert_eq!(FB_PI_OVER_16[0], 0);
     }
 
     #[test]
