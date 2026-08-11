@@ -3171,6 +3171,7 @@ pub mod tests {
             looped: false,
             volume: 64,
             c5_speed: 8363,
+            adlib: None,
         }
     }
 
@@ -3314,6 +3315,7 @@ pub mod tests {
             looped: true,
             volume: 64,
             c5_speed: 8363,
+            adlib: None,
         };
         let samples = vec![sample];
         let mut ch = Channel {
@@ -3375,6 +3377,7 @@ pub mod tests {
             looped: true,
             volume: 64,
             c5_speed: 8363,
+            adlib: None,
         };
         let samples = vec![sample];
         // Park the cursor mid-way between frame 3 (loop_end-1) and the wrap.
@@ -3425,6 +3428,7 @@ pub mod tests {
             channels: [0xFFu8; 32],
             pans: [8u8; 32],
             muted: [true; 32],
+            adlib: [false; 32],
             order: vec![0xFF],
             instruments: Vec::new(),
             pattern_offsets: Vec::new(),
@@ -3970,6 +3974,7 @@ pub mod tests {
             looped: false,
             volume: 64,
             c5_speed: 8363,
+            adlib: None,
         };
 
         let mut p = PlayerState::new(&h, vec![sample], vec![Pattern::empty(1)], 44_100);
@@ -4101,6 +4106,7 @@ pub mod tests {
             looped: false,
             volume: 40,
             c5_speed: 8363,
+            adlib: None,
         };
         let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
         // Keep the harness from running off the synthesized pattern.
@@ -4321,6 +4327,7 @@ pub mod tests {
             looped: false,
             volume: 40,
             c5_speed: 8363,
+            adlib: None,
         };
         let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
         p.order = vec![0u8, 0u8];
@@ -4399,6 +4406,7 @@ pub mod tests {
             looped: false,
             volume: 64,
             c5_speed: 8363,
+            adlib: None,
         };
         let render_at = |gv: u8| -> i32 {
             let mut p = PlayerState::new(&h, vec![sample.clone()], vec![Pattern::empty(1)], 44_100);
@@ -4918,6 +4926,7 @@ pub mod tests {
             // (63) on the PCM path per §Playback Notes.
             volume: 64,
             c5_speed: 8363,
+            adlib: None,
         };
 
         let mut pat = Pattern::empty(1);
@@ -4987,6 +4996,7 @@ pub mod tests {
             looped: true,
             volume: 40,
             c5_speed: 8363,
+            adlib: None,
         };
 
         let mut pat = Pattern::empty(1);
@@ -5037,6 +5047,7 @@ pub mod tests {
             looped: true,
             volume: 64,
             c5_speed: 8363,
+            adlib: None,
         };
 
         let mut pat = Pattern::empty(1);
@@ -5080,6 +5091,7 @@ pub mod tests {
             looped: false,
             volume: 32,
             c5_speed: 8363,
+            adlib: None,
         };
 
         let mut pat = Pattern::empty(2);

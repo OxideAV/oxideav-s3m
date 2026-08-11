@@ -306,8 +306,16 @@ pub struct S3mHeader {
     /// bit 7 set (`0x80 | type`). Muted channels still parse pattern data
     /// (so jumps, loops, pattern-delay see consistent state) but produce
     /// no audio in the mixer. `0xFF` (unused) is treated as muted, since
-    /// no output channel is mapped to it.
+    /// no output channel is mapped to it, as are the AdLib *drum* slots
+    /// (type 25..=31 — "these are unused" per the multimedia.cx channel
+    /// map; only the nine melody slots 16..=24 render).
     pub muted: [bool; CHANNEL_COUNT],
+    /// Per-channel AdLib flag — true when the channel settings byte's
+    /// type bits (low 7) land in the nine OPL2 *melody* slots (16..=24,
+    /// `A1`..`A9` per the multimedia.cx channel map). Derived
+    /// independently of the mute bit, so a `+128`-muted AdLib channel
+    /// still reports `adlib = true` (and `muted = true`).
+    pub adlib: [bool; CHANNEL_COUNT],
     /// Raw order list (0xFE marker rows and 0xFF end markers preserved).
     pub order: Vec<u8>,
     /// Per-instrument definitions (parsed from parapointers).
@@ -437,10 +445,14 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
     //     — i.e. the mono override beats an explicitly-specified pan byte.
     //     We implement that as a final sweep over the resolved pan array.
     fn stereo_default_pan(channel_settings: u8) -> u8 {
-        // Mute / AdLib slots have no PCM output mapping — assign the
-        // centre value so the field is well-defined without affecting
-        // anything audible.
-        if channel_settings == 0xFF {
+        // Unused slots have no output mapping — assign the centre value
+        // so the field is well-defined without affecting anything
+        // audible. AdLib slots (type 16..=31) also default to centre:
+        // the YM3812 renders its nine melody channels into a single
+        // mono output on the hardware, so the L/R PCM bank split does
+        // not apply to them (an explicit pan byte or S8x/Xxx can still
+        // move a rendered FM voice).
+        if channel_settings == 0xFF || (channel_settings & 0x7F) >= 16 {
             return 0x08;
         }
         let slot = channel_settings & 0x0F;
@@ -480,7 +492,10 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
         }
     }
 
-    let enabled_channels = channels.iter().filter(|&&c| c != 0xFF && c < 16).count() as u8;
+    // Channels that carry audio: unmuted PCM (type 0..=15) and unmuted
+    // AdLib melody slots (16..=24). A `+128`-muted channel has bit 7 set
+    // so its byte exceeds 24 and drops out of the count naturally.
+    let enabled_channels = channels.iter().filter(|&&c| c != 0xFF && c <= 24).count() as u8;
 
     // Per-channel mute flag: bit 7 (`+128`) marks a channel as disabled in
     // the file-format spec. We treat 0xFF (unused) as muted too — there's no
@@ -488,12 +503,14 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
     // channels so jumps / loops / pattern-delay see consistent state; the
     // mixer silences them in `render`.
     let mut muted = [false; CHANNEL_COUNT];
+    let mut adlib = [false; CHANNEL_COUNT];
     for (i, c) in channels.iter().enumerate() {
-        // 0xFF = unused. Otherwise bit 7 set (mask 0x80) = explicitly muted.
-        // AdLib slots (16..=31) without bit 7 are valid AdLib channels in
-        // ST3 — we don't render those (no OPL synth), so report them as
-        // muted to keep the audio path silent without confusing the parser.
-        muted[i] = *c == 0xFF || (*c & 0x80) != 0 || (*c & 0x7F) >= 16;
+        // 0xFF = unused. Otherwise bit 7 set (mask 0x80) = explicitly
+        // muted. The nine AdLib melody slots (16..=24) render through the
+        // OPL2 voice path; the drum slots (25..=29, "unused" per the
+        // multimedia.cx channel map) and the undefined 30..=31 stay muted.
+        muted[i] = *c == 0xFF || (*c & 0x80) != 0 || (*c & 0x7F) >= 25;
+        adlib[i] = *c != 0xFF && (16..=24).contains(&(*c & 0x7F));
     }
 
     Ok(S3mHeader {
@@ -513,6 +530,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
         channels,
         pans,
         muted,
+        adlib,
         order,
         instruments,
         pattern_offsets,
@@ -766,6 +784,55 @@ mod tests {
     }
 
     #[test]
+    fn adlib_melody_slots_are_ungated_and_flagged() {
+        // Channel map per the multimedia.cx behavioural reference:
+        // 0..=15 PCM, 16..=24 AdLib/OPL2 melody (A1..A9), 25..=29 AdLib
+        // drums ("these are unused"). The nine melody slots render; the
+        // drum slots stay muted.
+        let mut settings = [0xFFu8; CHANNEL_COUNT];
+        settings[0] = 0x00; // left PCM
+        settings[1] = 16; // AdLib melody A1
+        settings[2] = 24; // AdLib melody A9
+        settings[3] = 25; // AdLib drum — unused, stays muted
+        settings[4] = 16 | 0x80; // +128-muted AdLib melody
+        let h = parse_header(&build_min_header(settings)).unwrap();
+        assert!(!h.muted[0] && !h.adlib[0]);
+        assert!(!h.muted[1] && h.adlib[1], "A1 must render");
+        assert!(!h.muted[2] && h.adlib[2], "A9 must render");
+        assert!(h.muted[3], "drum slot 25 stays muted");
+        assert!(!h.adlib[3], "drum slots are not melody voices");
+        assert!(
+            h.muted[4] && h.adlib[4],
+            "+128 AdLib slot: muted but still typed AdLib"
+        );
+        // enabled_channels counts unmuted PCM + unmuted AdLib melody:
+        // slots 0, 1, 2 — not the drum or the +128-muted one.
+        assert_eq!(h.enabled_channels, 3);
+    }
+
+    #[test]
+    fn adlib_slots_default_pan_to_centre() {
+        // The YM3812 renders all nine melody channels to one mono output
+        // — the stereo L/R PCM bank split does not apply, so AdLib slots
+        // default to the centre pan.
+        let mut settings = [0xFFu8; CHANNEL_COUNT];
+        settings[0] = 0x00; // left PCM  -> 0x03
+        settings[1] = 0x08; // right PCM -> 0x0C
+        settings[2] = 16; // AdLib      -> centre
+        settings[3] = 24; // AdLib      -> centre
+        let mut bytes = build_min_header(settings);
+        // The stereo master-volume bit must be set — in mono mode the
+        // FireLight §2.8.1 override centres every channel and the bank
+        // split under test never applies.
+        bytes[0x33] |= 0x80;
+        let h = parse_header(&bytes).unwrap();
+        assert_eq!(h.pans[0], 0x03);
+        assert_eq!(h.pans[1], 0x0C);
+        assert_eq!(h.pans[2], 0x08);
+        assert_eq!(h.pans[3], 0x08);
+    }
+
+    #[test]
     fn tracker_from_cwt_v_documented_prefixes() {
         // Per the multimedia.cx behavioural reference §"Tracker version"
         // (`docs/audio/trackers/s3m/multimedia-cx-scream-tracker-3.html`)
@@ -874,21 +941,21 @@ mod tests {
     }
 
     #[test]
-    fn muted_flag_set_for_adlib_slots() {
-        // AdLib melody (0x10..=0x18) and drum (0x19..=0x1D) slots are
-        // valid file-format entries but ST3 doesn't synthesise AdLib in
-        // the PCM mixer path. Mark them muted so the output stays silent
-        // instead of running an uninitialised PCM voice.
+    fn muted_flag_set_for_adlib_drum_slots_only() {
+        // AdLib *melody* slots (0x10..=0x18) render through the OPL2
+        // voice path and are no longer muted at parse time. The drum
+        // slots (0x19..=0x1D) are "unused" per the multimedia.cx channel
+        // map and stay muted.
         let mut settings = [0xFFu8; CHANNEL_COUNT];
         settings[0] = 0x10; // melody 1
         settings[1] = 0x18; // melody 9
         settings[2] = 0x1D; // drum 5
         let bytes = build_min_header(settings);
         let h = parse_header(&bytes).unwrap();
-        assert!(h.muted[0]);
-        assert!(h.muted[1]);
-        assert!(h.muted[2]);
-        // No PCM channels enabled → enabled_channels = 0.
-        assert_eq!(h.enabled_channels, 0);
+        assert!(!h.muted[0], "melody slot must render");
+        assert!(!h.muted[1], "melody slot must render");
+        assert!(h.muted[2], "drum slot stays muted");
+        // The two melody channels count toward the mixer normalisation.
+        assert_eq!(h.enabled_channels, 2);
     }
 }

@@ -39,6 +39,12 @@ pub struct SampleBody {
     pub volume: u8,
     /// C5 (middle-C) playback rate in Hz.
     pub c5_speed: u32,
+    /// Decoded OPL2 register block for an AdLib (`SCRI`, type 2..=7)
+    /// instrument. `None` for PCM instruments and empty slots. AdLib
+    /// instruments carry no PCM (`pcm` stays empty) — the player
+    /// synthesizes them through [`crate::opl2::OplVoice`] instead of the
+    /// sample mixer.
+    pub adlib: Option<crate::opl2::AdLibInstrument>,
 }
 
 impl SampleBody {
@@ -59,9 +65,12 @@ impl SampleBody {
 /// signed for 16-bit too — we follow ST3).
 pub fn decode_instrument(inst: &Instrument, bytes: &[u8], signed_samples: bool) -> SampleBody {
     if !inst.is_pcm() || inst.length == 0 {
+        // AdLib (`SCRI`) instruments land here: no PCM body, but the
+        // decoded OPL2 register block rides along for the FM voice path.
         return SampleBody {
             volume: inst.volume,
             c5_speed: inst.c5_speed.max(1),
+            adlib: inst.adlib_instrument(),
             ..Default::default()
         };
     }
@@ -96,6 +105,7 @@ pub fn decode_instrument(inst: &Instrument, bytes: &[u8], signed_samples: bool) 
             looped,
             volume: inst.volume,
             c5_speed: inst.c5_speed.max(1),
+            adlib: None,
         };
     }
     let is_16 = inst.is_16bit();
@@ -198,6 +208,7 @@ pub fn decode_instrument(inst: &Instrument, bytes: &[u8], signed_samples: bool) 
         looped,
         volume: inst.volume,
         c5_speed: inst.c5_speed.max(1),
+        adlib: None,
     }
 }
 
