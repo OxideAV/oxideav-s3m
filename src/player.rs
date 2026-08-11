@@ -16,6 +16,7 @@
 //! with N = 12 * octave + semitone. We compute this directly as a float.
 
 use crate::header::{S3mHeader, PATTERN_ROWS};
+use crate::opl2::{AdLibInstrument, OperatorCore, OplVoice};
 use crate::pattern::{Cell, Pattern};
 use crate::samples::SampleBody;
 
@@ -31,13 +32,14 @@ pub const DEFAULT_BPM: u8 = 125;
 /// channels, if the default volume is 64, it will use 64. Any further
 /// operations on the volume will clip it to within the 0-63 range."
 ///
-/// This crate decodes only the PCM path (Adlib FM synth is out of scope),
-/// so every active-volume write — instrument default load, volume-column,
-/// per-tick D/Dxy slide, retrigger modifier, tremor restore, tremolo
-/// delta — saturates to 63 rather than 64. The file-header *global*
-/// volume keeps the full 0..=64 range (it is not a per-channel active
-/// volume; multimedia.cx §Header: "Global volume (range 0 &lt;= x &lt;=
-/// 64)").
+/// On the PCM path every active-volume write — instrument default load,
+/// volume-column, per-tick D/Dxy slide, retrigger modifier, tremor
+/// restore, tremolo delta — saturates to 63 rather than 64. AdLib
+/// channels differ only at the instrument-default load, which keeps the
+/// full 64 (see [`ADLIB_VOLUME_PEAK`]); their effect-side operations
+/// clip to the same 0..=63 window. The file-header *global* volume
+/// keeps the full 0..=64 range (it is not a per-channel active volume;
+/// multimedia.cx §Header: "Global volume (range 0 &lt;= x &lt;= 64)").
 pub const PCM_VOLUME_PEAK: u8 = 63;
 
 /// Cap a candidate active-volume value to [`PCM_VOLUME_PEAK`].
@@ -50,6 +52,36 @@ pub const PCM_VOLUME_PEAK: u8 = 63;
 #[inline]
 pub fn clamp_pcm_volume(v: u16) -> u8 {
     v.min(PCM_VOLUME_PEAK as u16) as u8
+}
+
+/// Peak active-volume value for AdLib (OPL2) channels.
+///
+/// Per the multimedia.cx behavioural reference §Playback Notes: "on
+/// Adlib channels, if the default volume is 64, it will use 64. Any
+/// further operations on the volume will clip it to within the 0-63
+/// range." So the *instrument-default load* on an AdLib channel keeps
+/// the full 64 (unity gain), while every effect-side operation (volume
+/// column, slides, retrigger modifiers, tremolo) still funnels through
+/// [`clamp_pcm_volume`]'s 63 ceiling.
+pub const ADLIB_VOLUME_PEAK: u8 = 64;
+
+/// Derive the OPL2 key-scale number `N` (the 4-bit pitch code the KSR
+/// envelope-rate coupling is indexed by — see
+/// [`crate::opl2::effective_rate`]) from an S3M note byte.
+///
+/// The staged acquisition record defines `N` only as "the note's 4-bit
+/// key-scale number": a monotone 4-bit pitch code. Sixteen codes over
+/// the chip's eight octave blocks force two codes per octave, so we map
+/// `N = 2 * octave + (upper half-octave)`, splitting the octave at the
+/// F#/G boundary (semitone 6). The vendor's exact `N = f(BLOCK, F-NUM)`
+/// rule (including which F-NUM bit selects the half-octave) is not in
+/// the staged docs and is flagged as a docs gap; this derivation is the
+/// documented interim reading. `N` is resolved at note trigger time —
+/// pitch effects on a sounding note do not re-scale its envelope rates.
+fn key_scale_number(note: u8) -> u8 {
+    let octave = note >> 4;
+    let semi = note & 0x0F;
+    (octave * 2 + u8::from(semi >= 6)).min(15)
 }
 
 /// Command letters from the ST3 spec.
@@ -346,6 +378,15 @@ pub struct Channel {
     /// §SAx: "This effect is dependent on what channel type you put it
     /// on ... SA0/SA2: Normal panning (L is left, R is right) ...").
     pub right_bank: bool,
+    /// This channel maps to one of the nine OPL2 AdLib melody slots
+    /// (file channel-settings type 16..=24). AdLib channels synthesize
+    /// through [`Channel::opl_voice`] instead of the PCM sample mixer,
+    /// and their volume ceiling follows [`ADLIB_VOLUME_PEAK`].
+    pub adlib: bool,
+    /// The sounding OPL2 voice on an AdLib channel (`None` before the
+    /// first trigger, or when the triggering instrument carried no
+    /// `SCRI` register block).
+    pub opl_voice: Option<OplVoice>,
     /// Global volume *latched into this voice* at the moment its note
     /// volume was last (re)written. Per the multimedia.cx behavioural
     /// reference §Vxx: "It does not affect past notes, that are still
@@ -403,6 +444,8 @@ impl Default for Channel {
             muted: false,
             frozen: false,
             right_bank: false,
+            adlib: false,
+            opl_voice: None,
             // Default to full scale (64/64 = unity). A freshly-constructed
             // channel that has never carried a note plays at the player's
             // global volume the first time it triggers, re-latching there.
@@ -696,6 +739,10 @@ pub struct PlayerState {
     pub sample_rate: u32,
     pub ended: bool,
 
+    /// Shared YM3812 operator core (the two ROM tables) every AdLib
+    /// voice synthesizes through.
+    opl_core: OperatorCore,
+
     pending_jump: Option<Jump>,
     /// SBx (pattern loop) state. The loop start row is set by SB0; a
     /// subsequent SBx with x>0 loops back `x` times. ST3 keeps a single
@@ -749,6 +796,7 @@ impl PlayerState {
             .map(|i| Channel {
                 pan: header.pans.get(i).copied().unwrap_or(8) & 0x0F,
                 muted: header.muted.get(i).copied().unwrap_or(false),
+                adlib: header.adlib.get(i).copied().unwrap_or(false),
                 // Stereo bank from the channel-settings low nibble: slots
                 // 0..=7 = left (`L1..L8`), 8..=15 = right (`R1..R8`). Used
                 // only by the legacy SAx effect. 0xFF (unused) slots fall
@@ -828,6 +876,7 @@ impl PlayerState {
             tick_sample_cursor: 0,
             sample_rate,
             ended: false,
+            opl_core: OperatorCore::new(),
             pending_jump: None,
             loop_start_row: 0,
             loop_count: None,
@@ -1093,7 +1142,14 @@ impl PlayerState {
                         // "stored volume isn't modified by this effect"
                         // distinction — Ixy's restore target is updated
                         // here.
-                        let v = clamp_pcm_volume(s.volume as u16);
+                        // AdLib channels keep a default volume of 64
+                        // (unity) — only *operations* clip to 0..=63.
+                        // See [`ADLIB_VOLUME_PEAK`].
+                        let v = if ch.adlib {
+                            s.volume.min(ADLIB_VOLUME_PEAK)
+                        } else {
+                            clamp_pcm_volume(s.volume as u16)
+                        };
                         ch.volume = v;
                         ch.stored_volume = v;
                         // An instrument reload is a note-volume write: latch
@@ -1106,10 +1162,21 @@ impl PlayerState {
                     }
                 }
 
-                // Note cut.
+                // Note cut. On an AdLib channel with a sounding voice
+                // this is the "Adlib noteoff command" (ScreamTracker
+                // v3.20 manual §Adlib FM-songs): the voice keys off into
+                // its release stage — the channel stays active (and
+                // keeps its frequency) until the envelope runs out. PCM
+                // channels cut instantly as before.
                 if cell.note == 0xFE {
-                    ch.active = false;
-                    ch.frequency = 0.0;
+                    if ch.adlib && ch.opl_voice.is_some() {
+                        if let Some(voice) = ch.opl_voice.as_mut() {
+                            voice.key_off();
+                        }
+                    } else {
+                        ch.active = false;
+                        ch.frequency = 0.0;
+                    }
                 } else if cell.note != 0xFF {
                     // Trigger.
                     let inst_idx = ch.instrument as usize;
@@ -1176,6 +1243,19 @@ impl PlayerState {
                                 ch.tremolo_pos = 0;
                             }
                             ch.last_note = cell.note;
+                            // AdLib channel: key a fresh OPL2 voice on
+                            // from the instrument's SCRI register block.
+                            // The key-scale number resolves from the
+                            // triggering note (see [`key_scale_number`]).
+                            if ch.adlib {
+                                ch.opl_voice = self.samples[inst_idx - 1].adlib.map(|inst| {
+                                    OplVoice::new(
+                                        inst,
+                                        key_scale_number(cell.note),
+                                        self.sample_rate,
+                                    )
+                                });
+                            }
                         }
                     }
                 } else if (ch.command == cmd::G_TONE_PORTA || ch.command == cmd::L_PORT_VOL)
@@ -1578,11 +1658,12 @@ impl PlayerState {
         let global_vol_now = self.global_volume;
         // Clone sample metadata we need for deferred SDx triggers. Can't
         // borrow `&self.samples` inside the mutable-channel loop.
-        let samples_snapshot: Vec<(u32, u8)> = self
+        let samples_snapshot: Vec<(u32, u8, Option<AdLibInstrument>)> = self
             .samples
             .iter()
-            .map(|s| (s.c5_speed.max(1), s.volume))
+            .map(|s| (s.c5_speed.max(1), s.volume, s.adlib))
             .collect();
+        let sample_rate = self.sample_rate;
         // Snapshot the header-derived flag so the channel loop can clamp
         // each frequency-mutating effect without re-borrowing `self`.
         let amiga_limits = self.amiga_limits;
@@ -1607,7 +1688,13 @@ impl PlayerState {
                             // SDx-deferred instrument load is still a
                             // stored-volume write — Ixy's restore target
                             // tracks it just like the immediate trigger.
-                            let v = clamp_pcm_volume(samples_snapshot[idx - 1].1 as u16);
+                            // AdLib default volume keeps the full 64 —
+                            // see [`ADLIB_VOLUME_PEAK`].
+                            let v = if ch.adlib {
+                                samples_snapshot[idx - 1].1.min(ADLIB_VOLUME_PEAK)
+                            } else {
+                                clamp_pcm_volume(samples_snapshot[idx - 1].1 as u16)
+                            };
                             ch.volume = v;
                             ch.stored_volume = v;
                             // SDx-deferred instrument reload fires on tick x
@@ -1619,8 +1706,16 @@ impl PlayerState {
                         }
                     }
                     if pd.note == 0xFE {
-                        ch.active = false;
-                        ch.frequency = 0.0;
+                        // AdLib noteoff: key the voice off into its
+                        // release (same as the immediate-trigger path).
+                        if ch.adlib && ch.opl_voice.is_some() {
+                            if let Some(voice) = ch.opl_voice.as_mut() {
+                                voice.key_off();
+                            }
+                        } else {
+                            ch.active = false;
+                            ch.frequency = 0.0;
+                        }
                     } else if pd.note != 0xFF {
                         let inst_idx = ch.instrument as usize;
                         if inst_idx > 0 && inst_idx <= samples_snapshot.len() {
@@ -1640,6 +1735,13 @@ impl PlayerState {
                                 ch.tremolo_pos = 0;
                             }
                             ch.last_note = pd.note;
+                            // SDx-deferred AdLib trigger keys a fresh
+                            // voice, same as the immediate path.
+                            if ch.adlib {
+                                ch.opl_voice = samples_snapshot[inst_idx - 1].2.map(|inst| {
+                                    OplVoice::new(inst, key_scale_number(pd.note), sample_rate)
+                                });
+                            }
                         }
                     }
                     if pd.volume != 0xFF {
@@ -1871,8 +1973,11 @@ impl PlayerState {
         if speed == 0 && depth == 0 {
             return;
         }
-        // §Rxy: "Tremolo will not work if the stored volume is 0."
-        if ch.stored_volume == 0 {
+        // §Rxy: "Tremolo will not work if the stored volume is 0" — and
+        // §Playback Notes' effects list adds "(or 64 - Adlib only)": an
+        // AdLib channel still carrying its untouched default volume of
+        // 64 is likewise immune.
+        if ch.stored_volume == 0 || (ch.adlib && ch.stored_volume == ADLIB_VOLUME_PEAK) {
             return;
         }
         ch.tremolo_pos = ch.tremolo_pos.wrapping_add(speed * 4);
@@ -1998,6 +2103,12 @@ impl PlayerState {
         ch.retrig_counter = ch.retrig_counter.saturating_add(1);
         if ch.retrig_counter >= y {
             ch.sample_pos = 0.0;
+            // An AdLib voice retriggers by re-keying: the attack
+            // restarts from the current attenuation (see
+            // [`crate::opl2::Envelope::key_on`]).
+            if let Some(voice) = ch.opl_voice.as_mut() {
+                voice.key_on();
+            }
             ch.volume = retrigger_volume(ch.volume, x);
             ch.retrig_counter = 0;
         }
@@ -2098,7 +2209,12 @@ impl PlayerState {
     /// keeps a Q/G/H state-bearing pattern row consistent with what a real
     /// ST3 would render if you later unmute the slot mid-song — but emit
     /// silence into the bus.
-    fn mix_channel(ch: &mut Channel, samples: &[SampleBody], out_rate: f32) -> (f32, f32) {
+    fn mix_channel(
+        ch: &mut Channel,
+        samples: &[SampleBody],
+        opl_core: &OperatorCore,
+        out_rate: f32,
+    ) -> (f32, f32) {
         if !ch.active || ch.frequency <= 0.0 {
             return (0.0, 0.0);
         }
@@ -2129,6 +2245,29 @@ impl PlayerState {
                 }
             }
             return (0.0, 0.0);
+        }
+        if ch.adlib {
+            // OPL2 melody channel: synthesize through the FM voice at
+            // the channel's current frequency. Voice-less slots (no
+            // SCRI instrument triggered yet, or a PCM instrument on an
+            // AdLib channel) and finished voices go inactive.
+            let Some(voice) = ch.opl_voice.as_mut() else {
+                ch.active = false;
+                return (0.0, 0.0);
+            };
+            if voice.finished() {
+                ch.active = false;
+                return (0.0, 0.0);
+            }
+            let out = voice.render_sample(opl_core, ch.frequency as f64);
+            // AdLib active volume peaks at 64 (unity), not the PCM 63 —
+            // see [`ADLIB_VOLUME_PEAK`]. The per-voice global-volume
+            // latch applies exactly as on the PCM path.
+            let v = (ch.volume.min(ADLIB_VOLUME_PEAK) as f32) / 64.0;
+            let gv = (ch.voice_global_vol.min(64) as f32) / 64.0;
+            let vol = v * gv;
+            let pan = (ch.pan as f32) / 15.0;
+            return (out * vol * (1.0 - pan), out * vol * pan);
         }
         let idx = ch.instrument as usize;
         if idx == 0 || idx > samples.len() {
@@ -2248,7 +2387,7 @@ impl PlayerState {
         let mut l = 0.0f32;
         let mut r = 0.0f32;
         for ch in &mut self.channels {
-            let (cl, cr) = Self::mix_channel(ch, &self.samples, out_rate);
+            let (cl, cr) = Self::mix_channel(ch, &self.samples, &self.opl_core, out_rate);
             l += cl;
             r += cr;
         }
@@ -2309,7 +2448,7 @@ impl PlayerState {
         // re-applied here (see `render_one`).
         let scale = mv;
         for (i, ch) in self.channels.iter_mut().enumerate() {
-            let (cl, cr) = Self::mix_channel(ch, &self.samples, out_rate);
+            let (cl, cr) = Self::mix_channel(ch, &self.samples, &self.opl_core, out_rate);
             let l = (cl * scale).clamp(-1.0, 1.0);
             let r = (cr * scale).clamp(-1.0, 1.0);
             let off = i * 2;
@@ -3195,8 +3334,10 @@ pub mod tests {
         };
         let mut muted = unmuted.clone();
         muted.muted = true;
-        let (l1, r1) = PlayerState::mix_channel(&mut unmuted, &samples, 44_100.0);
-        let (l2, r2) = PlayerState::mix_channel(&mut muted, &samples, 44_100.0);
+        let (l1, r1) =
+            PlayerState::mix_channel(&mut unmuted, &samples, &OperatorCore::new(), 44_100.0);
+        let (l2, r2) =
+            PlayerState::mix_channel(&mut muted, &samples, &OperatorCore::new(), 44_100.0);
         assert!(l1.abs() + r1.abs() > 0.01, "unmuted must emit audio");
         assert_eq!((l2, r2), (0.0, 0.0), "muted must emit silence");
     }
@@ -3220,8 +3361,8 @@ pub mod tests {
         let mut muted = unmuted.clone();
         muted.muted = true;
         for _ in 0..200 {
-            PlayerState::mix_channel(&mut unmuted, &samples, 44_100.0);
-            PlayerState::mix_channel(&mut muted, &samples, 44_100.0);
+            PlayerState::mix_channel(&mut unmuted, &samples, &OperatorCore::new(), 44_100.0);
+            PlayerState::mix_channel(&mut muted, &samples, &OperatorCore::new(), 44_100.0);
         }
         // Same step size on both branches, so cursors must match exactly.
         assert_eq!(
@@ -3247,7 +3388,7 @@ pub mod tests {
             muted: true,
             ..Channel::default()
         };
-        let (l, r) = PlayerState::mix_channel(&mut ch, &samples, 44_100.0);
+        let (l, r) = PlayerState::mix_channel(&mut ch, &samples, &OperatorCore::new(), 44_100.0);
         assert_eq!((l, r), (0.0, 0.0));
         assert_eq!(ch.sample_pos, 0.0);
     }
@@ -3272,8 +3413,8 @@ pub mod tests {
         let mut frozen = thawed.clone();
         frozen.frozen = true;
         for _ in 0..200 {
-            PlayerState::mix_channel(&mut thawed, &samples, 44_100.0);
-            PlayerState::mix_channel(&mut frozen, &samples, 44_100.0);
+            PlayerState::mix_channel(&mut thawed, &samples, &OperatorCore::new(), 44_100.0);
+            PlayerState::mix_channel(&mut frozen, &samples, &OperatorCore::new(), 44_100.0);
         }
         // The thawed branch must have advanced past the starting cursor.
         assert!(
@@ -3283,7 +3424,8 @@ pub mod tests {
         );
         // The frozen branch must have produced silence AND not advanced.
         // We re-mix one more step on each and check the frozen output.
-        let (fl, fr) = PlayerState::mix_channel(&mut frozen, &samples, 44_100.0);
+        let (fl, fr) =
+            PlayerState::mix_channel(&mut frozen, &samples, &OperatorCore::new(), 44_100.0);
         assert_eq!((fl, fr), (0.0, 0.0), "frozen must emit silence");
         assert_eq!(
             frozen.sample_pos, 100.0,
@@ -3331,7 +3473,8 @@ pub mod tests {
             ..Channel::default()
         };
         for _ in 0..200 {
-            let (l, r) = PlayerState::mix_channel(&mut ch, &samples, 44_100.0);
+            let (l, r) =
+                PlayerState::mix_channel(&mut ch, &samples, &OperatorCore::new(), 44_100.0);
             // The poison tail (-30_000) would drive |sample| ~0.9; the loop
             // window value (+1_000) sits near 0.03. If we ever read the tail
             // the magnitude jumps well past the loop-window level.
@@ -3391,7 +3534,7 @@ pub mod tests {
             target_frequency: 44_100.0,
             ..Channel::default()
         };
-        let (l, _r) = PlayerState::mix_channel(&mut ch, &samples, 44_100.0);
+        let (l, _r) = PlayerState::mix_channel(&mut ch, &samples, &OperatorCore::new(), 44_100.0);
         // s0 = frame 3 (+8_000), s1 = loop_start frame 1 (+8_000): the
         // interpolation stays at +8_000 (≈0.24 after volume/pan). A buggy
         // read of frame 4 (-8_000) would land near the midpoint ≈0.0.
@@ -5760,5 +5903,259 @@ pub mod tests {
             !p.channels[0].active,
             "an instrument with no note must not activate a silent channel"
         );
+    }
+
+    // ----- AdLib (OPL2) playback ---------------------------------------
+
+    /// A sustained OPL2 instrument with an instant attack, frozen decay
+    /// (holds at 0 dB) and the given release nibble — deterministic
+    /// steady tone until key-off. Modulator is silenced (TL = 63) so the
+    /// carrier's sine dominates.
+    fn adlib_test_instrument(release: u8) -> AdLibInstrument {
+        // $20 mod/car: EGT=1 (0x20) | MUL=1; $40 mod: TL=63; $60: AR=15
+        // DR=0; $80: SL=0 RR=release; $E0: sine; $C0: FM, no feedback.
+        AdLibInstrument::from_registers(&[
+            0x21,
+            0x21,
+            0x3F,
+            0x00,
+            0xF0,
+            0xF0,
+            release & 0x0F,
+            release & 0x0F,
+            0x00,
+            0x00,
+            0x00,
+        ])
+    }
+
+    /// Build a player whose channel 0 is an AdLib melody slot (type 16)
+    /// carrying `rows`, with instrument 1 an OPL2 `SCRI` voice of the
+    /// given default volume and release nibble.
+    fn adlib_player(rows: Vec<[Cell; 32]>, default_volume: u8, release: u8) -> PlayerState {
+        let mut h = synth_header();
+        h.channels = [0xFFu8; 32];
+        h.channels[0] = 16; // AdLib melody A1
+        h.muted = [true; 32];
+        h.muted[0] = false;
+        h.adlib = [false; 32];
+        h.adlib[0] = true;
+        h.pans = [8u8; 32];
+        h.global_volume = 64;
+        h.enabled_channels = 1;
+        h.order = vec![0u8];
+
+        let n = rows.len().max(1);
+        let mut pat = Pattern::empty(1);
+        for (i, row) in rows.into_iter().enumerate() {
+            pat.rows[i] = row.to_vec();
+        }
+        let sample = SampleBody {
+            volume: default_volume,
+            c5_speed: 8363,
+            adlib: Some(adlib_test_instrument(release)),
+            ..Default::default()
+        };
+        let mut p = PlayerState::new(&h, vec![sample], vec![pat], 44_100);
+        p.order = vec![0u8; n];
+        p
+    }
+
+    fn row_with(cell: Cell) -> [Cell; 32] {
+        let mut row = [Cell::default(); 32];
+        row[0] = cell;
+        row
+    }
+
+    /// Render `frames` stereo frames and return the interleaved buffer.
+    fn render_frames(p: &mut PlayerState, frames: usize) -> Vec<i16> {
+        let mut buf = vec![0i16; frames * 2];
+        let got = p.render(&mut buf);
+        buf.truncate(got * 2);
+        buf
+    }
+
+    #[test]
+    fn adlib_channel_renders_audible_output() {
+        // The headline ungate: an OPL2 melody channel triggering a SCRI
+        // instrument must produce real audio through the normal render
+        // path.
+        let mut p = adlib_player(vec![row_with(note_cell(0x40))], 64, 4);
+        let buf = render_frames(&mut p, 4096);
+        let peak = buf.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(
+            peak > 2000,
+            "AdLib channel should be audible, peak was {peak}"
+        );
+    }
+
+    #[test]
+    fn adlib_default_volume_64_is_kept_but_operations_clip_to_63() {
+        // §Playback Notes: "on Adlib channels, if the default volume is
+        // 64, it will use 64. Any further operations on the volume will
+        // clip it to within the 0-63 range."
+        let mut p = adlib_player(vec![row_with(note_cell(0x40))], 64, 4);
+        p.enter_row();
+        assert_eq!(
+            p.channels[0].volume, 64,
+            "AdLib default volume 64 must be kept, not clipped to 63"
+        );
+
+        // An explicit volume column of 64 is an *operation* — clips to 63.
+        let mut cell = note_cell(0x40);
+        cell.volume = 64;
+        let mut p = adlib_player(vec![row_with(cell)], 64, 4);
+        p.enter_row();
+        assert_eq!(
+            p.channels[0].volume, 63,
+            "a volume-column write is an operation and clips to 63"
+        );
+
+        // The PCM path still clips the default load to 63.
+        let mut p = voice_gv_player(vec![row_with(note_cell(0x40))]);
+        p.samples[0].volume = 64;
+        p.enter_row();
+        assert_eq!(p.channels[0].volume, PCM_VOLUME_PEAK);
+    }
+
+    #[test]
+    fn adlib_noteoff_releases_instead_of_cutting() {
+        // ScreamTracker v3.20 manual §Adlib FM-songs: the note-off
+        // command keys the FM voice off — the release stage still
+        // sounds, unlike a PCM cut. Slow release (RR nibble 1 => RATE 4
+        // => 8212.48 ms) so the tail is clearly audible after the cut.
+        let rows = vec![row_with(note_cell(0x40)), row_with(note_cell(0xFE))];
+        let mut p = adlib_player(rows, 64, 1);
+        // Row 0: 6 ticks * 882 samples = 5292 frames, then row 1 keys off.
+        let _ = render_frames(&mut p, 5292 + 882);
+        assert!(
+            p.channels[0].active,
+            "AdLib channel must stay active through its release"
+        );
+        assert!(
+            p.channels[0].frequency > 0.0,
+            "release keeps sounding at the note's pitch"
+        );
+        let tail = render_frames(&mut p, 2048);
+        let peak = tail.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(peak > 500, "release tail should be audible, peak {peak}");
+
+        // A PCM channel with the same pattern cuts to silence instantly.
+        let rows = vec![row_with(note_cell(0x40)), row_with(note_cell(0xFE))];
+        let mut p = voice_gv_player(rows);
+        let _ = render_frames(&mut p, 5292 + 882);
+        assert!(!p.channels[0].active, "PCM note cut deactivates the voice");
+    }
+
+    #[test]
+    fn adlib_release_tail_length_matches_documented_rate() {
+        // Conformance through the *full render path*: RR nibble 8, C-5
+        // note (key-scale number 8, KSR off => Rks 2) => RATE 34 =>
+        // 8212.48 / 2^7.5 ms ≈ 45.4 ms ≈ 2001 samples of release after
+        // the key-off row boundary at frame 5292.
+        let rows = vec![row_with(note_cell(0x40)), row_with(note_cell(0xFE))];
+        let mut p = adlib_player(rows, 64, 8);
+        let buf = render_frames(&mut p, 5292 + 8000);
+        let last_nonzero = buf
+            .chunks(2)
+            .rposition(|f| f[0] != 0 || f[1] != 0)
+            .expect("expected audio");
+        let expected_end = 5292.0
+            + crate::opl2::full_scale_traversal_ms(crate::opl2::DECAY_FULL_SCALE_MS_AT_RATE_4, 34)
+                / 1000.0
+                * 44_100.0;
+        // The audible tail ends a little before the mathematical 96 dB
+        // floor (16-bit output quantises the last few dB to zero) —
+        // allow a one-sided window.
+        assert!(
+            (last_nonzero as f64) <= expected_end + 8.0,
+            "tail ran past the documented release window: {last_nonzero} > {expected_end:.0}"
+        );
+        assert!(
+            (last_nonzero as f64) >= expected_end - 900.0,
+            "tail ended far before the documented release window: {last_nonzero} vs {expected_end:.0}"
+        );
+    }
+
+    #[test]
+    fn muted_adlib_channel_stays_silent() {
+        let mut p = adlib_player(vec![row_with(note_cell(0x40))], 64, 4);
+        p.channels[0].muted = true;
+        let buf = render_frames(&mut p, 4096);
+        assert!(
+            buf.iter().all(|&s| s == 0),
+            "muted AdLib channel must not reach the bus"
+        );
+    }
+
+    #[test]
+    fn adlib_channel_without_scri_instrument_goes_inactive() {
+        // A PCM instrument triggered on an AdLib slot has no register
+        // block to key: the channel must fall silent, not run an
+        // uninitialised FM voice.
+        let mut p = adlib_player(vec![row_with(note_cell(0x40))], 64, 4);
+        p.samples[0].adlib = None;
+        let buf = render_frames(&mut p, 2048);
+        assert!(buf.iter().all(|&s| s == 0));
+        assert!(!p.channels[0].active);
+    }
+
+    #[test]
+    fn adlib_tremolo_disabled_at_stored_volume_64() {
+        // §effects list: "Tremolo will not work if the stored volume is
+        // 0 (or 64 - Adlib only)."
+        let mut ch = Channel {
+            adlib: true,
+            stored_volume: 64,
+            volume: 64,
+            ..Channel::default()
+        };
+        for _ in 0..8 {
+            PlayerState::apply_tremolo(&mut ch, 4, 8);
+        }
+        assert_eq!(ch.volume, 64, "tremolo must not act on stored volume 64");
+        // At stored 63 it does act.
+        ch.stored_volume = 63;
+        for _ in 0..8 {
+            PlayerState::apply_tremolo(&mut ch, 4, 8);
+        }
+        assert_ne!(ch.volume, 64);
+    }
+
+    #[test]
+    fn key_scale_number_tracks_note_pitch() {
+        // Two codes per octave, split at the F#/G boundary, clamped to
+        // the 4-bit domain.
+        assert_eq!(key_scale_number(0x00), 0); // C-0
+        assert_eq!(key_scale_number(0x05), 0); // F-0
+        assert_eq!(key_scale_number(0x06), 1); // F#0
+        assert_eq!(key_scale_number(0x40), 8); // C-5 reference
+        assert_eq!(key_scale_number(0x7B), 15); // B-7
+        assert_eq!(key_scale_number(0x8B), 15); // B-8 clamps
+                                                // Monotone over the full 9-octave note range.
+        let mut prev = 0;
+        for oct in 0..9u8 {
+            for semi in 0..12u8 {
+                let n = key_scale_number((oct << 4) | semi);
+                assert!(n >= prev, "N not monotone at note {oct}-{semi}");
+                prev = n;
+            }
+        }
+    }
+
+    #[test]
+    fn adlib_retrigger_rekeys_the_voice() {
+        // Qxy on an AdLib channel re-keys the envelope (audible attack
+        // restart) rather than resetting a PCM cursor. Use a percussive
+        // twin so the envelope is decaying — after several retriggers
+        // the voice must still be sounding (attack keeps restarting).
+        let mut cell = note_cell(0x40);
+        cell.command = cmd::Q_RETRIGGER;
+        cell.info = 0x02; // retrig every 2 ticks
+        let mut p = adlib_player(vec![row_with(cell)], 64, 6);
+        let _ = render_frames(&mut p, 5292);
+        assert!(p.channels[0].active);
+        let voice = p.channels[0].opl_voice.as_ref().expect("voice");
+        assert!(!voice.finished());
     }
 }
