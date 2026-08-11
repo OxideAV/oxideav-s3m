@@ -510,6 +510,54 @@ fn rich_module_byte_mutations_never_panic() {
     }
 }
 
+/// An AdLib variant of the minimal seed: channel 0 is OPL2 melody slot
+/// `A1` (type 16) and the instrument is a `SCRI` register block, so the
+/// mutation / truncation corpora reach the FM synthesis path — envelope
+/// rate resolution, the key-scale coupling, the operator core, and the
+/// AdLib note-off — with adversarial register bytes.
+fn build_adlib_module() -> Vec<u8> {
+    let mut b = build_valid_module();
+    b[0x40] = 16; // channel 0 = AdLib melody A1
+    let ins = 0x80;
+    b[ins] = 2; // SCRI melody instrument
+                // Register block at +0x10: sustained carrier, KSR on, instant
+                // attack, mid decay/release — every field nonzero so mutations flip
+                // real parameter bits.
+    let regs = [
+        0x31, 0x21, 0x3F, 0x08, 0xF4, 0xF2, 0x35, 0x47, 0x01, 0x00, 0x0D,
+    ];
+    put(&mut b, ins + 0x10, &regs);
+    put(&mut b, ins + 0x4C, b"SCRI");
+    // Row 1: AdLib note-off so the release path runs too.
+    let pat = 0x100;
+    let body = [0x20u8, 0x40, 0x01, 0x00, 0x20, 0xFE, 0x01, 0x00];
+    let length = (2 + body.len()) as u16;
+    put(&mut b, pat, &length.to_le_bytes());
+    put(&mut b, pat + 2, &body);
+    b
+}
+
+#[test]
+fn adlib_module_truncation_and_mutations_never_panic() {
+    let seed = build_adlib_module();
+    // Sanity: the unmutated seed actually exercises the FM path.
+    drive_pipeline(&seed);
+    drive_decoder_api(&seed);
+    for len in 0..=seed.len() {
+        drive_pipeline(&seed[..len]);
+    }
+    let mut rng = Rng::new(0xAD11_B5EE_D440);
+    for _ in 0..3000 {
+        let mut m = seed.clone();
+        let mutations = 1 + rng.below(8);
+        for _ in 0..mutations {
+            let idx = rng.below(m.len() as u32) as usize;
+            m[idx] = rng.next_u32() as u8;
+        }
+        drive_pipeline(&m);
+    }
+}
+
 #[test]
 fn truncation_prefixes_never_panic() {
     // Every prefix of a valid module — from the empty slice up to the full
