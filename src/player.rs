@@ -776,6 +776,29 @@ pub struct PlayerState {
     /// cleared on the next `enter_row` — matching the spec's "doesn't do
     /// anything if the current speed is 1".
     pending_global_vol: Option<u8>,
+    /// Index of the first in-band order-list sentinel (`0xFE` "++" marker or
+    /// `0xFF` "--" end-of-tune mark) in the **raw** order list, or `None`
+    /// when the list carries no sentinel. Precomputed at construction; feeds
+    /// the [`divergent_jump_count`](Self::divergent_jump_count) diagnostic.
+    first_sentinel_order: Option<u8>,
+    /// Diagnostic counter for `Bxx` order jumps on which S3M players are
+    /// known to disagree. Per the staged erratum
+    /// (`docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`
+    /// §"Erratum — the four staged sources give three different answers"),
+    /// the staged references never settle whether a `Bxx` parameter indexes
+    /// the **raw** on-disk order list or a marker-**compacted**, renumbered
+    /// copy — and the two models pick *different patterns* for any index at
+    /// or after the first sentinel. This player follows the erratum's
+    /// recommended raw-list model (the only one in which `Bxx`'s parameter
+    /// means the number the tracker's own order editor displays) and, as the
+    /// same section recommends, "surface[s] any `Bxx` that lands on or after
+    /// the first sentinel as a diagnostic". Each `Bxx` write whose parameter
+    /// names an order slot at or after [`Self::first_sentinel_order`] — or
+    /// past the end of the order list, where the models likewise diverge
+    /// (wrap-to-start vs. end of decode) — increments this counter. A
+    /// nonzero value after playback means the module sits in the set on
+    /// which players disagree; the rendered output itself is unaffected.
+    pub divergent_jump_count: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -884,6 +907,12 @@ impl PlayerState {
             pattern_delay_remaining: 0,
             replaying_for_pattern_delay: false,
             pending_global_vol: None,
+            first_sentinel_order: header
+                .order
+                .iter()
+                .position(|&v| v == 0xFE || v == 0xFF)
+                .map(|i| i.min(usize::from(u8::MAX)) as u8),
+            divergent_jump_count: 0,
         }
     }
 
@@ -938,6 +967,17 @@ impl PlayerState {
 
     fn find_next_playable_order(&mut self) -> Option<u8> {
         // Walk past 0xFE (marker) entries; stop at 0xFF (end).
+        //
+        // This is the raw-order-list sentinel handling the staged erratum
+        // recommends (`docs/audio/trackers/s3m/
+        // s3m-position-jump-pattern-break-and-adpcm.md` §Erratum): the order
+        // list keeps its on-disk indices — `Bxx` and natural advance both
+        // land on raw slots — and the in-band sentinels are resolved at
+        // fetch time, "254=++ is just a marker that is skipped" and
+        // "255=-- is the end of tune mark"
+        // (`ScreamTracker-v3.20-s3m.txt` order-list section). The list is
+        // never compacted, so a `Bxx` parameter always means the number
+        // ST3's own order editor displays.
         while (self.order_index as usize) < self.order.len() {
             let v = self.order[self.order_index as usize];
             if v == 0xFF {
@@ -1312,7 +1352,25 @@ impl PlayerState {
                     // implicit row-0 destination of a bare Bxx comes from the
                     // merge below (`jump_row` still `None` → row 0), so a
                     // companion Cxx on the same row can override it.
+                    //
+                    // The parameter indexes the **raw** on-disk order list —
+                    // in-band `0xFE`/`0xFF` sentinels are handled at fetch
+                    // time by `find_next_playable_order`, never compacted
+                    // away. That is the model the staged erratum recommends
+                    // (`s3m-position-jump-pattern-break-and-adpcm.md`
+                    // §Erratum): it is the only one in which the parameter
+                    // means the number ST3's own order editor displays.
+                    // Any Bxx naming a slot at/after the first sentinel (or
+                    // past the end) sits in the region where the raw-list
+                    // and compacted models pick different patterns, so it
+                    // is surfaced through the recommended diagnostic.
                     jump_order = Some(ch.info);
+                    let idx = usize::from(ch.info);
+                    let divergent = idx >= self.order.len()
+                        || self.first_sentinel_order.is_some_and(|s| ch.info >= s);
+                    if divergent {
+                        self.divergent_jump_count = self.divergent_jump_count.saturating_add(1);
+                    }
                 }
                 cmd::C_PAT_BREAK => {
                     // Writes only the target *row*. Parameter is BCD (high
@@ -2197,6 +2255,15 @@ impl PlayerState {
                 self.order_index = self.order_index.saturating_add(1);
             }
         }
+        // Past the end of the raw order list — natural advance or a Bxx
+        // naming an out-of-range slot. ST3 itself, as a live looping
+        // player, wraps to the start here (FireLight §6.2 / §6.3, noted as
+        // "established" by the staged erratum); a finite decoder maps that
+        // wrap to end-of-decode, otherwise every such module would render
+        // forever. The erratum's substantive open question (raw vs.
+        // compacted indexing) does not affect this branch — both models
+        // stop producing new material at this point — and any Bxx that
+        // reached it has already been counted in `divergent_jump_count`.
         if self.order_index as usize >= self.order.len() {
             self.ended = true;
         }
@@ -5695,6 +5762,186 @@ pub mod tests {
         let jump = p.pending_jump.expect("Bxx alone still arms a jump");
         assert_eq!(jump.order, Some(2));
         assert_eq!(jump.row, 0, "the ignored Cxx contributes no row");
+    }
+
+    // ---- Raw-order-list model + sentinel handling, per the staged erratum
+    // `docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`
+    // §"Erratum — the four staged sources give three different answers":
+    // Bxx indexes the RAW on-disk order list; 0xFE ("++") is skipped
+    // forward, 0xFF ("--") ends the tune, and any Bxx landing at/after the
+    // first sentinel is surfaced through `divergent_jump_count`.
+
+    /// Pattern 0 carries a single `Bxx` with the given infobyte on row 0 of
+    /// channel 0; the remaining patterns are empty. Drives one row so the
+    /// jump is taken and the destination order slot is settled.
+    fn take_bxx_probe(order: Vec<u8>, info: u8, n_pats: usize) -> PlayerState {
+        let mut pat0 = Pattern::empty(1);
+        pat0.rows[0][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::B_POS_JUMP,
+            info,
+        };
+        let mut pats = vec![Pattern::empty(1); n_pats];
+        pats[0] = pat0;
+        let mut p = multi_pattern_player(order, pats);
+        p.enter_row(); // row 0 of pattern 0 arms the jump
+        p.next_row(); // jump taken: order_index = infobyte, row = 0
+        p.tick = 0;
+        p.enter_row(); // sentinel walk settles the playable slot (or ends)
+        p
+    }
+
+    #[test]
+    fn bxx_indexes_the_raw_order_list_and_skips_markers_forward() {
+        // The erratum's worked probe table, raw-list model: order list
+        // [000, 001, 002, 002, 254, 254, 003, 004] (raw SONGLENGTH 8).
+        // B04 → slot 4 = 254, skip → 5 = 254, skip → 6 → pattern 003.
+        // B05 → slot 5 = 254, skip → 6 → pattern 003 (the compacted model
+        //       would pick pattern 004 here).
+        // B06 → slot 6 → pattern 003 directly (the compacted model would
+        //       wrap to order 0 → pattern 000 here).
+        let order = vec![0u8, 1, 2, 2, 254, 254, 3, 4];
+        for info in [0x04u8, 0x05, 0x06] {
+            let p = take_bxx_probe(order.clone(), info, 5);
+            assert!(
+                !p.ended,
+                "B{info:02X} must keep playing under the raw-list model"
+            );
+            assert_eq!(
+                p.order_index, 6,
+                "B{info:02X} must settle on raw slot 6 (the first playable \
+                 slot at/after the named index)"
+            );
+            assert_eq!(
+                p.order[p.order_index as usize], 3,
+                "B{info:02X} must select pattern 003 per the erratum's \
+                 raw-list probe table"
+            );
+        }
+    }
+
+    #[test]
+    fn bxx_after_the_sentinel_run_keeps_raw_indexing() {
+        // B07 on the same list names raw slot 7 → pattern 004. Under the
+        // compacted model index 7 would be past the recomputed length 6 and
+        // wrap to pattern 000 — the raw model must NOT do that.
+        let order = vec![0u8, 1, 2, 2, 254, 254, 3, 4];
+        let p = take_bxx_probe(order, 0x07, 5);
+        assert!(!p.ended);
+        assert_eq!(p.order_index, 7);
+        assert_eq!(p.order[7], 4, "raw slot 7 holds pattern 004");
+    }
+
+    #[test]
+    fn bxx_landing_on_the_end_mark_ends_the_tune() {
+        // "255=-- is the end of tune mark" (ScreamTracker-v3.20-s3m.txt);
+        // a Bxx naming a slot that holds 0xFF ends playback even though
+        // playable slots follow it.
+        let p = take_bxx_probe(vec![0u8, 255, 1], 0x01, 2);
+        assert!(p.ended, "a Bxx onto the 0xFF end mark must end the tune");
+    }
+
+    #[test]
+    fn bxx_past_the_raw_order_list_ends_the_decode() {
+        // ST3's live player wraps to the first order here (FireLight §6.2);
+        // a finite decoder maps that wrap to end-of-decode.
+        let p = take_bxx_probe(vec![0u8, 1], 0x05, 2);
+        assert!(p.ended, "an out-of-range Bxx must end the decode");
+    }
+
+    #[test]
+    fn natural_advance_skips_markers_and_stops_at_the_end_mark() {
+        // Order [000, 254, 001, 255, 002]: crossing the pattern boundary
+        // from slot 0 must skip the 254 marker onto slot 2, and the next
+        // boundary must stop at the 255 end mark without ever reaching the
+        // trailing pattern 002.
+        let order = vec![0u8, 254, 1, 255, 2];
+        let pats = vec![Pattern::empty(1); 3];
+        let mut p = multi_pattern_player(order, pats);
+        p.enter_row();
+        assert_eq!(p.order_index, 0);
+
+        p.row = 63; // last row of the pattern
+        p.next_row(); // natural advance → slot 1 (the marker)
+        p.tick = 0;
+        p.enter_row(); // fetch walks the marker → slot 2
+        assert!(!p.ended);
+        assert_eq!(p.order_index, 2, "the 254 marker is skipped, not played");
+        assert_eq!(p.order[2], 1);
+
+        p.row = 63;
+        p.next_row(); // natural advance → slot 3 (the end mark)
+        p.tick = 0;
+        p.enter_row();
+        assert!(
+            p.ended,
+            "the 0xFF end mark ends the tune; pattern 002 after it is never \
+             reached"
+        );
+    }
+
+    #[test]
+    fn divergent_jump_diagnostic_counts_bxx_at_or_after_first_sentinel() {
+        // The erratum: "surface any Bxx that lands on or after the first
+        // sentinel as a diagnostic, since that is exactly the set of
+        // modules on which players will disagree."
+        let order = vec![0u8, 1, 2, 2, 254, 254, 3, 4];
+
+        // B03 names a slot strictly before the first sentinel (index 4):
+        // every model agrees, no diagnostic.
+        let p = take_bxx_probe(order.clone(), 0x03, 5);
+        assert_eq!(p.divergent_jump_count, 0, "pre-sentinel Bxx is clean");
+
+        // B04 / B05 / B06 / B07 all land at/after the first sentinel.
+        for info in [0x04u8, 0x05, 0x06, 0x07] {
+            let p = take_bxx_probe(order.clone(), info, 5);
+            assert_eq!(
+                p.divergent_jump_count, 1,
+                "B{info:02X} sits in the model-divergent region and must be \
+                 surfaced"
+            );
+        }
+    }
+
+    #[test]
+    fn divergent_jump_diagnostic_on_a_sentinel_free_list() {
+        // No sentinels: an in-range Bxx is clean; an out-of-range one still
+        // diverges (live-player wrap-to-start vs. end of decode).
+        let p = take_bxx_probe(vec![0u8, 1, 2, 3], 0x02, 4);
+        assert_eq!(p.divergent_jump_count, 0);
+        let p = take_bxx_probe(vec![0u8, 1], 0x05, 2);
+        assert_eq!(p.divergent_jump_count, 1);
+    }
+
+    #[test]
+    fn sbx_loop_after_a_marker_is_not_a_divergent_jump() {
+        // The diagnostic is scoped to Bxx writes. An SBx pattern loop on a
+        // playable slot that happens to sit after a marker jumps to its own
+        // (settled) order index — that is not a Bxx naming an ambiguous
+        // index and must not trip the counter.
+        let order = vec![0u8, 254, 1];
+        let mut pat1 = Pattern::empty(1);
+        pat1.rows[0][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xB1, // SB1 — loop this pattern once
+        };
+        let pats = vec![Pattern::empty(1), pat1];
+        let mut p = multi_pattern_player(order, pats);
+        p.order_index = 2; // playable slot after the marker
+        p.tick = 0;
+        p.row = 0;
+        p.enter_row();
+        let jump = p.pending_jump.expect("SB1 arms a loop jump");
+        assert_eq!(jump.order, Some(2), "loop stays on its own order slot");
+        assert_eq!(
+            p.divergent_jump_count, 0,
+            "an SBx loop-back is not a Bxx and must not be surfaced"
+        );
     }
 
     #[test]
