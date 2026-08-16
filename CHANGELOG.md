@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.8...v0.0.9) - 2026-08-16
+
+### Other
+
+- first_sentinel_order() accessor + SEx-replay diagnostic guard test
+- README — document the pinned raw-order-list model + jump diagnostic
+- fix two rustdoc warnings in the divergent-jump diagnostic doc
+- end-to-end raw-order-list sentinel probes over real .s3m bytes
+- pin the raw-order-list Bxx model + sentinel-region jump diagnostic
+- README + CHANGELOG — document the AdLib/OPL2 playback arc
+- end-to-end AdLib coverage — real .s3m bytes + hostile FM-path corpus
+- wire OPL2 voices into the audible mix path — AdLib playback ungated
+- ungate AdLib melody channels at the header/samples layer
+- OplVoice — two-operator OPL2 synthesis (FM/additive, feedback, per-op EG)
+- OPL2 envelope generator — KSR rate resolution + doc-anchored ADSR timing
+- property-fuzz the DP30ADPCM depacker invariants
+- decode DP30ADPCM packed samples (pack type 1)
+- merge same-row Bxx+Cxx into one jump target and drop effect memory from A/B/C/T/V
+- document hostile-input hardening + the two known format gaps
+- fuzz the registered decoder API state machine under hostile input
+- split truncated stereo samples at the declared per-channel length
+- broaden hostile-input fuzz over a feature-rich seed module
+- fix effect-memory OOB on corrupt command bytes + hostile-input fuzz harness
+- add CI / crates.io / docs.rs / MIT-license badges
+- vibrato/tremolo waveform 3: reuse the sine table, not a noise LFO
+- regression tests for note-vs-sample handling rules
+- document per-pattern SBx loop scope
+- per-pattern SBx loop scope — reset loop start at pattern boundary
+- document the per-voice latched global-volume (Vxx) model
+- per-voice latched global volume so Vxx no longer rescales held notes
+- fix Hxy/Uxy/Kxy vibrato phase to the documented 256-cycle convention
+- looped samples wrap at loop_end, not the PCM buffer length
+- OPL2 (YM3812) operator core + AdLib instrument register decode
+- SAx "old stereo control" — bank-keyed normal/reversed/center mapping
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **AdLib / OPL2 playback — ungated.** The nine OPL2 melody channels
