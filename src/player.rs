@@ -791,9 +791,9 @@ pub struct PlayerState {
     /// or after the first sentinel. This player follows the erratum's
     /// recommended raw-list model (the only one in which `Bxx`'s parameter
     /// means the number the tracker's own order editor displays) and, as the
-    /// same section recommends, "surface[s] any `Bxx` that lands on or after
+    /// same section recommends, surfaces "any `Bxx` that lands on or after
     /// the first sentinel as a diagnostic". Each `Bxx` write whose parameter
-    /// names an order slot at or after [`Self::first_sentinel_order`] — or
+    /// names an order slot at or after the first in-band sentinel — or
     /// past the end of the order list, where the models likewise diverge
     /// (wrap-to-start vs. end of decode) — increments this counter. A
     /// nonzero value after playback means the module sits in the set on
