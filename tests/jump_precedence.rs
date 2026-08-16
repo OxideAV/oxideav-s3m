@@ -53,6 +53,13 @@ fn pack_pattern(rows: &[&[PatCell]]) -> Vec<u8> {
 /// instrument, pattern 0 row 0 carrying the caller's cells, pattern 1
 /// fully empty. Speed 6, tempo 125.
 fn build_jump_module(row0: &[PatCell]) -> Vec<u8> {
+    build_jump_module_with_order([0x00, 0x01, 0xFF, 0xFF], row0)
+}
+
+/// Same fixture with a caller-supplied 4-entry raw order table, so probes
+/// can place `0xFE` ("++" marker, skipped) and `0xFF` ("--" end mark)
+/// sentinels at chosen raw indices.
+fn build_jump_module_with_order(order: [u8; 4], row0: &[PatCell]) -> Vec<u8> {
     let mut b = vec![0u8; 0x60];
     put(&mut b, 0x00, b"JUMP-FIXTURE");
     b[0x1C] = 0x1A;
@@ -74,7 +81,7 @@ fn build_jump_module(row0: &[PatCell]) -> Vec<u8> {
     b[0x40] = 0x00; // channel 0: left PCM
     b[0x41] = 0x01; // channel 1: left PCM
 
-    put(&mut b, 0x60, &[0x00, 0x01, 0xFF, 0xFF]); // order: pat0, pat1, end
+    put(&mut b, 0x60, &order); // raw order table (4 entries)
     put(&mut b, 0x64, &0x0008u16.to_le_bytes()); // instrument → 0x80
     put(&mut b, 0x66, &0x0010u16.to_le_bytes()); // pat0 → 0x100
     put(&mut b, 0x68, &0x0020u16.to_le_bytes()); // pat1 → 0x200
@@ -154,6 +161,52 @@ fn bare_bxx_plays_the_named_order_from_row_zero() {
     // rows of pattern 1. This pins the baseline the merge tests shorten.
     let m = build_jump_module(&[(0, 0x40, 1, 0xFF, 2, 0x01)]);
     assert_eq!(total_frames(m), frames_for_rows(1 + 64));
+}
+
+// ---- Raw-order-list sentinel probes over real bytes, per the staged
+// erratum (`docs/audio/trackers/s3m/
+// s3m-position-jump-pattern-break-and-adpcm.md` §"Erratum — the four
+// staged sources give three different answers"): `Bxx` indexes the raw
+// on-disk order list, `0xFE` is skipped forward at fetch time, `0xFF`
+// ends the tune, and the list is never marker-compacted.
+
+#[test]
+fn natural_advance_skips_the_marker_and_stops_at_the_end_mark() {
+    // Order [00, FE, 01, FF] with no jump effects: pattern 0 plays all 64
+    // rows, the FE marker is skipped (never played), pattern 1 plays all
+    // 64 rows, the FF end mark stops the tune → exactly 128 rows.
+    let m = build_jump_module_with_order(
+        [0x00, 0xFE, 0x01, 0xFF],
+        &[(0, 0x40, 1, 0xFF, 0, 0x00)], // just a note, no effect
+    );
+    assert_eq!(total_frames(m), frames_for_rows(64 + 64));
+}
+
+#[test]
+fn bxx_indexes_the_raw_order_list_across_a_marker() {
+    // Order [00, FE, 01, FF]; pattern 0 row 0 carries B02. Raw-list model:
+    // slot 2 holds pattern 1 → 1 row of pattern 0 + 64 rows of pattern 1.
+    // A marker-compacted model would renumber the list to [00, 01]
+    // (length 2), find index 2 out of range, and wrap to order 0 —
+    // replaying pattern 0 in full before reaching pattern 1 (129 rows).
+    // The song length separates the two models exactly.
+    let m = build_jump_module_with_order(
+        [0x00, 0xFE, 0x01, 0xFF],
+        &[(0, 0x40, 1, 0xFF, 2, 0x02)], // note + B02
+    );
+    assert_eq!(total_frames(m), frames_for_rows(1 + 64));
+}
+
+#[test]
+fn bxx_onto_the_end_mark_ends_the_tune_over_real_bytes() {
+    // Order [00, FE, 01, FF]; B03 names the slot holding the FF end mark
+    // ("255=-- is the end of tune mark", ScreamTracker-v3.20-s3m.txt):
+    // only the single row carrying the jump plays.
+    let m = build_jump_module_with_order(
+        [0x00, 0xFE, 0x01, 0xFF],
+        &[(0, 0x40, 1, 0xFF, 2, 0x03)], // note + B03
+    );
+    assert_eq!(total_frames(m), frames_for_rows(1));
 }
 
 #[test]
