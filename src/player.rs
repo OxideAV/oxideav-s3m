@@ -916,6 +916,18 @@ impl PlayerState {
         }
     }
 
+    /// Index of the first in-band sentinel (`0xFE` "++" marker or `0xFF`
+    /// "--" end mark) in the raw order list, or `None` when the list has
+    /// no sentinel. Together with
+    /// [`divergent_jump_count`](Self::divergent_jump_count) this lets a
+    /// caller locate the region of the order list on which the staged
+    /// erratum documents that S3M players disagree (raw-list vs.
+    /// marker-compacted `Bxx` indexing).
+    #[inline]
+    pub fn first_sentinel_order(&self) -> Option<u8> {
+        self.first_sentinel_order
+    }
+
     /// Lower frequency bound (Hz) of the Amiga-limits clamp.
     ///
     /// Period `856` (max) → frequency `AMIGA_CLOCK_HZ / 856 ≈ 16725` Hz.
@@ -5913,6 +5925,56 @@ pub mod tests {
         assert_eq!(p.divergent_jump_count, 0);
         let p = take_bxx_probe(vec![0u8, 1], 0x05, 2);
         assert_eq!(p.divergent_jump_count, 1);
+    }
+
+    #[test]
+    fn first_sentinel_order_accessor_reports_the_raw_index() {
+        let p = multi_pattern_player(vec![0u8, 1, 254, 2], vec![Pattern::empty(1); 3]);
+        assert_eq!(p.first_sentinel_order(), Some(2));
+        let p = multi_pattern_player(vec![0u8, 255], vec![Pattern::empty(1)]);
+        assert_eq!(p.first_sentinel_order(), Some(1));
+        let p = multi_pattern_player(vec![0u8, 1], vec![Pattern::empty(1); 2]);
+        assert_eq!(p.first_sentinel_order(), None);
+    }
+
+    #[test]
+    fn sex_held_row_does_not_double_count_the_divergent_jump_diagnostic() {
+        // A row carrying both SEx (pattern delay) and a divergent Bxx is
+        // re-entered for each held replay, but cell application is skipped
+        // on replays — the Bxx must be counted exactly once per authored
+        // encounter, not once per replay.
+        let order = vec![0u8, 254, 1];
+        let mut pat0 = Pattern::empty(2);
+        pat0.rows[0][0] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::B_POS_JUMP,
+            info: 0x01, // names the marker slot — divergent
+        };
+        pat0.rows[0][1] = Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command: cmd::S_EXTENDED,
+            info: 0xE2, // SE2 — hold this row two extra times
+        };
+        let mut p = multi_pattern_player(order, vec![Pattern::empty(2); 2]);
+        p.patterns[0] = pat0;
+        p.channels.push(p.channels[0].clone());
+        p.enter_row();
+        assert_eq!(p.divergent_jump_count, 1, "authored encounter counts once");
+        // Simulate the SEx replay path: next_row holds the row (the armed
+        // jump is taken instead per ST3 — but force the held-replay branch
+        // to prove the counting site is skipped on replays).
+        p.pending_jump = None;
+        p.replaying_for_pattern_delay = true;
+        p.tick = 0;
+        p.enter_row();
+        assert_eq!(
+            p.divergent_jump_count, 1,
+            "a held-row replay must not re-count the Bxx"
+        );
     }
 
     #[test]
