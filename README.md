@@ -78,7 +78,9 @@ re-emitting one is out of scope.
     `tables/opl2-ksr-rate-offset.csv`, docs #262): `RATE = 4*R + Rks`
     with the `R == 0 ⇒ RATE = 0` freeze, the key-scale offset table
     (KSR bit × 4-bit key-scale number, conformance-tested against the
-    staged CSV), the documented clamp of the 75-overflow at 63, and
+    staged CSV), the mandated clamp of the 75-overflow (saturated at 63
+    here; the record flags the hardware's exact clamp point as
+    unresolved), and
     ADSR timing anchored to the two quoted vendor-table samples
     (attack 2826.24 ms / decay 8212.48 ms full-scale at RATE 4) with
     the record's exact per-RM halving law. Trajectory tests pin the
@@ -112,7 +114,16 @@ re-emitting one is out of scope.
   two commands write independent target-order / target-row state; within
   each variable the right-most channel's write wins, an out-of-range
   `Cxx` (row ≥ 64) is ignored without disturbing an earlier valid one,
-  and `SBx` keeps its loop-back priority over the merged destination —
+  and `SBx` keeps its loop-back priority over the merged destination.
+  `Bxx` indexes the **raw** on-disk order list (the number ST3's own
+  order editor displays) with the in-band sentinels resolved at fetch
+  time — `254` ("++") skipped forward, `255` ("--") ends the tune —
+  per the staged erratum's recommended model, locked by a regression
+  battery transcribing the erratum's worked probe table; a
+  `PlayerState::divergent_jump_count` diagnostic counts every `Bxx`
+  that names a slot at/after the first sentinel (or past the end),
+  the exact region where the raw-list and marker-compacted models
+  silently pick different patterns —
   `Dxy` volume slide (full case matrix including
   the fine forms and the both-nibbles-nonzero quirk), `Exx` / `Fxx`
   pitch slides (with fine + extra-fine forms), `Gxx` (tone portamento,
@@ -196,11 +207,17 @@ re-emitting one is out of scope.
   sub-steps + attack curve), the vendor key-scale-number and
   sustain-level scaling rules, and the AM/VIB/KSL tables — see the
   OPL2 bullet above.
-  That note flags two residual unknowns it could not pin down — exact
-  ST3 multi-channel edge behaviour when a jump lands on the very last
-  order, and finer `SBx`-vs-jump interactions — for which this decoder
-  keeps its existing documented behaviour (order-table end ⇒ song end;
-  `SBx` loop-back overrides a same-row jump).
+  The staged erratum leaves two questions open, both respected here as
+  documented boundaries rather than guessed at: (a) whether ST3's `Bxx`
+  indexes the raw or a marker-compacted order list — this decoder pins
+  the erratum's recommended **raw-list** model and surfaces the
+  ambiguous region through `divergent_jump_count` (see the effects
+  bullet); an out-of-range jump ends the decode (the finite-decode
+  mapping of the live player's documented wrap-to-start); and (b) the
+  `SBx`-vs-`Bxx`/`Cxx` same-row dispatch precedence, re-checked and
+  **confirmed blocked** in the staged record — this decoder keeps its
+  documented `SBx`-overrides-the-merged-jump behaviour until a static
+  read of ST3's effect dispatch settles it.
 
 ## Usage
 

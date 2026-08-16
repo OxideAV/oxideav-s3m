@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tables/opl2-ksr-rate-offset.csv`, docs #262): `opl2::effective_rate`
   implements `RATE = 4*R + Rks` with the `R == 0 ⇒ RATE = 0` freeze, the
   KSR key-scale offset table (conformance-tested against the staged CSV
-  when the docs tree is present), and the documented saturation of the
-  75-overflow at 63; `opl2::Envelope` runs the ADSR trajectory with
+  when the docs tree is present), and the mandated clamp of the
+  75-overflow (saturated at 63 here; the record flags the hardware's
+  exact clamp point as unresolved); `opl2::Envelope` runs the ADSR trajectory with
   full-scale traversal times anchored to the record's two quoted
   vendor-table samples (attack 2826.24 ms / decay 8212.48 ms at RATE 4)
   and its exact per-RM halving law. `opl2::OplVoice` synthesizes the
