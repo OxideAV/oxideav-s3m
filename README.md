@@ -227,16 +227,27 @@ oxideav-s3m = "0.0"
 ```
 
 ```rust,no_run
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
+use oxideav_core::{CodecId, Frame, RuntimeContext};
 
-let mut containers = ContainerRegistry::new();
-let mut codecs = CodecRegistry::new();
-oxideav_s3m::register_containers(&mut containers);
-oxideav_s3m::register_codecs(&mut codecs);
+let mut ctx = RuntimeContext::new();
+oxideav_s3m::register(&mut ctx); // codecs "s3m" + "s3m_multichannel", the .s3m container
 
-// Mixed-stereo output: build a decoder under the `s3m` id.
-// Per-channel output: use `oxideav_s3m::CODEC_ID_MULTICHANNEL` instead.
+let input: Box<dyn oxideav_core::ReadSeek> = Box::new(std::fs::File::open("song.s3m")?);
+let mut dmx = ctx.containers.open_demuxer("s3m", input, &ctx.codecs)?;
+let mut params = dmx.streams()[0].params.clone();
+
+// Mixed-stereo output: build a decoder under the `s3m` id (the default).
+// Per-channel output: switch to `oxideav_s3m::CODEC_ID_MULTICHANNEL` instead.
+params.codec_id = CodecId::new(oxideav_s3m::CODEC_ID_STR);
+let mut dec = ctx.codecs.first_decoder(&params)?;
+
+let pkt = dmx.next_packet()?; // the whole module is one packet
+dec.send_packet(&pkt)?;
+while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+    // af.data[0]: interleaved PCM in the stream's sample format
+    let _ = af;
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 For lower-level access, [`player::PlayerState`] exposes both `render`
