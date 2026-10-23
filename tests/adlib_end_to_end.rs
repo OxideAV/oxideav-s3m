@@ -59,9 +59,9 @@ fn build_adlib_module(rr: u8, cut_row: usize) -> Vec<u8> {
     let ins = 0x80;
     b.resize(ins + 80, 0);
     b[ins] = 2; // AdLib melody instrument
-                // Register block at +0x10 (mod/car interleaved):
-                //   $20: EGT=1 | MUL=1;  $40 mod: TL=63 (silent), car: TL=0;
-                //   $60: AR=15 DR=0;     $80: SL=0 RR=rr;  $E0: sine;  $C0: 0.
+    // Register block at +0x10 (mod/car interleaved):
+    //   $20: EGT=1 | MUL=1;  $40 mod: TL=63 (silent), car: TL=0;
+    //   $60: AR=15 DR=0;     $80: SL=0 RR=rr;  $E0: sine;  $C0: 0.
     let regs = [
         0x21,
         0x21,

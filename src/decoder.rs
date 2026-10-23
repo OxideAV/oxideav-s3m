@@ -16,7 +16,7 @@ use oxideav_core::{
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
 use crate::container::OUTPUT_SAMPLE_RATE;
-use crate::header::{parse_header, CHANNEL_COUNT};
+use crate::header::{CHANNEL_COUNT, parse_header};
 use crate::pattern::unpack_all;
 use crate::player::PlayerState;
 use crate::samples::extract_samples;

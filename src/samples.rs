@@ -18,7 +18,7 @@
 //! true stereo samples we decode both sides into `pcm` (left) and
 //! `pcm_right` (right) and the mixer routes them through the channel pan.
 
-use crate::header::{Instrument, S3mHeader, PACK_DP30ADPCM};
+use crate::header::{Instrument, PACK_DP30ADPCM, S3mHeader};
 
 /// Decoded sample body ready for mixing.
 #[derive(Clone, Debug, Default)]
@@ -147,11 +147,7 @@ pub fn decode_instrument(inst: &Instrument, bytes: &[u8], signed_samples: bool) 
     let right_raw: &[u8] = if is_stereo {
         let start = left_block_bytes.min(raw.len());
         let end = (2 * left_block_bytes).min(raw.len());
-        if start >= end {
-            &[]
-        } else {
-            &raw[start..end]
-        }
+        if start >= end { &[] } else { &raw[start..end] }
     } else {
         &[]
     };
@@ -264,7 +260,7 @@ pub fn extract_samples(header: &S3mHeader, bytes: &[u8]) -> Vec<SampleBody> {
 mod tests {
     use super::*;
     use crate::header::{
-        Instrument, INST_TYPE_PCM, SAMPLE_FLAG_16BIT, SAMPLE_FLAG_LOOP, SAMPLE_FLAG_STEREO,
+        INST_TYPE_PCM, Instrument, SAMPLE_FLAG_16BIT, SAMPLE_FLAG_LOOP, SAMPLE_FLAG_STEREO,
     };
 
     /// Build a PCM instrument whose sample body sits at byte offset

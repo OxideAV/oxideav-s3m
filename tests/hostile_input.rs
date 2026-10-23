@@ -196,7 +196,7 @@ fn build_rich_module() -> Vec<u8> {
     put(&mut b, 0x68, &0x001Du16.to_le_bytes()); // inst3 → 0x1D0
     put(&mut b, 0x6A, &0x0040u16.to_le_bytes()); // pat0 → 0x400
     put(&mut b, 0x6C, &0x0050u16.to_le_bytes()); // pat1 → 0x500
-                                                 // Pan block at 0x6E: bit 5 set + explicit low nibble on every channel.
+    // Pan block at 0x6E: bit 5 set + explicit low nibble on every channel.
     b.resize(0x6E + 32, 0);
     for i in 0..32 {
         b[0x6E + i] = 0x20 | ((i as u8 * 3) & 0x0F);
@@ -520,9 +520,9 @@ fn build_adlib_module() -> Vec<u8> {
     b[0x40] = 16; // channel 0 = AdLib melody A1
     let ins = 0x80;
     b[ins] = 2; // SCRI melody instrument
-                // Register block at +0x10: sustained carrier, KSR on, instant
-                // attack, mid decay/release — every field nonzero so mutations flip
-                // real parameter bits.
+    // Register block at +0x10: sustained carrier, KSR on, instant
+    // attack, mid decay/release — every field nonzero so mutations flip
+    // real parameter bits.
     let regs = [
         0x31, 0x21, 0x3F, 0x08, 0xF4, 0xF2, 0x35, 0x47, 0x01, 0x00, 0x0D,
     ];
@@ -600,7 +600,7 @@ fn adpcm_random_bodies_decode_bounded() {
     // more output samples than the declared length, every decoded point
     // an exact signed-8-bit value scaled by 256, mono-only output, and a
     // loop window clamped inside the decoded PCM.
-    use oxideav_s3m::header::{Instrument, INST_TYPE_PCM, PACK_DP30ADPCM};
+    use oxideav_s3m::header::{INST_TYPE_PCM, Instrument, PACK_DP30ADPCM};
     use oxideav_s3m::samples::decode_instrument;
     let mut rng = Rng::new(0xADCC_0DEC_5EED_0001);
     for _ in 0..4000 {

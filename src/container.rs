@@ -13,7 +13,7 @@ use oxideav_core::{
 };
 use oxideav_core::{ContainerRegistry, Demuxer, ReadSeek};
 
-use crate::header::{parse_header, S3mHeader};
+use crate::header::{S3mHeader, parse_header};
 
 /// Output sample rate used by the decoder. 44.1 kHz matches what the
 /// MOD crate emits, keeping the pipeline uniform across tracker formats.

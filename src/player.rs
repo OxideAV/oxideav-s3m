@@ -15,7 +15,7 @@
 //!     freq = c5 * 2^((N - C5) / 12)
 //! with N = 12 * octave + semitone. We compute this directly as a float.
 
-use crate::header::{S3mHeader, PATTERN_ROWS};
+use crate::header::{PATTERN_ROWS, S3mHeader};
 use crate::opl2::{AdLibInstrument, OperatorCore, OplVoice};
 use crate::pattern::{Cell, Pattern};
 use crate::samples::SampleBody;
@@ -586,11 +586,7 @@ fn waveform_sample(wf: Waveform, pos: u8) -> i32 {
         // ramps `idx*8` (0..=248); the negative half mirrors it to 255-that.
         Waveform::RampDown => {
             let t = (idx as i32) << 3;
-            if negative {
-                255 - t
-            } else {
-                t
-            }
+            if negative { 255 - t } else { t }
         }
         // Square per FireLight §6.8 `case 2: delta = 255` — a constant
         // magnitude whose sign is supplied by the half-cycle below.
@@ -599,11 +595,7 @@ fn waveform_sample(wf: Waveform, pos: u8) -> i32 {
     // Scale the 0..=255 native magnitude into the ±64 range used by the
     // depth math, then apply the half-cycle sign.
     let scaled = (magnitude / 4).min(64);
-    if negative {
-        -scaled
-    } else {
-        scaled
-    }
+    if negative { -scaled } else { scaled }
 }
 
 /// Quantise an arbitrary frequency to the nearest equal-tempered
@@ -1712,10 +1704,10 @@ impl PlayerState {
         // live. When `speed == 1`, tick 1 never fires before the row
         // advances and the stash is cleared by `enter_row` — matching
         // the spec's "doesn't do anything if the current speed is 1".
-        if tick == 1 {
-            if let Some(g) = self.pending_global_vol.take() {
-                self.global_volume = g;
-            }
+        if tick == 1
+            && let Some(g) = self.pending_global_vol.take()
+        {
+            self.global_volume = g;
         }
         // Snapshot the (post-Vxx-drain) player global volume so the channel
         // loop can re-latch it into any voice whose note volume a per-tick
@@ -1747,88 +1739,88 @@ impl PlayerState {
             let vol_before_tick = ch.volume;
 
             // SDx (note delay): fire the stashed trigger at tick x.
-            if let Some(pd) = ch.pending_delay {
-                if tick == pd.fire_tick {
-                    // Apply the stashed cell data like `enter_row` would.
-                    if pd.instrument != 0 {
-                        ch.instrument = pd.instrument;
-                        let idx = pd.instrument as usize;
-                        if idx > 0 && idx <= samples_snapshot.len() {
-                            // PCM volumes peak at 63 — see [`PCM_VOLUME_PEAK`].
-                            // SDx-deferred instrument load is still a
-                            // stored-volume write — Ixy's restore target
-                            // tracks it just like the immediate trigger.
-                            // AdLib default volume keeps the full 64 —
-                            // see [`ADLIB_VOLUME_PEAK`].
-                            let v = if ch.adlib {
-                                samples_snapshot[idx - 1].1.min(ADLIB_VOLUME_PEAK)
-                            } else {
-                                clamp_pcm_volume(samples_snapshot[idx - 1].1 as u16)
-                            };
-                            ch.volume = v;
-                            ch.stored_volume = v;
-                            // SDx-deferred instrument reload fires on tick x
-                            // (>= 1), so `global_vol_now` is the post-Vxx
-                            // value — the delayed note correctly picks up a
-                            // same-row Vxx, per §Vxx "applied to notes ...
-                            // that have a note delay (SDx with x >= 1)".
-                            ch.voice_global_vol = global_vol_now;
-                        }
-                    }
-                    if pd.note == 0xFE {
-                        // AdLib noteoff: key the voice off into its
-                        // release (same as the immediate-trigger path).
-                        if ch.adlib && ch.opl_voice.is_some() {
-                            if let Some(voice) = ch.opl_voice.as_mut() {
-                                voice.key_off();
-                            }
-                        } else {
-                            ch.active = false;
-                            ch.frequency = 0.0;
-                        }
-                    } else if pd.note != 0xFF {
-                        let inst_idx = ch.instrument as usize;
-                        if inst_idx > 0 && inst_idx <= samples_snapshot.len() {
-                            let c5 = samples_snapshot[inst_idx - 1].0;
-                            let freq = note_to_frequency(pd.note, c5);
-                            ch.frequency = freq;
-                            ch.target_frequency = freq;
-                            Self::clamp_amiga(ch, amiga_limits);
-                            ch.sample_pos = 0.0;
-                            ch.active = true;
-                            // SDx-deferred trigger thaws SCx freeze.
-                            ch.frozen = false;
-                            if !ch.keep_vibrato_pos_on_new_note {
-                                ch.vibrato_pos = 0;
-                            }
-                            if !ch.keep_tremolo_pos_on_new_note {
-                                ch.tremolo_pos = 0;
-                            }
-                            ch.last_note = pd.note;
-                            // SDx-deferred AdLib trigger keys a fresh
-                            // voice, same as the immediate path.
-                            if ch.adlib {
-                                ch.opl_voice = samples_snapshot[inst_idx - 1].2.map(|inst| {
-                                    OplVoice::new(inst, key_scale_number(pd.note), sample_rate)
-                                });
-                            }
-                        }
-                    }
-                    if pd.volume != 0xFF {
+            if let Some(pd) = ch.pending_delay
+                && tick == pd.fire_tick
+            {
+                // Apply the stashed cell data like `enter_row` would.
+                if pd.instrument != 0 {
+                    ch.instrument = pd.instrument;
+                    let idx = pd.instrument as usize;
+                    if idx > 0 && idx <= samples_snapshot.len() {
                         // PCM volumes peak at 63 — see [`PCM_VOLUME_PEAK`].
-                        // SDx-deferred volume-column write is a
-                        // stored-volume write, same as the immediate
-                        // form — Ixy's restore target tracks it.
-                        let v = clamp_pcm_volume(pd.volume as u16);
+                        // SDx-deferred instrument load is still a
+                        // stored-volume write — Ixy's restore target
+                        // tracks it just like the immediate trigger.
+                        // AdLib default volume keeps the full 64 —
+                        // see [`ADLIB_VOLUME_PEAK`].
+                        let v = if ch.adlib {
+                            samples_snapshot[idx - 1].1.min(ADLIB_VOLUME_PEAK)
+                        } else {
+                            clamp_pcm_volume(samples_snapshot[idx - 1].1 as u16)
+                        };
                         ch.volume = v;
                         ch.stored_volume = v;
-                        // SDx-deferred volume-column write re-latches the
-                        // (post-Vxx) global volume; see the deferred
-                        // instrument-reload branch above.
+                        // SDx-deferred instrument reload fires on tick x
+                        // (>= 1), so `global_vol_now` is the post-Vxx
+                        // value — the delayed note correctly picks up a
+                        // same-row Vxx, per §Vxx "applied to notes ...
+                        // that have a note delay (SDx with x >= 1)".
                         ch.voice_global_vol = global_vol_now;
                     }
-                    ch.pending_delay = None;
                 }
+                if pd.note == 0xFE {
+                    // AdLib noteoff: key the voice off into its
+                    // release (same as the immediate-trigger path).
+                    if ch.adlib && ch.opl_voice.is_some() {
+                        if let Some(voice) = ch.opl_voice.as_mut() {
+                            voice.key_off();
+                        }
+                    } else {
+                        ch.active = false;
+                        ch.frequency = 0.0;
+                    }
+                } else if pd.note != 0xFF {
+                    let inst_idx = ch.instrument as usize;
+                    if inst_idx > 0 && inst_idx <= samples_snapshot.len() {
+                        let c5 = samples_snapshot[inst_idx - 1].0;
+                        let freq = note_to_frequency(pd.note, c5);
+                        ch.frequency = freq;
+                        ch.target_frequency = freq;
+                        Self::clamp_amiga(ch, amiga_limits);
+                        ch.sample_pos = 0.0;
+                        ch.active = true;
+                        // SDx-deferred trigger thaws SCx freeze.
+                        ch.frozen = false;
+                        if !ch.keep_vibrato_pos_on_new_note {
+                            ch.vibrato_pos = 0;
+                        }
+                        if !ch.keep_tremolo_pos_on_new_note {
+                            ch.tremolo_pos = 0;
+                        }
+                        ch.last_note = pd.note;
+                        // SDx-deferred AdLib trigger keys a fresh
+                        // voice, same as the immediate path.
+                        if ch.adlib {
+                            ch.opl_voice = samples_snapshot[inst_idx - 1].2.map(|inst| {
+                                OplVoice::new(inst, key_scale_number(pd.note), sample_rate)
+                            });
+                        }
+                    }
+                }
+                if pd.volume != 0xFF {
+                    // PCM volumes peak at 63 — see [`PCM_VOLUME_PEAK`].
+                    // SDx-deferred volume-column write is a
+                    // stored-volume write, same as the immediate
+                    // form — Ixy's restore target tracks it.
+                    let v = clamp_pcm_volume(pd.volume as u16);
+                    ch.volume = v;
+                    ch.stored_volume = v;
+                    // SDx-deferred volume-column write re-latches the
+                    // (post-Vxx) global volume; see the deferred
+                    // instrument-reload branch above.
+                    ch.voice_global_vol = global_vol_now;
+                }
+                ch.pending_delay = None;
             }
 
             // SCx (note cut): freeze the channel at tick x. Per the
@@ -2538,7 +2530,7 @@ impl PlayerState {
 
     /// Render up to `dst.len()/2` stereo frames.
     pub fn render(&mut self, dst: &mut [i16]) -> usize {
-        assert!(dst.len() % 2 == 0);
+        assert!(dst.len().is_multiple_of(2));
         let mut produced = 0usize;
         let total_frames = dst.len() / 2;
         while produced < total_frames {
@@ -2592,7 +2584,7 @@ impl PlayerState {
     pub fn render_per_channel(&mut self, dst: &mut [i16]) -> usize {
         let stride = self.channels.len() * 2;
         assert!(
-            stride > 0 && dst.len() % stride == 0,
+            stride > 0 && dst.len().is_multiple_of(stride),
             "per-channel destination must be a multiple of 2 * channel_count"
         );
         let total_frames = dst.len() / stride;
@@ -2655,7 +2647,7 @@ pub mod tests {
         assert_eq!(PERIOD_TABLE[0], 27392); // octave-0 C
         assert_eq!(PERIOD_TABLE[C5_NOTE_INDEX as usize], 1712); // C-5 ref
         assert_eq!(PERIOD_TABLE[107], 56); // octave-8 B
-                                           // Octave-4 row (the canonical "1712,1616,…,906" semitone ratios).
+        // Octave-4 row (the canonical "1712,1616,…,906" semitone ratios).
         let oct4 = [
             1712, 1616, 1524, 1440, 1356, 1280, 1208, 1140, 1076, 1016, 960, 906,
         ];
@@ -2824,8 +2816,8 @@ pub mod tests {
         assert_eq!(retrigger_volume(32, 0xD), 48); // +16
         assert_eq!(retrigger_volume(32, 0xE), 48); // *3/2
         assert_eq!(retrigger_volume(32, 0xF), PCM_VOLUME_PEAK); // *2 clamped to 63
-                                                                // Clamping: subtract saturates at 0; add/multiply cap at the
-                                                                // PCM peak (63 per multimedia.cx §Playback Notes), NOT 64.
+        // Clamping: subtract saturates at 0; add/multiply cap at the
+        // PCM peak (63 per multimedia.cx §Playback Notes), NOT 64.
         assert_eq!(retrigger_volume(4, 0x5), 0);
         assert_eq!(retrigger_volume(60, 0xF), PCM_VOLUME_PEAK);
     }
@@ -2875,10 +2867,10 @@ pub mod tests {
         assert!(PlayerState::is_fine_volslide(0xF, 0x3)); // DF3 (fine down 3)
         assert!(PlayerState::is_fine_volslide(0x3, 0xF)); // D3F (fine up 3)
         assert!(PlayerState::is_fine_volslide(0xF, 0xF)); // DFF (fine up 15)
-                                                          // Slide-on-all-ticks forms are NOT fine and must keep running.
+        // Slide-on-all-ticks forms are NOT fine and must keep running.
         assert!(!PlayerState::is_fine_volslide(0x0, 0xF)); // D0F
         assert!(!PlayerState::is_fine_volslide(0xF, 0x0)); // DF0
-                                                           // Ordinary continuous slides are not fine either.
+        // Ordinary continuous slides are not fine either.
         assert!(!PlayerState::is_fine_volslide(0x2, 0x0)); // D20
         assert!(!PlayerState::is_fine_volslide(0x0, 0x4)); // D04
     }
@@ -3527,7 +3519,7 @@ pub mod tests {
         // but the buffer is 16 frames long; the trailing 8 frames carry a
         // poison value the mixer must never reach.
         let mut pcm = vec![1_000i16; 8];
-        pcm.extend(std::iter::repeat(-30_000i16).take(8)); // post-loop tail
+        pcm.extend(std::iter::repeat_n(-30_000i16, 8)); // post-loop tail
         let sample = SampleBody {
             pcm,
             pcm_right: None,
@@ -6441,7 +6433,7 @@ pub mod tests {
         assert_eq!(key_scale_number(0x40), 8); // C-5 reference
         assert_eq!(key_scale_number(0x7B), 15); // B-7
         assert_eq!(key_scale_number(0x8B), 15); // B-8 clamps
-                                                // Monotone over the full 9-octave note range.
+        // Monotone over the full 9-octave note range.
         let mut prev = 0;
         for oct in 0..9u8 {
             for semi in 0..12u8 {

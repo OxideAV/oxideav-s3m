@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-s3m"
 version = "0.0.9"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-s3m"
 authors = ["Mark Karpeles"]

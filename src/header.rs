@@ -456,11 +456,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<S3mHeader> {
             return 0x08;
         }
         let slot = channel_settings & 0x0F;
-        if slot < 8 {
-            0x03
-        } else {
-            0x0C
-        }
+        if slot < 8 { 0x03 } else { 0x0C }
     }
 
     let mut pans = [0u8; CHANNEL_COUNT];
@@ -654,8 +650,8 @@ mod tests {
         let mut buf = vec![0u8; base + INSTRUMENT_HEADER_SIZE];
         let h = &mut buf[base..base + INSTRUMENT_HEADER_SIZE];
         h[0x00] = 1; // PCM type.
-                     // Length 0x0001_2345 → 0x2345; Loop start 0xDEAD_0010 → 0x0010;
-                     // Loop end 0xBEEF_8000 → 0x8000; C5 speed 0xCAFE_56C2 → 0x56C2.
+        // Length 0x0001_2345 → 0x2345; Loop start 0xDEAD_0010 → 0x0010;
+        // Loop end 0xBEEF_8000 → 0x8000; C5 speed 0xCAFE_56C2 → 0x56C2.
         h[0x10..0x14].copy_from_slice(&0x0001_2345u32.to_le_bytes());
         h[0x14..0x18].copy_from_slice(&0xDEAD_0010u32.to_le_bytes());
         h[0x18..0x1C].copy_from_slice(&0xBEEF_8000u32.to_le_bytes());
@@ -698,7 +694,9 @@ mod tests {
         assert!(!inst.is_pcm());
         assert_eq!(
             inst.adlib_registers,
-            Some([0x21u8, 0x61, 0x1D, 0x07, 0x82, 0x81, 0x10, 0x07, 0x01, 0x00, 0x0C])
+            Some([
+                0x21u8, 0x61, 0x1D, 0x07, 0x82, 0x81, 0x10, 0x07, 0x01, 0x00, 0x0C
+            ])
         );
 
         let voice = inst.adlib_instrument().expect("AdLib decode");

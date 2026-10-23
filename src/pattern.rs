@@ -17,7 +17,7 @@
 //!
 //! The low 5 bits (`flags & 0x1F`) give the channel index 0..=31.
 
-use crate::header::{S3mHeader, PATTERN_ROWS};
+use crate::header::{PATTERN_ROWS, S3mHeader};
 
 /// A decoded cell for one channel at one row.
 ///
@@ -180,7 +180,7 @@ mod tests {
         buf.push(1); // instrument 1
         buf.push(48); // volume
         buf.push(0x00); // end of row 2
-                        // Patch the length field.
+        // Patch the length field.
         let len = buf.len();
         buf[0..2].copy_from_slice(&(len as u16).to_le_bytes());
 

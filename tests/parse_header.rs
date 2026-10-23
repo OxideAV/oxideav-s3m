@@ -10,7 +10,7 @@ use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_s3m::container::OUTPUT_SAMPLE_RATE;
 use oxideav_s3m::decoder;
-use oxideav_s3m::header::{parse_header, S3M_SIGNATURE};
+use oxideav_s3m::header::{S3M_SIGNATURE, parse_header};
 use oxideav_s3m::pattern::unpack_all;
 use oxideav_s3m::samples::extract_samples;
 
@@ -72,7 +72,7 @@ fn build_synth_s3m() -> (Vec<u8>, SynthLayout) {
     out.extend_from_slice(&[0, 0]);
 
     // Pad to next 16-byte boundary for the instrument header.
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let inst_off = out.len();
@@ -82,7 +82,7 @@ fn build_synth_s3m() -> (Vec<u8>, SynthLayout) {
     // 80-byte instrument header.
     let mut inst = vec![0u8; 80];
     inst[0] = 1; // PCM
-                 // DOS filename "square.wav"
+    // DOS filename "square.wav"
     let dn = b"square.wav";
     inst[1..1 + dn.len()].copy_from_slice(dn);
     // MemSeg (parapointer to sample body) — patched once sample offset is known.
@@ -93,7 +93,7 @@ fn build_synth_s3m() -> (Vec<u8>, SynthLayout) {
     inst[0x18..0x1C].copy_from_slice(&16u32.to_le_bytes());
     inst[0x1C] = 64; // volume
     inst[0x1F] = 1; // flags: loop
-                    // C5 speed = 8363 Hz.
+    // C5 speed = 8363 Hz.
     inst[0x20..0x24].copy_from_slice(&8363u32.to_le_bytes());
     // Sample name.
     let nm = b"square wave";
@@ -102,7 +102,7 @@ fn build_synth_s3m() -> (Vec<u8>, SynthLayout) {
     out.extend_from_slice(&inst);
 
     // Pattern body, 16-byte aligned.
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let pat_off = out.len();
@@ -126,7 +126,7 @@ fn build_synth_s3m() -> (Vec<u8>, SynthLayout) {
     out.extend_from_slice(&pat_body);
 
     // Sample body, 16-byte aligned.
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let sample_off = out.len();
@@ -251,8 +251,8 @@ fn decoder_emits_nonsilent_pcm() {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
                 total_samples += a.samples as u64;
-                for chunk in a.data[0].chunks_exact(2) {
-                    let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                for chunk in a.data[0].as_chunks::<2>().0 {
+                    let s = i16::from_le_bytes(*chunk);
                     if s != 0 {
                         total_nonzero += 1;
                     }
@@ -351,7 +351,7 @@ fn build_synth_s3m_with_axx(new_speed: u8) -> Vec<u8> {
     out.extend_from_slice(&[0, 0]);
     let pat_pp_off = out.len();
     out.extend_from_slice(&[0, 0]);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let inst_off = out.len();
@@ -365,7 +365,7 @@ fn build_synth_s3m_with_axx(new_speed: u8) -> Vec<u8> {
     inst[0x20..0x24].copy_from_slice(&8363u32.to_le_bytes());
     inst[0x4C..0x50].copy_from_slice(b"SCRS");
     out.extend_from_slice(&inst);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let pat_off = out.len();
@@ -385,7 +385,7 @@ fn build_synth_s3m_with_axx(new_speed: u8) -> Vec<u8> {
     let total_len = (2 + pat_body.len()) as u16;
     out.extend_from_slice(&total_len.to_le_bytes());
     out.extend_from_slice(&pat_body);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let sample_off = out.len();
@@ -429,7 +429,7 @@ fn build_synth_with_pattern(pat_body: Vec<u8>) -> Vec<u8> {
     out.extend_from_slice(&[0, 0]);
     let pat_pp_off = out.len();
     out.extend_from_slice(&[0, 0]);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let inst_off = out.len();
@@ -445,7 +445,7 @@ fn build_synth_with_pattern(pat_body: Vec<u8>) -> Vec<u8> {
     inst[0x20..0x24].copy_from_slice(&8363u32.to_le_bytes());
     inst[0x4C..0x50].copy_from_slice(b"SCRS");
     out.extend_from_slice(&inst);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let pat_off = out.len();
@@ -457,7 +457,7 @@ fn build_synth_with_pattern(pat_body: Vec<u8>) -> Vec<u8> {
     let total_len = (2 + body.len()) as u16;
     out.extend_from_slice(&total_len.to_le_bytes());
     out.extend_from_slice(&body);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let sample_off = out.len();
@@ -488,7 +488,7 @@ fn render_all(bytes: &[u8]) -> Vec<(i16, i16)> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                for pair in a.data[0].chunks_exact(4) {
+                for pair in a.data[0].as_chunks::<4>().0 {
                     let l = i16::from_le_bytes([pair[0], pair[1]]);
                     let r = i16::from_le_bytes([pair[2], pair[3]]);
                     out.push((l, r));
@@ -712,7 +712,7 @@ fn build_stereo_pan_module() -> Vec<u8> {
     out.extend_from_slice(&[0, 0]);
     let pat_pp_off = out.len();
     out.extend_from_slice(&[0, 0]);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let inst_off = out.len();
@@ -727,7 +727,7 @@ fn build_stereo_pan_module() -> Vec<u8> {
     inst[0x20..0x24].copy_from_slice(&8363u32.to_le_bytes());
     inst[0x4C..0x50].copy_from_slice(b"SCRS");
     out.extend_from_slice(&inst);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let pat_off = out.len();
@@ -747,16 +747,16 @@ fn build_stereo_pan_module() -> Vec<u8> {
     let total_len = (2 + pat_body.len()) as u16;
     out.extend_from_slice(&total_len.to_le_bytes());
     out.extend_from_slice(&pat_body);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let sample_off = out.len();
     let sample_parapointer = (sample_off >> 4) as u32;
     // 16 frames: left block then right block (non-interleaved, per S3M).
     // Left: all 0xF0 (strongly positive after -128 bias).
-    out.extend(std::iter::repeat(0xF0_u8).take(16));
+    out.extend(std::iter::repeat_n(0xF0_u8, 16));
     // Right: all 0x10 (strongly negative).
-    out.extend(std::iter::repeat(0x10_u8).take(16));
+    out.extend(std::iter::repeat_n(0x10_u8, 16));
     let mem_hi = (sample_parapointer >> 16) as u8;
     let mem_lo = (sample_parapointer & 0xFFFF) as u16;
     out[inst_off + 0x0D] = mem_hi;
@@ -1124,7 +1124,7 @@ fn effect_s2x_finetune_changes_playback_rate() {
 fn effect_jxy_arpeggio_uses_period_table_note_index() {
     use oxideav_s3m::header::parse_header;
     use oxideav_s3m::pattern::unpack_all;
-    use oxideav_s3m::player::{PlayerState, AMIGA_CLOCK_HZ, PERIOD_TABLE};
+    use oxideav_s3m::player::{AMIGA_CLOCK_HZ, PERIOD_TABLE, PlayerState};
     use oxideav_s3m::samples::extract_samples;
 
     // Row 0: note 0x50 + J47 (cmd 10 = J, info 0x47). x = 4, y = 7.
@@ -1705,7 +1705,7 @@ fn build_synth_with_muted_channel() -> Vec<u8> {
     out.extend_from_slice(&[0, 0]);
     let pat_pp_off = out.len();
     out.extend_from_slice(&[0, 0]);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let inst_off = out.len();
@@ -1719,7 +1719,7 @@ fn build_synth_with_muted_channel() -> Vec<u8> {
     inst[0x20..0x24].copy_from_slice(&8363u32.to_le_bytes());
     inst[0x4C..0x50].copy_from_slice(b"SCRS");
     out.extend_from_slice(&inst);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let pat_off = out.len();
@@ -1737,7 +1737,7 @@ fn build_synth_with_muted_channel() -> Vec<u8> {
     let total_len = (2 + body.len()) as u16;
     out.extend_from_slice(&total_len.to_le_bytes());
     out.extend_from_slice(&body);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let sample_off = out.len();
@@ -1780,8 +1780,8 @@ fn muted_channel_outputs_silent_pair_via_multichannel_decoder() {
     let mut nonzero = vec![0u64; 32];
     while let Ok(Frame::Audio(a)) = dec.receive_frame() {
         // Frame layout: i16 stereo pairs for ch0..=ch31 interleaved.
-        for frame_bytes in a.data[0].chunks_exact(2 * 2 * 32) {
-            for (ch, pair) in frame_bytes.chunks_exact(4).enumerate() {
+        for frame_bytes in a.data[0].as_chunks::<{ 2 * 2 * 32 }>().0 {
+            for (ch, pair) in frame_bytes.as_chunks::<4>().0.iter().enumerate() {
                 let l = i16::from_le_bytes([pair[0], pair[1]]);
                 let r = i16::from_le_bytes([pair[2], pair[3]]);
                 if l != 0 || r != 0 {
@@ -1940,7 +1940,7 @@ fn build_pan_header_module(
         out.extend_from_slice(block);
     }
     // Pad to 16, add a stub instrument so parse_header completes.
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let inst_off = out.len();
@@ -1952,7 +1952,7 @@ fn build_pan_header_module(
     inst[0x20..0x24].copy_from_slice(&8363u32.to_le_bytes());
     inst[0x4C..0x50].copy_from_slice(b"SCRS");
     out.extend_from_slice(&inst);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let pat_off = out.len();
@@ -1962,12 +1962,12 @@ fn build_pan_header_module(
     let total_len = (2 + pat_body.len()) as u16;
     out.extend_from_slice(&total_len.to_le_bytes());
     out.append(&mut pat_body);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
     let sample_off = out.len();
     let sample_parapointer = (sample_off >> 4) as u32;
-    out.extend(std::iter::repeat(0x80_u8).take(16));
+    out.extend(std::iter::repeat_n(0x80_u8, 16));
     let mem_hi = (sample_parapointer >> 16) as u8;
     let mem_lo = (sample_parapointer & 0xFFFF) as u16;
     out[inst_off + 0x0D] = mem_hi;
@@ -2218,7 +2218,7 @@ fn effect_sax_full_nibble_mapping_left_bank() {
 fn pcm_volume_peak_is_63_not_64() {
     use oxideav_s3m::header::parse_header;
     use oxideav_s3m::pattern::unpack_all;
-    use oxideav_s3m::player::{PlayerState, PCM_VOLUME_PEAK};
+    use oxideav_s3m::player::{PCM_VOLUME_PEAK, PlayerState};
     use oxideav_s3m::samples::extract_samples;
 
     assert_eq!(
@@ -2309,7 +2309,7 @@ fn pcm_volume_peak_is_63_not_64() {
 fn mixer_caps_externally_supplied_volume_64_to_pcm_peak() {
     use oxideav_s3m::header::parse_header;
     use oxideav_s3m::pattern::unpack_all;
-    use oxideav_s3m::player::{PlayerState, PCM_VOLUME_PEAK};
+    use oxideav_s3m::player::{PCM_VOLUME_PEAK, PlayerState};
     use oxideav_s3m::samples::extract_samples;
 
     // Build a one-row module just to construct a valid PlayerState; we
