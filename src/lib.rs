@@ -19,9 +19,13 @@
 pub mod container;
 pub mod decoder;
 pub mod header;
+#[doc(hidden)]
 pub mod opl2;
+#[doc(hidden)]
 pub mod pattern;
+#[doc(hidden)]
 pub mod player;
+#[doc(hidden)]
 pub mod samples;
 
 use oxideav_core::CodecRegistry;

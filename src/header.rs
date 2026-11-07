@@ -64,6 +64,7 @@ pub const INSTRUMENT_HEADER_SIZE: usize = 80;
 /// Anything outside these documented prefixes lands in
 /// [`Tracker::Other`] with the raw nibble preserved for diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Tracker {
     /// `0x1xyy` — Scream Tracker family (the canonical writer).
     ScreamTracker,
@@ -105,6 +106,7 @@ impl Tracker {
 /// quoted verbatim from `ScreamTracker-v3.20-s3m.txt` and corroborated
 /// by `multimedia-cx-scream-tracker-3.html` §"Tracker version".
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct CreatedWithTracker {
     /// Raw 16-bit `Cwt/v` word as stored in the file.
     pub raw: u16,
@@ -274,6 +276,7 @@ impl Instrument {
 /// Parsed S3M top-level header + order table + parapointer tables +
 /// channel settings + default pan.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct S3mHeader {
     pub song_name: String,
     pub ord_num: u16,

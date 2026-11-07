@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `#[non_exhaustive]` on `Tracker`, `CreatedWithTracker` and `S3mHeader`
+  (`Instrument` stays exhaustive: callers build it).
+- `#[doc(hidden)]` on the internal `opl2`, `player`, `pattern` and
+  `samples` modules (FM synth, mixer engine, pattern cells, sample bodies).
+
+### Changed
+
 - edition 2024, MSRV 1.95
 
 ## [0.0.9](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.8...v0.0.9) - 2026-08-16
