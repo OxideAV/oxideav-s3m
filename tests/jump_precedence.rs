@@ -217,3 +217,13 @@ fn bare_cxx_breaks_into_the_next_order() {
     let m = build_jump_module(&[(0, 0x40, 1, 0xFF, 3, 0x60)]);
     assert_eq!(total_frames(m), frames_for_rows(5));
 }
+
+#[test]
+fn self_looping_bxx_renders_one_pass_and_reaches_eof() {
+    // B00 on pattern 0 row 0 jumps back onto the row that carries it — the
+    // tracker would replay that one row forever. The decoder's default
+    // `SongEndPolicy::Stop` treats the jump onto an already-played row as
+    // the end of the pass: exactly one row renders, then Eof.
+    let m = build_jump_module(&[(0, 0x40, 1, 0xFF, 2, 0x00)]); // note + B00
+    assert_eq!(total_frames(m), frames_for_rows(1));
+}

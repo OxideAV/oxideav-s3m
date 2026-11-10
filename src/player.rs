@@ -682,23 +682,35 @@ pub const AMIGA_LIMIT_PERIOD_MAX: u32 = 856;
 /// `Bxx` or a natural advance lands on row 0, a `Cxx` on the last order
 /// lands on its own row), and increments its `loop` counter.
 ///
+/// The tracker also never stops on its own when a `Bxx` (or `Cxx`) jumps
+/// back onto rows it has already played — the usual way a module loops
+/// itself (a `B00` on its last row). The sequencer therefore also tracks
+/// a **position repeat**: a jump or advance onto an `(order, row)` that
+/// was already entered during the current pass. `SBx` loop-backs re-play
+/// their loop body by design and never count, and `SEx` held rows are not
+/// row entries. A song-end restart starts a new pass.
+///
 /// A finite decoder cannot loop forever, so the default is
-/// [`SongEndPolicy::Stop`]: the song end terminates the decode and no
-/// restart material is rendered. [`SongEndPolicy::Restart`] reproduces the
-/// tracker's restart for up to `max_restarts` song ends, then stops on the
-/// next one.
+/// [`SongEndPolicy::Stop`]: the first song end **or** position repeat
+/// terminates the decode, so every module renders exactly one pass.
+/// [`SongEndPolicy::Restart`] reproduces the tracker: a song end restarts
+/// at order 0, a position repeat keeps playing, and each of them uses one
+/// unit of the `max_loops` budget; the event after the budget is spent
+/// stops the decode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SongEndPolicy {
     /// End the decode at the first song end (default).
     #[default]
     Stop,
-    /// Restart at order 0 (row kept) for up to `max_restarts` song ends,
-    /// counting each in [`PlayPosition::song_loops`]; the song end after
-    /// that stops the decode.
+    /// Play on like the tracker for up to `max_loops` loop events: a song
+    /// end restarts at order 0 (row kept) and is counted in
+    /// [`PlayPosition::song_loops`]; a position repeat simply continues.
+    /// The loop event after that stops the decode.
     Restart {
-        /// Number of restarts taken before the decode stops.
-        max_restarts: u32,
+        /// Loop events (song-end restarts + position repeats) taken
+        /// before the decode stops.
+        max_loops: u32,
     },
 }
 
@@ -708,9 +720,9 @@ impl SongEndPolicy {
         SongEndPolicy::Stop
     }
 
-    /// [`SongEndPolicy::Restart`] with the given restart budget.
-    pub fn restart(max_restarts: u32) -> Self {
-        SongEndPolicy::Restart { max_restarts }
+    /// [`SongEndPolicy::Restart`] with the given loop budget.
+    pub fn restart(max_loops: u32) -> Self {
+        SongEndPolicy::Restart { max_loops }
     }
 }
 
@@ -863,12 +875,20 @@ pub struct PlayerState {
     song_end_policy: SongEndPolicy,
     /// Song-end restarts taken so far (the tracker's `loop` counter).
     song_loops: u32,
+    /// Position repeats taken so far under [`SongEndPolicy::Restart`].
+    position_repeats: u32,
+    /// `(order, row)` entries played during the current pass, one bit per
+    /// row, 64 rows per raw order slot (256 slots × 64 rows).
+    visited: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Jump {
     order: Option<u8>,
     row: u8,
+    /// `true` for an `SBx` loop-back (re-plays rows of the current pattern
+    /// by design, so it never counts as a position repeat).
+    loop_back: bool,
 }
 
 impl PlayerState {
@@ -979,6 +999,8 @@ impl PlayerState {
             divergent_jump_count: 0,
             song_end_policy: SongEndPolicy::Stop,
             song_loops: 0,
+            position_repeats: 0,
+            visited: vec![0; 256],
         }
     }
 
@@ -1062,6 +1084,43 @@ impl PlayerState {
         None
     }
 
+    /// Whether the active policy allows one more loop event.
+    fn loop_budget_left(&self) -> bool {
+        match self.song_end_policy {
+            SongEndPolicy::Stop => false,
+            SongEndPolicy::Restart { max_loops } => {
+                self.song_loops.saturating_add(self.position_repeats) < max_loops
+            }
+        }
+    }
+
+    /// Bit position of `(order, row)` in [`visited`](Self::visited).
+    fn visit_bit(order: u8, row: u8) -> (usize, u64) {
+        let flat = usize::from(order) * PATTERN_ROWS + usize::from(row % 64);
+        (flat / 64, 1u64 << (flat % 64))
+    }
+
+    fn mark_visited(&mut self, order: u8, row: u8) {
+        let (w, b) = Self::visit_bit(order, row);
+        self.visited[w] |= b;
+    }
+
+    fn is_visited(&self, order: u8, row: u8) -> bool {
+        let (w, b) = Self::visit_bit(order, row);
+        self.visited[w] & b != 0
+    }
+
+    /// A jump or advance landed on a row already played this pass.
+    fn position_repeat(&mut self) {
+        if !self.loop_budget_left() {
+            self.ended = true;
+            return;
+        }
+        self.position_repeats = self.position_repeats.saturating_add(1);
+        // A new pass starts at the repeat point.
+        self.visited.iter_mut().for_each(|w| *w = 0);
+    }
+
     /// Move the sequencer to raw order `target` (row already set), taking
     /// the song-end path when it does not resolve to a playable slot.
     fn goto_order(&mut self, target: usize) {
@@ -1075,17 +1134,14 @@ impl PlayerState {
     /// trace, probes `BEND` / `BPAST` / `CLAST` / `BAFTER` / `BC`), or stop
     /// the decode, per [`SongEndPolicy`].
     fn song_end(&mut self) {
-        let restart = match self.song_end_policy {
-            SongEndPolicy::Stop => false,
-            SongEndPolicy::Restart { max_restarts } => self.song_loops < max_restarts,
-        };
-        if !restart {
+        if !self.loop_budget_left() {
             self.ended = true;
             return;
         }
         match self.resolve_order(0) {
             Some(idx) => {
                 self.song_loops = self.song_loops.saturating_add(1);
+                self.visited.iter_mut().for_each(|w| *w = 0);
                 self.order_index = idx;
                 // A restart begins a new pass through the song: no SBx
                 // loop point or counter survives into it, even when the
@@ -1171,6 +1227,7 @@ impl PlayerState {
             return;
         }
         let row_cells: Vec<Cell> = self.patterns[pat_idx].rows[self.row as usize].clone();
+        self.mark_visited(self.order_index, self.row);
 
         // Pattern-loop is scoped to a single pattern. When playback crosses
         // into a different order slot (natural advance, Bxx, Cxx, or an order
@@ -1798,6 +1855,7 @@ impl PlayerState {
             row_jump = Some(Jump {
                 order: jump_order,
                 row: jump_row.unwrap_or(0),
+                loop_back: false,
             });
         }
 
@@ -1830,6 +1888,7 @@ impl PlayerState {
                     row_jump = Some(Jump {
                         order: Some(self.order_index),
                         row: self.loop_start_row,
+                        loop_back: true,
                     });
                 } else {
                     self.loop_count = None;
@@ -2410,7 +2469,17 @@ impl PlayerState {
             return;
         }
         self.replaying_for_pattern_delay = false;
+        let mut loop_back = false;
         let target = if let Some(jump) = self.pending_jump.take() {
+            if jump.loop_back {
+                // SBx loop-back: the loop body is played again by design;
+                // forget its rows so re-entering them is not a repeat.
+                loop_back = true;
+                for r in jump.row..=self.row.min(63) {
+                    let (w, b) = Self::visit_bit(self.order_index, r);
+                    self.visited[w] &= !b;
+                }
+            }
             // Bxx names the raw slot; a bare Cxx (order `None`) breaks to
             // the next raw slot. The row comes from the merge (Cxx row, or
             // 0 for a bare Bxx).
@@ -2426,14 +2495,21 @@ impl PlayerState {
                 usize::from(self.order_index) + 1
             } else {
                 // Same pattern, next row: no order movement.
-                return;
+                usize::from(self.order_index)
             }
         };
         // Resolve the destination on the raw order list: markers skipped
         // forward, a `255` end mark or a slot at/after `OrdNum` is a song
         // end (restart at order 0 with the row kept, or stop — see
         // `SongEndPolicy`).
+        let loops_before = self.song_loops;
         self.goto_order(target);
+        if self.ended || loop_back || self.song_loops != loops_before {
+            return;
+        }
+        if self.is_visited(self.order_index, self.row) {
+            self.position_repeat();
+        }
     }
 
     /// Mix one sample from one channel. Returns (left, right) in -1..=1.
@@ -6761,5 +6837,96 @@ pub mod tests {
         let p = multi_pattern_player(vec![0, 1], vec![Pattern::empty(1); 2]);
         assert_eq!(p.song_length(), 2);
         assert_eq!(p.song_end_policy(), SongEndPolicy::Stop);
+    }
+
+    /// One-channel player whose pattern `pat` carries `cells` as
+    /// `(row, command, info)`; other patterns are empty. Rendered at a low
+    /// rate — these are sequencer-only probes.
+    fn seq_player(
+        order: Vec<u8>,
+        n_pats: usize,
+        pat: usize,
+        cells: &[(usize, u8, u8)],
+    ) -> PlayerState {
+        let mut pats = vec![Pattern::empty(1); n_pats];
+        for &(row, command, info) in cells {
+            pats[pat].rows[row][0] = Cell {
+                note: 0xFF,
+                instrument: 0,
+                volume: 0xFF,
+                command,
+                info,
+            };
+        }
+        let mut p = multi_pattern_player(order, pats);
+        p.sample_rate = 1_000;
+        p
+    }
+
+    #[test]
+    fn backward_jump_onto_played_rows_ends_one_pass_under_stop() {
+        // B00 on the last row of the last pattern: the tracker would loop
+        // forever; the default policy renders the pass once and stops.
+        let mut p = seq_player(vec![0, 1], 2, 1, &[(63, cmd::B_POS_JUMP, 0x00)]);
+        let got = row_entries(&mut p, 10_000);
+        assert!(p.ended);
+        assert_eq!(got.len(), 128, "exactly one pass of two patterns");
+        assert_eq!(got.last(), Some(&(0, 1, 63)));
+        assert_eq!(p.song_loops(), 0, "a position repeat is not a song end");
+    }
+
+    #[test]
+    fn backward_jump_keeps_playing_under_restart_until_the_budget() {
+        let mut p = seq_player(vec![0, 1], 2, 1, &[(63, cmd::B_POS_JUMP, 0x00)])
+            .with_song_end_policy(SongEndPolicy::restart(2));
+        let got = row_entries(&mut p, 10_000);
+        assert!(p.ended);
+        assert_eq!(got.len(), 3 * 128, "the first pass plus two repeats");
+        assert_eq!(p.song_loops(), 0, "the tracker's loop counter stays 0");
+    }
+
+    #[test]
+    fn forward_break_into_unplayed_rows_is_not_a_repeat() {
+        // C10 on row 4 of order 0 skips rows 0..=9 of order 1: entering
+        // them for the first time (no prior visit) must not stop playback.
+        let mut p = seq_player(vec![0, 1], 2, 0, &[(4, cmd::C_PAT_BREAK, 0x10)]);
+        let got = row_entries(&mut p, 10_000);
+        assert!(p.ended);
+        assert_eq!(got.len(), 5 + 54);
+    }
+
+    #[test]
+    fn sbx_loop_body_replay_is_not_a_position_repeat() {
+        // SB0 on row 2, SB2 on row 5: rows 2..=5 play three times in all.
+        let mut p = seq_player(
+            vec![0],
+            1,
+            0,
+            &[(2, cmd::S_EXTENDED, 0xB0), (5, cmd::S_EXTENDED, 0xB2)],
+        );
+        let got = row_entries(&mut p, 10_000);
+        assert!(p.ended);
+        assert_eq!(got.len(), 64 + 2 * 4);
+        let rows: Vec<u8> = got.iter().take(14).map(|e| e.2).collect();
+        assert_eq!(rows, vec![0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn jump_back_into_a_finished_loop_body_is_a_repeat() {
+        // After the SBx loop has run out, a later B00 back into the pattern
+        // is an ordinary position repeat.
+        let mut p = seq_player(
+            vec![0],
+            1,
+            0,
+            &[
+                (2, cmd::S_EXTENDED, 0xB0),
+                (5, cmd::S_EXTENDED, 0xB1),
+                (10, cmd::B_POS_JUMP, 0x00),
+            ],
+        );
+        let got = row_entries(&mut p, 10_000);
+        assert!(p.ended);
+        assert_eq!(got.len(), 11 + 4);
     }
 }

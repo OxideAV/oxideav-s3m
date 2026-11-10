@@ -216,19 +216,28 @@ re-emitting one is out of scope.
   `Bxx`/`Cxx` precedence) are settled by the black-box ST3.21 trace and
   matched by the position-trace harness.
 
-## Song end
+## Song end and looping
 
 A **song end** is a natural advance or `Cxx` break off the last raw order
 slot, a natural advance onto a `255` end mark, or a `Bxx` naming a `255`
 slot or a slot at/after `OrdNum`. The tracker restarts at order 0 at the
 destination row (row 0 for a bare `Bxx` or natural advance, the `Cxx` row
-for a break off the last order) and increments its loop counter. The
-codec decoders use the default `SongEndPolicy::Stop`: the first song end
-ends the decode, so a module renders once and never loops.
-`PlayerState::with_song_end_policy(SongEndPolicy::restart(n))` reproduces
-the tracker's restart for `n` song ends (each clearing the `SBx` loop
-state), and `PlayerState::position()` reports the
-`(song_loops, order, pattern, row)` the tracker's status line shows.
+for a break off the last order) and increments its loop counter.
+
+A **position repeat** is a `Bxx` / `Cxx` jump (or advance) onto an
+`(order, row)` already entered during the current pass — the usual way a
+module loops itself, e.g. `B00` on its last row. The tracker plays on
+forever. `SBx` loop-backs re-play their body by design and never count;
+`SEx` held rows are not row entries.
+
+The codec decoders use the default `SongEndPolicy::Stop`: the first song
+end or position repeat ends the decode, so every module renders exactly
+one pass and the decoder always reaches end-of-stream.
+`PlayerState::with_song_end_policy(SongEndPolicy::restart(n))` plays on
+like the tracker for `n` loop events (song-end restarts clear the `SBx`
+loop state and are counted in `song_loops()`), then stops; and
+`PlayerState::position()` reports the `(song_loops, order, pattern, row)`
+the tracker's status line shows.
 
 ## Usage
 

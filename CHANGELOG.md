@@ -15,12 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/fixtures/st321-jump-probes/`): every probe's
   `(loop, order, pattern, row)` sequence matches the tracker's status-line
   trace exactly (70/70 states each), including the displayed last order.
-- `SongEndPolicy` (`Stop` default / `Restart { max_restarts }`): a song end
+- `SongEndPolicy` (`Stop` default / `Restart { max_loops }`): a song end
   (`255` end mark, running off the raw list, or `Bxx` ≥ `OrdNum`) restarts
   at order 0 with the destination row kept and counts a loop, as the
   tracker does, or stops the decode. `PlayerState::position()`
   (`PlayPosition`), `song_loops()`, `song_length()`,
   `set_song_end_policy()` / `with_song_end_policy()`.
+- Position-repeat detection: a `Bxx` / `Cxx` jump onto a row already played
+  in the current pass (e.g. a self-looping `B00`) ends the pass under
+  `Stop`, so the decoder always reaches end-of-stream; `SBx` loop-backs
+  are exempt. Under `Restart` it plays on and uses one unit of the
+  `max_loops` budget.
 
 ### Fixed
 
