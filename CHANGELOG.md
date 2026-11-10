@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-s3m/compare/v0.0.9...v0.0.10) - 2026-11-10
+
+### Other
+
+- position-repeat detection so every module renders one finite pass
+- order sequencer matches the black-box ST3.21 position traces
+- API hygiene: non_exhaustive header records and Tracker, hide playback internals
+- edition 2024, MSRV 1.95
+- README examples use the current registry API
+
 ### Added
 
 - Position-trace harness (`tests/position_trace.rs`) over the twelve
