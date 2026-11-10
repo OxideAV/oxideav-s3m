@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Position-trace harness (`tests/position_trace.rs`) over the twelve
+  black-box ScreamTracker 3.21 jump probes (BMARK, BONMK, BAFTER, BEND,
+  BPAST, CLAST, BC, CB, SBC, CSB, SBB, BSB, vendored under
+  `tests/fixtures/st321-jump-probes/`): every probe's
+  `(loop, order, pattern, row)` sequence matches the tracker's status-line
+  trace exactly (70/70 states each), including the displayed last order.
+- `SongEndPolicy` (`Stop` default / `Restart { max_restarts }`): a song end
+  (`255` end mark, running off the raw list, or `Bxx` ≥ `OrdNum`) restarts
+  at order 0 with the destination row kept and counts a loop, as the
+  tracker does, or stops the decode. `PlayerState::position()`
+  (`PlayPosition`), `song_loops()`, `song_length()`,
+  `set_song_end_policy()` / `with_song_end_policy()`.
+
+### Fixed
+
+- A same-row `SEx` pattern delay now runs before a `Bxx` / `Cxx` / `SBx`
+  jump (ST3.2 bug-fix list) instead of being cancelled by it.
+- A natural advance off raw order slot 255 is a song end; it used to
+  saturate and replay slot 255 forever on a 256+-entry order list.
+
 ### Changed
 
 - `#[non_exhaustive]` on `Tracker`, `CreatedWithTracker` and `S3mHeader`

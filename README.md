@@ -116,14 +116,18 @@ re-emitting one is out of scope.
   `Cxx` (row ≥ 64) is ignored without disturbing an earlier valid one,
   and `SBx` keeps its loop-back priority over the merged destination.
   `Bxx` indexes the **raw** on-disk order list (the number ST3's own
-  order editor displays) with the in-band sentinels resolved at fetch
-  time — `254` ("++") skipped forward, `255` ("--") ends the tune —
-  per the staged erratum's recommended model, locked by a regression
-  battery transcribing the erratum's worked probe table; a
-  `PlayerState::divergent_jump_count` diagnostic counts every `Bxx`
-  that names a slot at/after the first sentinel (or past the end),
-  the exact region where the raw-list and marker-compacted models
-  silently pick different patterns —
+  order editor displays): `254` ("++") is skipped forward and a `255`
+  ("--") end mark, or a slot at/after `OrdNum`, is a **song end**; a `Bxx`
+  past the first `255` is honoured. On a row carrying `SBx`, the loop
+  comes first — a same-row `Bxx`/`Cxx` is dropped on the looping pass and
+  taken on the pass that exhausts the loop, in either channel order — and
+  a same-row `SEx` delay runs before any jump. All of this is locked by a
+  **position-trace harness** over the twelve black-box ST3.21 jump probes
+  (`tests/position_trace.rs`): every probe's `(loop, order, pattern, row)`
+  sequence matches the tracker's own status-line trace exactly. A
+  `PlayerState::divergent_jump_count` diagnostic counts every `Bxx` that
+  names a slot at/after the first sentinel (or past the end), the region
+  where a marker-compacted reading would pick different patterns —
   `Dxy` volume slide (full case matrix including
   the fine forms and the both-nibbles-nonzero quirk), `Exx` / `Fxx`
   pitch slides (with fine + extra-fine forms), `Gxx` (tone portamento,
@@ -207,17 +211,24 @@ re-emitting one is out of scope.
   sub-steps + attack curve), the vendor key-scale-number and
   sustain-level scaling rules, and the AM/VIB/KSL tables — see the
   OPL2 bullet above.
-  The staged erratum leaves two questions open, both respected here as
-  documented boundaries rather than guessed at: (a) whether ST3's `Bxx`
-  indexes the raw or a marker-compacted order list — this decoder pins
-  the erratum's recommended **raw-list** model and surfaces the
-  ambiguous region through `divergent_jump_count` (see the effects
-  bullet); an out-of-range jump ends the decode (the finite-decode
-  mapping of the live player's documented wrap-to-start); and (b) the
-  `SBx`-vs-`Bxx`/`Cxx` same-row dispatch precedence, re-checked and
-  **confirmed blocked** in the staged record — this decoder keeps its
-  documented `SBx`-overrides-the-merged-jump behaviour until a static
-  read of ST3's effect dispatch settles it.
+  The order-sequencing questions the staged erratum left open (raw vs.
+  compacted `Bxx` indexing, `255`/past-the-end landings, `SBx` vs.
+  `Bxx`/`Cxx` precedence) are settled by the black-box ST3.21 trace and
+  matched by the position-trace harness.
+
+## Song end
+
+A **song end** is a natural advance or `Cxx` break off the last raw order
+slot, a natural advance onto a `255` end mark, or a `Bxx` naming a `255`
+slot or a slot at/after `OrdNum`. The tracker restarts at order 0 at the
+destination row (row 0 for a bare `Bxx` or natural advance, the `Cxx` row
+for a break off the last order) and increments its loop counter. The
+codec decoders use the default `SongEndPolicy::Stop`: the first song end
+ends the decode, so a module renders once and never loops.
+`PlayerState::with_song_end_policy(SongEndPolicy::restart(n))` reproduces
+the tracker's restart for `n` song ends (each clearing the `SBx` loop
+state), and `PlayerState::position()` reports the
+`(song_loops, order, pattern, row)` the tracker's status line shows.
 
 ## Usage
 

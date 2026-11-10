@@ -670,6 +670,77 @@ pub const AMIGA_CLOCK_HZ: u32 = 14_317_456;
 pub const AMIGA_LIMIT_PERIOD_MIN: u32 = 113;
 pub const AMIGA_LIMIT_PERIOD_MAX: u32 = 856;
 
+/// What the order sequencer does when the song reaches its end.
+///
+/// "Song end" is every way the position can run off the playable order
+/// list: a natural advance (or `Cxx` break) past the last raw slot, a
+/// natural advance onto a `255` ("--") end mark, and a `Bxx` naming either
+/// a `255` slot or a slot at/after `OrdNum`. The black-box ST3.21 position
+/// trace (`docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`
+/// §"Black-box ST3.21 trace") shows the tracker treating all of them the
+/// same way: it restarts at **order 0**, keeps the destination row (a bare
+/// `Bxx` or a natural advance lands on row 0, a `Cxx` on the last order
+/// lands on its own row), and increments its `loop` counter.
+///
+/// A finite decoder cannot loop forever, so the default is
+/// [`SongEndPolicy::Stop`]: the song end terminates the decode and no
+/// restart material is rendered. [`SongEndPolicy::Restart`] reproduces the
+/// tracker's restart for up to `max_restarts` song ends, then stops on the
+/// next one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SongEndPolicy {
+    /// End the decode at the first song end (default).
+    #[default]
+    Stop,
+    /// Restart at order 0 (row kept) for up to `max_restarts` song ends,
+    /// counting each in [`PlayPosition::song_loops`]; the song end after
+    /// that stops the decode.
+    Restart {
+        /// Number of restarts taken before the decode stops.
+        max_restarts: u32,
+    },
+}
+
+impl SongEndPolicy {
+    /// [`SongEndPolicy::Stop`].
+    pub fn stop() -> Self {
+        SongEndPolicy::Stop
+    }
+
+    /// [`SongEndPolicy::Restart`] with the given restart budget.
+    pub fn restart(max_restarts: u32) -> Self {
+        SongEndPolicy::Restart { max_restarts }
+    }
+}
+
+/// The sequencer's current play position, in the terms the tracker's own
+/// status line uses (`loop:L ord:O pat:P row:R`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct PlayPosition {
+    /// Number of song-end restarts taken so far (the tracker's `loop`).
+    pub song_loops: u32,
+    /// Raw order-list index being played (markers already skipped).
+    pub order: u8,
+    /// Pattern number held at that order slot.
+    pub pattern: u8,
+    /// Row within the pattern (0..=63).
+    pub row: u8,
+}
+
+impl PlayPosition {
+    /// Build a position record.
+    pub fn new(song_loops: u32, order: u8, pattern: u8, row: u8) -> Self {
+        PlayPosition {
+            song_loops,
+            order,
+            pattern,
+            row,
+        }
+    }
+}
+
 /// Top-level player state.
 pub struct PlayerState {
     pub samples: Vec<SampleBody>,
@@ -773,24 +844,25 @@ pub struct PlayerState {
     /// when the list carries no sentinel. Precomputed at construction; feeds
     /// the [`divergent_jump_count`](Self::divergent_jump_count) diagnostic.
     first_sentinel_order: Option<u8>,
-    /// Diagnostic counter for `Bxx` order jumps on which S3M players are
-    /// known to disagree. Per the staged erratum
-    /// (`docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`
-    /// §"Erratum — the four staged sources give three different answers"),
-    /// the staged references never settle whether a `Bxx` parameter indexes
-    /// the **raw** on-disk order list or a marker-**compacted**, renumbered
-    /// copy — and the two models pick *different patterns* for any index at
-    /// or after the first sentinel. This player follows the erratum's
-    /// recommended raw-list model (the only one in which `Bxx`'s parameter
-    /// means the number the tracker's own order editor displays) and, as the
-    /// same section recommends, surfaces "any `Bxx` that lands on or after
-    /// the first sentinel as a diagnostic". Each `Bxx` write whose parameter
-    /// names an order slot at or after the first in-band sentinel — or
-    /// past the end of the order list, where the models likewise diverge
-    /// (wrap-to-start vs. end of decode) — increments this counter. A
-    /// nonzero value after playback means the module sits in the set on
-    /// which players disagree; the rendered output itself is unaffected.
+    /// Diagnostic counter for `Bxx` order jumps whose meaning depends on
+    /// the order-list model. Per
+    /// `docs/audio/trackers/s3m/s3m-position-jump-pattern-break-and-adpcm.md`
+    /// (§"Erratum" and §"Black-box ST3.21 trace"), a `Bxx` parameter can be
+    /// read against the **raw** on-disk order list or a marker-**compacted**,
+    /// renumbered copy, and the two readings pick *different patterns* for
+    /// any index at or after the first sentinel. The black-box ST3.21 trace
+    /// settles the tracker's own behaviour as the raw list (probe `BMARK`),
+    /// which this player follows; the counter still surfaces "any `Bxx`
+    /// that lands on or after the first sentinel", since that is exactly
+    /// the set of modules other readers of the format may render
+    /// differently. Each `Bxx` write whose parameter names an order slot at
+    /// or after the first in-band sentinel — or at/after `OrdNum`, a song
+    /// end — increments this counter. The rendered output is unaffected.
     pub divergent_jump_count: u32,
+    /// What a song end does — see [`SongEndPolicy`].
+    song_end_policy: SongEndPolicy,
+    /// Song-end restarts taken so far (the tracker's `loop` counter).
+    song_loops: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -905,6 +977,8 @@ impl PlayerState {
                 .position(|&v| v == 0xFE || v == 0xFF)
                 .map(|i| i.min(usize::from(u8::MAX)) as u8),
             divergent_jump_count: 0,
+            song_end_policy: SongEndPolicy::Stop,
+            song_loops: 0,
         }
     }
 
@@ -918,6 +992,112 @@ impl PlayerState {
     #[inline]
     pub fn first_sentinel_order(&self) -> Option<u8> {
         self.first_sentinel_order
+    }
+
+    /// Select what a song end does (default [`SongEndPolicy::Stop`]).
+    pub fn set_song_end_policy(&mut self, policy: SongEndPolicy) {
+        self.song_end_policy = policy;
+    }
+
+    /// Builder form of [`set_song_end_policy`](Self::set_song_end_policy).
+    pub fn with_song_end_policy(mut self, policy: SongEndPolicy) -> Self {
+        self.song_end_policy = policy;
+        self
+    }
+
+    /// The active song-end policy.
+    pub fn song_end_policy(&self) -> SongEndPolicy {
+        self.song_end_policy
+    }
+
+    /// Song-end restarts taken so far (the tracker's `loop` counter).
+    pub fn song_loops(&self) -> u32 {
+        self.song_loops
+    }
+
+    /// Song length as the tracker displays it: the number of raw order
+    /// slots before the first `255` ("--") end mark, or the whole raw list
+    /// when it carries none. The tracker's status line shows
+    /// `song_length() - 1` as its "last order". Slots after the first end
+    /// mark stay reachable through `Bxx` (they are not part of this count).
+    pub fn song_length(&self) -> usize {
+        self.order
+            .iter()
+            .position(|&v| v == 0xFF)
+            .unwrap_or(self.order.len())
+    }
+
+    /// The current play position. Between rows this is the row most
+    /// recently entered; before the first row is rendered it is the
+    /// start position.
+    pub fn position(&self) -> PlayPosition {
+        let pattern = self
+            .order
+            .get(usize::from(self.order_index))
+            .copied()
+            .unwrap_or(0xFF);
+        PlayPosition::new(self.song_loops, self.order_index, pattern, self.row)
+    }
+
+    /// Number of raw order slots a `u8` order index can address.
+    fn addressable_orders(&self) -> usize {
+        self.order.len().min(usize::from(u8::MAX) + 1)
+    }
+
+    /// Resolve a raw order index to the slot actually played: `254` ("++")
+    /// markers are skipped forward; a `255` ("--") end mark or running
+    /// off the raw list is a song end (`None`). The list is never
+    /// compacted — the black-box ST3.21 trace confirms that `Bxx` and the
+    /// natural advance both address the raw on-disk slots, and that a
+    /// `Bxx` landing past the first `255` is honoured.
+    fn resolve_order(&self, mut idx: usize) -> Option<u8> {
+        let len = self.addressable_orders();
+        while idx < len {
+            match self.order[idx] {
+                0xFF => return None,
+                0xFE => idx += 1,
+                _ => return Some(idx as u8),
+            }
+        }
+        None
+    }
+
+    /// Move the sequencer to raw order `target` (row already set), taking
+    /// the song-end path when it does not resolve to a playable slot.
+    fn goto_order(&mut self, target: usize) {
+        match self.resolve_order(target) {
+            Some(idx) => self.order_index = idx,
+            None => self.song_end(),
+        }
+    }
+
+    /// Song end: restart at order 0 with the row kept (black-box ST3.21
+    /// trace, probes `BEND` / `BPAST` / `CLAST` / `BAFTER` / `BC`), or stop
+    /// the decode, per [`SongEndPolicy`].
+    fn song_end(&mut self) {
+        let restart = match self.song_end_policy {
+            SongEndPolicy::Stop => false,
+            SongEndPolicy::Restart { max_restarts } => self.song_loops < max_restarts,
+        };
+        if !restart {
+            self.ended = true;
+            return;
+        }
+        match self.resolve_order(0) {
+            Some(idx) => {
+                self.song_loops = self.song_loops.saturating_add(1);
+                self.order_index = idx;
+                // A restart begins a new pass through the song: no SBx
+                // loop point or counter survives into it, even when the
+                // restart lands back on the order slot that was playing.
+                self.loop_pattern_order = None;
+                self.loop_start_row = 0;
+                self.loop_count = None;
+            }
+            // Nothing playable from the top — restarting cannot make
+            // progress.
+            None => self.ended = true,
+        }
     }
 
     /// Lower frequency bound (Hz) of the Amiga-limits clamp.
@@ -969,36 +1149,18 @@ impl PlayerState {
         ((self.sample_rate as f32) * 2.5 / self.bpm.max(1) as f32) as u32
     }
 
-    fn find_next_playable_order(&mut self) -> Option<u8> {
-        // Walk past 0xFE (marker) entries; stop at 0xFF (end).
-        //
-        // This is the raw-order-list sentinel handling the staged erratum
-        // recommends (`docs/audio/trackers/s3m/
-        // s3m-position-jump-pattern-break-and-adpcm.md` §Erratum): the order
-        // list keeps its on-disk indices — `Bxx` and natural advance both
-        // land on raw slots — and the in-band sentinels are resolved at
-        // fetch time, "254=++ is just a marker that is skipped" and
-        // "255=-- is the end of tune mark"
-        // (`ScreamTracker-v3.20-s3m.txt` order-list section). The list is
-        // never compacted, so a `Bxx` parameter always means the number
-        // ST3's own order editor displays.
-        while (self.order_index as usize) < self.order.len() {
-            let v = self.order[self.order_index as usize];
-            if v == 0xFF {
-                return None;
-            }
-            if v == 0xFE {
-                self.order_index = self.order_index.saturating_add(1);
-                continue;
-            }
-            return Some(v);
-        }
-        None
-    }
-
     fn enter_row(&mut self) {
-        let pat_idx = match self.find_next_playable_order() {
-            Some(v) => v as usize,
+        if self.ended {
+            return;
+        }
+        // `next_row` has already resolved the destination slot; this
+        // re-resolution only matters for the very first row (order 0 may
+        // itself be a `254` marker) and is idempotent otherwise.
+        let pat_idx = match self.resolve_order(usize::from(self.order_index)) {
+            Some(idx) => {
+                self.order_index = idx;
+                usize::from(self.order[usize::from(idx)])
+            }
             None => {
                 self.ended = true;
                 return;
@@ -1012,7 +1174,7 @@ impl PlayerState {
 
         // Pattern-loop is scoped to a single pattern. When playback crosses
         // into a different order slot (natural advance, Bxx, Cxx, or an order
-        // skip past a marker — `find_next_playable_order` has already settled
+        // skip past a marker — `resolve_order` has already settled
         // `order_index` on the slot being played), reset the SBx loop start to
         // the top of the new pattern and discard any in-flight loop counter —
         // a loop point set in a previous pattern must never trigger a jump in
@@ -1358,16 +1520,15 @@ impl PlayerState {
                     // companion Cxx on the same row can override it.
                     //
                     // The parameter indexes the **raw** on-disk order list —
-                    // in-band `0xFE`/`0xFF` sentinels are handled at fetch
-                    // time by `find_next_playable_order`, never compacted
-                    // away. That is the model the staged erratum recommends
+                    // in-band `0xFE`/`0xFF` sentinels are resolved when the
+                    // jump is taken (`resolve_order`), never compacted
+                    // away. The black-box ST3.21 trace confirms this
                     // (`s3m-position-jump-pattern-break-and-adpcm.md`
-                    // §Erratum): it is the only one in which the parameter
-                    // means the number ST3's own order editor displays.
-                    // Any Bxx naming a slot at/after the first sentinel (or
-                    // past the end) sits in the region where the raw-list
-                    // and compacted models pick different patterns, so it
-                    // is surfaced through the recommended diagnostic.
+                    // §"Black-box ST3.21 trace", probes BMARK / BONMK /
+                    // BAFTER). Any Bxx naming a slot at/after the first
+                    // sentinel (or past the end) sits in the region where
+                    // the raw-list and compacted readings pick different
+                    // patterns, so it is surfaced through the diagnostic.
                     jump_order = Some(ch.info);
                     let idx = usize::from(ch.info);
                     let divergent = idx >= self.order.len()
@@ -1658,10 +1819,14 @@ impl PlayerState {
                 };
                 if remaining > 0 {
                     self.loop_count = Some(remaining);
-                    // Override any other row jump — ST3 gives SB priority
-                    // over a same-row pattern-break. Stay on the current
-                    // order index; `next_row` sees `Some(order_index)` and
-                    // will not increment.
+                    // The loop comes first: on a looping pass any same-row
+                    // Bxx / Cxx is discarded, in either channel order; on
+                    // the pass that exhausts the counter (the `else` arm)
+                    // the merged jump survives and is taken. Black-box
+                    // ST3.21 trace probes SBC / CSB / SBB / BSB, and the
+                    // ST3.2 bug-fix list "When a patternloop and a pattern
+                    // break are on the same row, the loop comes before the
+                    // break". Stay on the current order index.
                     row_jump = Some(Jump {
                         order: Some(self.order_index),
                         row: self.loop_start_row,
@@ -2232,45 +2397,43 @@ impl PlayerState {
     }
 
     fn next_row(&mut self) {
-        // SEx pattern delay: when the counter is still positive, replay
-        // the same row instead of advancing. Each replay consumes one
-        // unit. A pattern jump (B/C) and pattern-loop SBx still take
-        // priority, matching ST3 behaviour where those commands end the
-        // delay early.
-        if self.pattern_delay_remaining > 0 && self.pending_jump.is_none() {
+        // SEx pattern delay: while the counter is positive, replay the same
+        // row instead of advancing; each replay consumes one unit. A
+        // same-row Bxx / Cxx / SBx jump stays armed in `pending_jump` and
+        // is taken only once the delay has run out — "When a patterndelay
+        // and a pattern break are on the same row, the delay comes before
+        // the break" (`docs/audio/trackers/s3m/ScreamTracker-v3.21-Whatsnew.txt`,
+        // ST3.2 bug-fix list).
+        if self.pattern_delay_remaining > 0 {
             self.pattern_delay_remaining -= 1;
             self.replaying_for_pattern_delay = true;
             return;
         }
-        // Drop any stale delay carryover (a row with no SEx clears it).
-        self.pattern_delay_remaining = 0;
         self.replaying_for_pattern_delay = false;
-        if let Some(jump) = self.pending_jump.take() {
-            if let Some(order) = jump.order {
-                self.order_index = order;
-            } else {
-                self.order_index = self.order_index.saturating_add(1);
-            }
+        let target = if let Some(jump) = self.pending_jump.take() {
+            // Bxx names the raw slot; a bare Cxx (order `None`) breaks to
+            // the next raw slot. The row comes from the merge (Cxx row, or
+            // 0 for a bare Bxx).
             self.row = jump.row;
+            match jump.order {
+                Some(order) => usize::from(order),
+                None => usize::from(self.order_index) + 1,
+            }
         } else {
             self.row += 1;
             if self.row as usize >= PATTERN_ROWS {
                 self.row = 0;
-                self.order_index = self.order_index.saturating_add(1);
+                usize::from(self.order_index) + 1
+            } else {
+                // Same pattern, next row: no order movement.
+                return;
             }
-        }
-        // Past the end of the raw order list — natural advance or a Bxx
-        // naming an out-of-range slot. ST3 itself, as a live looping
-        // player, wraps to the start here (FireLight §6.2 / §6.3, noted as
-        // "established" by the staged erratum); a finite decoder maps that
-        // wrap to end-of-decode, otherwise every such module would render
-        // forever. The erratum's substantive open question (raw vs.
-        // compacted indexing) does not affect this branch — both models
-        // stop producing new material at this point — and any Bxx that
-        // reached it has already been counted in `divergent_jump_count`.
-        if self.order_index as usize >= self.order.len() {
-            self.ended = true;
-        }
+        };
+        // Resolve the destination on the raw order list: markers skipped
+        // forward, a `255` end mark or a slot at/after `OrdNum` is a song
+        // end (restart at order 0 with the row kept, or stop — see
+        // `SongEndPolicy`).
+        self.goto_order(target);
     }
 
     /// Mix one sample from one channel. Returns (left, right) in -1..=1.
@@ -5841,16 +6004,18 @@ pub mod tests {
     #[test]
     fn bxx_landing_on_the_end_mark_ends_the_tune() {
         // "255=-- is the end of tune mark" (ScreamTracker-v3.20-s3m.txt);
-        // a Bxx naming a slot that holds 0xFF ends playback even though
-        // playable slots follow it.
+        // a Bxx naming a slot that holds 0xFF is a song end even though
+        // playable slots follow it (black-box ST3.21 trace, probe BEND);
+        // the default `SongEndPolicy::Stop` ends playback.
         let p = take_bxx_probe(vec![0u8, 255, 1], 0x01, 2);
         assert!(p.ended, "a Bxx onto the 0xFF end mark must end the tune");
     }
 
     #[test]
     fn bxx_past_the_raw_order_list_ends_the_decode() {
-        // ST3's live player wraps to the first order here (FireLight §6.2);
-        // a finite decoder maps that wrap to end-of-decode.
+        // A Bxx at/after OrdNum is a song end (black-box ST3.21 trace,
+        // probe BPAST); under the default `SongEndPolicy::Stop` that ends
+        // the decode.
         let p = take_bxx_probe(vec![0u8, 1], 0x05, 2);
         assert!(p.ended, "an out-of-range Bxx must end the decode");
     }
@@ -5956,11 +6121,11 @@ pub mod tests {
         p.channels.push(p.channels[0].clone());
         p.enter_row();
         assert_eq!(p.divergent_jump_count, 1, "authored encounter counts once");
-        // Simulate the SEx replay path: next_row holds the row (the armed
-        // jump is taken instead per ST3 — but force the held-replay branch
-        // to prove the counting site is skipped on replays).
-        p.pending_jump = None;
-        p.replaying_for_pattern_delay = true;
+        // The SEx replay path: next_row holds the row (the delay comes
+        // before the jump) and re-enters it with cell application skipped.
+        p.next_row();
+        assert!(p.replaying_for_pattern_delay, "SE2 holds the row first");
+        assert!(p.pending_jump.is_some(), "the jump stays armed");
         p.tick = 0;
         p.enter_row();
         assert_eq!(
@@ -6458,5 +6623,143 @@ pub mod tests {
         assert!(p.channels[0].active);
         let voice = p.channels[0].opl_voice.as_ref().expect("voice");
         assert!(!voice.finished());
+    }
+
+    // ---- Order sequencer: song end + delay-before-break, per the
+    // black-box ST3.21 trace (`docs/audio/trackers/s3m/
+    // s3m-position-jump-pattern-break-and-adpcm.md` §"Black-box ST3.21
+    // trace") and `ScreamTracker-v3.21-Whatsnew.txt`.
+
+    /// Every row entry `(song_loops, order, row)` — un-collapsed, so SEx
+    /// held replays show up as repeats — up to `limit` entries.
+    fn row_entries(p: &mut PlayerState, limit: usize) -> Vec<(u32, u8, u8)> {
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        for _ in 0..1_000_000 {
+            if out.len() >= limit || p.ended {
+                break;
+            }
+            let entering = p.tick == 0 && p.tick_sample_cursor == 0;
+            buf.resize(p.samples_per_tick().max(1) as usize * 2, 0);
+            p.render(&mut buf);
+            if entering && !p.ended {
+                let pos = p.position();
+                out.push((pos.song_loops, pos.order, pos.row));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pattern_delay_comes_before_a_same_row_break() {
+        // "When a patterndelay and a pattern break are on the same row, the
+        // delay comes before the break" (ST3.2 bug-fix list). SE2 + C05:
+        // the row plays three times, then the break lands on order 1 row 5.
+        for cells in [
+            [(0, cmd::S_EXTENDED, 0xE2), (1, cmd::C_PAT_BREAK, 0x05)],
+            [(0, cmd::C_PAT_BREAK, 0x05), (1, cmd::S_EXTENDED, 0xE2)],
+        ] {
+            let mut p = bc_row_player(&cells, vec![0, 1]);
+            let got = row_entries(&mut p, 4);
+            assert_eq!(got, vec![(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 1, 5)]);
+        }
+    }
+
+    #[test]
+    fn pattern_delay_comes_before_a_same_row_jump() {
+        // Same rule for Bxx: SE1 + B02 holds the row once, then jumps.
+        let mut p = bc_row_player(
+            &[(0, cmd::B_POS_JUMP, 0x02), (1, cmd::S_EXTENDED, 0xE1)],
+            vec![0, 1, 2],
+        );
+        let got = row_entries(&mut p, 3);
+        assert_eq!(got, vec![(0, 0, 0), (0, 0, 0), (0, 2, 0)]);
+    }
+
+    #[test]
+    fn song_end_restart_keeps_the_break_row() {
+        // CLAST shape: a Cxx on the last order wraps to order 0 *at the Cxx
+        // row* and counts a loop.
+        let mut p = bc_row_player(&[(0, cmd::C_PAT_BREAK, 0x07)], vec![0, 1])
+            .with_song_end_policy(SongEndPolicy::restart(1));
+        let got = row_entries(&mut p, 3);
+        // order 0 row 0 → C07 → order 1 row 7 (no Cxx there: row 0 only)
+        assert_eq!(got, vec![(0, 0, 0), (0, 1, 7), (0, 1, 8)]);
+        let mut p = bc_row_player(&[(0, cmd::C_PAT_BREAK, 0x07)], vec![0])
+            .with_song_end_policy(SongEndPolicy::restart(1));
+        let got = row_entries(&mut p, 2);
+        assert_eq!(got, vec![(0, 0, 0), (1, 0, 7)]);
+        // The restart budget is spent: the next song end stops.
+        let rest = row_entries(&mut p, 1_000);
+        assert!(p.ended);
+        assert_eq!(rest.last(), Some(&(1, 0, 63)));
+    }
+
+    #[test]
+    fn song_end_restart_skips_a_leading_marker() {
+        // Restart lands on order 0, resolved like any other destination:
+        // a `254` at slot 0 is skipped forward.
+        let mut p = bc_row_player(&[(0, cmd::B_POS_JUMP, 0x07)], vec![254, 0, 1])
+            .with_song_end_policy(SongEndPolicy::restart(2));
+        let got = row_entries(&mut p, 3);
+        assert_eq!(got, vec![(0, 1, 0), (1, 1, 0), (2, 1, 0)]);
+    }
+
+    #[test]
+    fn restart_with_nothing_playable_stops() {
+        let mut p =
+            bc_row_player(&[], vec![255, 0]).with_song_end_policy(SongEndPolicy::restart(5));
+        let got = row_entries(&mut p, 10);
+        assert!(got.is_empty());
+        assert!(p.ended);
+        assert_eq!(p.song_loops(), 0);
+    }
+
+    #[test]
+    fn restart_resets_the_pattern_loop_state() {
+        // SB0 on row 2 of the only pattern records a loop point; a Bxx past
+        // the end on row 3 ends the song. The restarted pass must start
+        // with no loop point or counter carried over from the first pass.
+        let mut pat = Pattern::empty(1);
+        let fx = |command, info| Cell {
+            note: 0xFF,
+            instrument: 0,
+            volume: 0xFF,
+            command,
+            info,
+        };
+        pat.rows[2][0] = fx(cmd::S_EXTENDED, 0xB0);
+        pat.rows[3][0] = fx(cmd::B_POS_JUMP, 0x09);
+        let mut p = multi_pattern_player(vec![0], vec![pat])
+            .with_song_end_policy(SongEndPolicy::restart(1));
+        let got = row_entries(&mut p, 4);
+        assert_eq!(got, vec![(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 0, 3)]);
+        // Restart: loop state cleared.
+        let got = row_entries(&mut p, 1);
+        assert_eq!(got, vec![(1, 0, 0)]);
+        assert_eq!(p.loop_start_row, 0);
+        assert_eq!(p.loop_count, None);
+    }
+
+    #[test]
+    fn a_full_256_slot_order_list_ends_instead_of_spinning() {
+        // An order index is a byte; a natural advance off raw slot 255 is a
+        // song end, never a saturating re-play of slot 255.
+        let mut p = multi_pattern_player(vec![0u8; 300], vec![Pattern::empty(1)]);
+        p.sample_rate = 1_000; // sequencer-only probe: keep the render cheap
+        let entries = row_entries(&mut p, 256 * 64 + 10);
+        assert!(p.ended, "decode must end after slot 255");
+        assert_eq!(entries.len(), 256 * 64);
+        assert_eq!(entries.last(), Some(&(0, 255, 63)));
+    }
+
+    #[test]
+    fn song_length_and_position_report_the_status_line_terms() {
+        let p = multi_pattern_player(vec![0, 1, 254, 2, 3, 255], vec![Pattern::empty(1); 4]);
+        assert_eq!(p.song_length(), 5);
+        assert_eq!(p.position(), PlayPosition::new(0, 0, 0, 0));
+        let p = multi_pattern_player(vec![0, 1], vec![Pattern::empty(1); 2]);
+        assert_eq!(p.song_length(), 2);
+        assert_eq!(p.song_end_policy(), SongEndPolicy::Stop);
     }
 }

@@ -46,7 +46,7 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// Unified entry point: install every codec and container provided by
 /// `oxideav-s3m` into a [`RuntimeContext`].
 ///
-/// Also wired into [`oxideav_meta::register_all`] via the
+/// Also wired into `oxideav_meta::register_all` via the
 /// [`oxideav_core::register!`] macro below.
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
